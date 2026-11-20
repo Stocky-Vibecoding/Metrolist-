@@ -54,7 +54,7 @@ class GeminiClient(
 
         val prompt =
             buildString {
-                append("Сейчас играет трек: $artist —$title.")
+                append("Сейчас играет трек: $artist — $title.")
                 if (!moodHint.isNullOrBlank()) append(" Настроение волны: $moodHint.")
                 append(" Напиши одну короткую (до 9 слов), живую и слегка ироничную фразу на русском о звучании или вайбе этого трека. Без кавычек, без эмодзи, без вступлений.")
             }
@@ -101,7 +101,7 @@ class GeminiClient(
 
         for (model in modelsToTry) {
             val payload = buildRequestPayload(prompt, systemInstruction, expectJson, temperature)
-            val url = "$API_BASE/models/$model:generateContent"
+            val url = "${apiBaseUrl()}/models/$model:generateContent"
 
             val response =
                 runCatching {
@@ -113,7 +113,7 @@ class GeminiClient(
                     )
                 }.getOrElse { err ->
                     lastError = err
-                    Log.w(TAG, "Network error on $model:${err.message}")
+                    Log.w(TAG, "Network error on $model: ${err.message}")
                     continue
                 }
 
@@ -136,19 +136,19 @@ class GeminiClient(
                         response.retryAfterSeconds?.let { it * 1_000L }
                             ?: if (hits >= 2) COOLDOWN_LONG_MS else COOLDOWN_SHORT_MS
                     cooldownUntilMs[model] = System.currentTimeMillis() + waitMs
-                    Log.w(TAG, "Model $model hit 429 (hits=$hits), cooldown${waitMs / 1000}s, switching...")
+                    Log.w(TAG, "Model $model hit 429 (hits=$hits), cooldown ${waitMs / 1000}s")
                     lastError = IllegalStateException("Лимит 429 на $model")
                 }
 
                 response.code == 503 || response.code == 500 -> {
                     cooldownUntilMs[model] = System.currentTimeMillis() + COOLDOWN_SHORT_MS
-                    Log.w(TAG, "Model $model returned${response.code}, switching...")
+                    Log.w(TAG, "Model $model returned ${response.code}")
                     lastError = IllegalStateException("Сервер ${response.code} на $model")
                 }
 
                 response.code == 404 -> {
                     unavailableModels.add(model)
-                    Log.w(TAG, "Model $model not found (404), excluding for session")
+                    Log.w(TAG, "Model $model not found (404)")
                     lastError = IllegalStateException("Модель $model недоступна (404)")
                 }
 
@@ -159,7 +159,7 @@ class GeminiClient(
 
                 else -> {
                     val msg = extractErrorMessage(response.body) ?: "HTTP ${response.code}"
-                    lastError = IllegalStateException("Gemini $model:$msg")
+                    lastError = IllegalStateException("Gemini $model: $msg")
                 }
             }
         }
@@ -236,12 +236,13 @@ class GeminiClient(
         }.getOrNull()
 
     private fun parseTrackSuggestions(raw: String): List<AiTrackSuggestion> {
+        val fence = "`".repeat(3)
         val cleaned =
             raw
                 .trim()
-                .removePrefix("```json")
-                .removePrefix("```")
-                .removeSuffix("```")
+                .removePrefix(fence + "json")
+                .removePrefix(fence)
+                .removeSuffix(fence)
                 .trim()
 
         val start = cleaned.indexOf('[')
@@ -256,7 +257,7 @@ class GeminiClient(
                 val artist = obj.optString("artist").trim()
                 val title = obj.optString("title").trim()
                 if (artist.isBlank() || title.isBlank()) continue
-                val key = "${artist.lowercase()}|${title.lowercase()}"
+                val key = "${artist.lowercase()}::${title.lowercase()}"
                 if (seen.add(key)) {
                     add(AiTrackSuggestion(artist = artist, title = title))
                 }
@@ -266,9 +267,13 @@ class GeminiClient(
 
     companion object {
         private const val TAG = "GeminiClient"
-        private const val API_BASE = "https:" + "//[generativelanguage.googleapis.com/v1beta](https://generativelanguage.googleapis.com/v1beta)"
         private const val COOLDOWN_SHORT_MS = 2 * 60 * 1_000L
         private const val COOLDOWN_LONG_MS = 15 * 60 * 1_000L
+
+        private fun apiBaseUrl(): String {
+            val host = listOf("generativelanguage", "googleapis", "com").joinToString(".")
+            return "https://" + host + "/v1beta"
+        }
 
         val DEFAULT_MODELS =
             listOf(
