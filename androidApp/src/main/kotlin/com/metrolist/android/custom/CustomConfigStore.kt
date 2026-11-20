@@ -25,6 +25,12 @@ enum class TrackSourcePreference(
     YTM("YTM"),
 }
 
+data class LikedTrackBackup(
+    val id: String,
+    val artist: String,
+    val title: String,
+)
+
 data class ArtistReputation(
     val likes: Int = 0,
     val dislikes: Int = 0,
@@ -78,9 +84,11 @@ enum class NeonColorMode(
 }
 
 data class CustomAppConfig(
+    val localAccountName: String = "Локальный профиль",
+    val useLocalAccountOnly: Boolean = true,
     val hybridResolverEnabled: Boolean = true,
     val preferVkForExplicit: Boolean = true,
-    val aiCensorshipCheckEnabled: Boolean = true,
+    val aiCensorshipCheckEnabled: Boolean = false,
     val yandexToken: String = "",
     val vkToken: String = "",
     val lastFmApiKey: String = "",
@@ -99,6 +107,7 @@ data class CustomAppConfig(
     val trackSourceOverrides: Map<String, TrackSourcePreference> = emptyMap(),
     val dislikedTracks: Set<String> = emptySet(),
     val artistReputation: Map<String, ArtistReputation> = emptyMap(),
+    val likedTracksBackup: List<LikedTrackBackup> = emptyList(),
 ) {
     fun waveFilterSummary(): String {
         val parts =
@@ -219,6 +228,7 @@ class CustomConfigStore(
     fun likeTrack(
         artist: String,
         title: String,
+        songId: String = "",
     ) {
         val tKey = buildTrackKey(artist, title)
         val aKey = buildArtistKey(artist)
@@ -230,7 +240,36 @@ class CustomConfigStore(
                 val prev = nextRep[aKey] ?: ArtistReputation()
                 nextRep[aKey] = prev.copy(likes = prev.likes + 1)
             }
-            cfg.copy(dislikedTracks = nextDisliked, artistReputation = nextRep)
+            val nextLiked =
+                if (songId.isNotBlank() || title.isNotBlank()) {
+                    val entry = LikedTrackBackup(id = songId.trim(), artist = artist.trim(), title = title.trim())
+                    (listOf(entry) + cfg.likedTracksBackup.filterNot {
+                        (entry.id.isNotBlank() && it.id == entry.id) ||
+                            (it.artist.equals(entry.artist, ignoreCase = true) && it.title.equals(entry.title, ignoreCase = true))
+                    }).take(2000)
+                } else {
+                    cfg.likedTracksBackup
+                }
+            cfg.copy(
+                dislikedTracks = nextDisliked,
+                artistReputation = nextRep,
+                likedTracksBackup = nextLiked,
+            )
+        }
+    }
+
+    fun removeLikedTrackBackup(
+        songId: String,
+        artist: String,
+        title: String,
+    ) {
+        update { cfg ->
+            val nextLiked =
+                cfg.likedTracksBackup.filterNot {
+                    (songId.isNotBlank() && it.id == songId) ||
+                        (it.artist.equals(artist, ignoreCase = true) && it.title.equals(title, ignoreCase = true))
+                }
+            cfg.copy(likedTracksBackup = nextLiked)
         }
     }
 
@@ -271,7 +310,8 @@ class CustomConfigStore(
         censorshipPrefs.edit().putBoolean(key, censored).apply()
     }
 
-    fun exportToJson(): String = toJson(_config.value).toString(2)
+    fun exportToJson(extraLikedIds: Set<String> = emptySet()): String =
+        toJson(_config.value, extraLikedIds).toString(2)
 
     fun importFromJson(rawJson: String): Result<CustomAppConfig> =
         runCatching {
@@ -305,8 +345,14 @@ class CustomConfigStore(
         }
     }
 
-    private fun toJson(cfg: CustomAppConfig): JSONObject =
+    private fun toJson(
+        cfg: CustomAppConfig,
+        extraLikedIds: Set<String> = emptySet(),
+    ): JSONObject =
         JSONObject().apply {
+            put("schemaVersion", 3)
+            put("localAccountName", cfg.localAccountName)
+            put("useLocalAccountOnly", cfg.useLocalAccountOnly)
             put("hybridResolverEnabled", cfg.hybridResolverEnabled)
             put("preferVkForExplicit", cfg.preferVkForExplicit)
             put("aiCensorshipCheckEnabled", cfg.aiCensorshipCheckEnabled)
@@ -344,6 +390,29 @@ class CustomConfigStore(
                 )
             }
             put("artistReputation", repObj)
+
+            val likedArr = JSONArray()
+            val knownIds = HashSet<String>()
+            cfg.likedTracksBackup.forEach { item ->
+                if (item.id.isNotBlank()) knownIds.add(item.id)
+                likedArr.put(
+                    JSONObject()
+                        .put("id", item.id)
+                        .put("artist", item.artist)
+                        .put("title", item.title),
+                )
+            }
+            extraLikedIds.forEach { id ->
+                if (id.isNotBlank() && knownIds.add(id)) {
+                    likedArr.put(
+                        JSONObject()
+                            .put("id", id)
+                            .put("artist", "")
+                            .put("title", ""),
+                    )
+                }
+            }
+            put("likedTracksBackup", likedArr)
         }
 
     private fun fromJson(obj: JSONObject): CustomAppConfig {
@@ -386,7 +455,23 @@ class CustomConfigStore(
                 }
             }
 
+        val likedBackup =
+            buildList<LikedTrackBackup> {
+                val arr = obj.optJSONArray("likedTracksBackup") ?: return@buildList
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val id = item.optString("id").trim()
+                    val artist = item.optString("artist").trim()
+                    val title = item.optString("title").trim()
+                    if (id.isNotBlank() || title.isNotBlank()) {
+                        add(LikedTrackBackup(id = id, artist = artist, title = title))
+                    }
+                }
+            }
+
         return CustomAppConfig(
+            localAccountName = obj.optString("localAccountName", defaults.localAccountName).ifBlank { defaults.localAccountName },
+            useLocalAccountOnly = obj.optBoolean("useLocalAccountOnly", defaults.useLocalAccountOnly),
             hybridResolverEnabled = obj.optBoolean("hybridResolverEnabled", defaults.hybridResolverEnabled),
             preferVkForExplicit = obj.optBoolean("preferVkForExplicit", defaults.preferVkForExplicit),
             aiCensorshipCheckEnabled = obj.optBoolean("aiCensorshipCheckEnabled", defaults.aiCensorshipCheckEnabled),
@@ -408,6 +493,7 @@ class CustomConfigStore(
             trackSourceOverrides = overrides,
             dislikedTracks = disliked,
             artistReputation = repMap,
+            likedTracksBackup = likedBackup,
         )
     }
 
