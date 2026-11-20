@@ -2,7 +2,6 @@ package com.metrolist.android.custom
 
 import android.util.Log
 import com.metrolist.shared.api.lastfm.LastFM
-import com.metrolist.shared.api.lastfm.artistName
 import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.GlobalYouTube
@@ -17,6 +16,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 data class AiPlaylistResult(
     val query: String,
@@ -140,13 +140,16 @@ class AiWaveEngine(
                         if (name.isNotBlank()) entries += if (art.isNotBlank()) "$art - $name" else name
                     }
                     val recent = LastFM.getRecentTracks(GlobalYouTube.client, cfg.lastFmUsername.trim(), limit = 12).getOrNull()
-                    val trackArr = recent?.optJSONArray("track")
-                    if (trackArr != null) {
-                        for (i in 0 until trackArr.length()) {
-                            val obj = trackArr.optJSONObject(i) ?: continue
-                            val name = obj.optString("name").trim()
-                            val art = obj.optJSONObject("artist")?.optString("#text").orEmpty().trim()
-                            if (name.isNotBlank()) entries += if (art.isNotBlank()) "$art - $name" else name
+                    if (recent != null) {
+                        val root = JSONObject(recent.toString())
+                        val trackArr = root.optJSONObject("recenttracks")?.optJSONArray("track") ?: root.optJSONArray("track")
+                        if (trackArr != null) {
+                            for (i in 0 until trackArr.length()) {
+                                val obj = trackArr.optJSONObject(i) ?: continue
+                                val name = obj.optString("name").trim()
+                                val art = obj.optJSONObject("artist")?.optString("#text").orEmpty().trim()
+                                if (name.isNotBlank()) entries += if (art.isNotBlank()) "$art - $name" else name
+                            }
                         }
                     }
                 }
