@@ -28,6 +28,101 @@ private data class PreResolvedEntry(
     val expiresAtMs: Long,
 )
 
+object LocalCensorshipAdvisor {
+    private val learnedArtists = ConcurrentHashMap.newKeySet<String>()
+
+    private val knownRuCensoredArtists =
+        setOf(
+            "паша техник",
+            "pasha tehnik",
+            "metox",
+            "метокс",
+            "kunteynir",
+            "контейнер",
+            "oxxxymiron",
+            "оксимирон",
+            "morgenshtern",
+            "моргенштерн",
+            "скриптонит",
+            "kizaru",
+            "кизару",
+            "big baby tape",
+            "friendly thug",
+            "alblak",
+            "платина",
+            "og buda",
+            "163onmyneck",
+            "bushido zho",
+            "mayot",
+            "soda luv",
+            "yanix",
+            "pharaoh",
+            "boulevard depo",
+            "gspd",
+            "cmh",
+            "lida",
+            "инстасамка",
+            "instasamka",
+            "каспийский груз",
+            "гуф",
+            "guf",
+            "ноггано",
+            "ак 47",
+            "рыночные отношения",
+            "полумягкие",
+            "слава кпсс",
+            "замай",
+            "pyrokinesis",
+            "atl",
+            "horus",
+            "хаски",
+            "кровосток",
+            "ленинград",
+            "сектор газа",
+            "красная плесень",
+            "2rbina 2rista",
+            "ic3peak",
+            "noize mc",
+            "порнофильмы",
+            "face",
+            "gone fludd",
+            "thrill pill",
+            "lovv66",
+            "scally milano",
+            "uglystephan",
+            "heronwater",
+            "saluki",
+            "obladaet",
+            "масло черного тмина",
+            "блэк бакарди",
+            "пошлая молли",
+            "кишлак",
+            "три дня дождя",
+            "дк",
+            "dk",
+        )
+
+    fun rememberCensoredArtist(artist: String) {
+        val parts = artist.split(",", "&", "feat.", "ft.")
+        parts.forEach { raw ->
+            val norm = TrackMatcher.normalize(raw)
+            if (norm.length >= 2) learnedArtists.add(norm)
+        }
+    }
+
+    fun isLikelyCensoredOnYandex(
+        artist: String,
+        title: String,
+    ): Boolean {
+        val normArtist = TrackMatcher.normalize(artist)
+        if (normArtist.isBlank()) return false
+        if (learnedArtists.any { normArtist.contains(it) }) return true
+        if (knownRuCensoredArtists.any { normArtist.contains(it) }) return true
+        val normTitle = TrackMatcher.normalize(title)
+        return normTitle.contains("explicit") || normTitle.contains("uncensored") || normTitle.contains("без цензуры")
+    }
+}
+
 object ResolverDiagnostics {
     private val _logs = MutableStateFlow<List<ResolverLogEntry>>(emptyList())
     val logs: StateFlow<List<ResolverLogEntry>> = _logs.asStateFlow()
@@ -47,7 +142,7 @@ object ResolverDiagnostics {
         if (!hdCoverUrl.isNullOrBlank()) {
             coverByVideo[videoId] = hdCoverUrl
         }
-        val label = if (artist.isNotBlank()) "$artist —$title" else title
+        val label = if (artist.isNotBlank()) "$artist — $title" else title
         val entry =
             ResolverLogEntry(
                 timestampMs = System.currentTimeMillis(),
@@ -82,12 +177,16 @@ object ResolverDiagnostics {
         bitrate: Int?,
         mimeType: String?,
         isHls: Boolean = false,
+        variantTag: String? = null,
     ): String? {
         if (clientName.isNullOrBlank()) return null
         val kbps = bitrate?.takeIf { it > 0 }?.let { if (it > 1_000) it / 1_000 else it }
         return when (clientName) {
             "yandex" -> if (kbps != null) "Я.Музыка • $kbps" else "Я.Музыка • 320"
-            "vk" -> if (isHls || mimeType?.contains("mpegURL", ignoreCase = true) == true) "VK • HLS" else "VK • MP3"
+            "vk" -> {
+                val base = if (isHls || mimeType?.contains("mpegURL", ignoreCase = true) == true) "VK • HLS" else "VK • MP3"
+                if (!variantTag.isNullOrBlank()) "$base $variantTag" else base
+            }
             else -> {
                 val codec =
                     when {
@@ -116,6 +215,8 @@ class HybridStreamResolver(
     private val failedProvidersByVideo = ConcurrentHashMap<String, MutableSet<String>>()
     private val preResolvedCache = ConcurrentHashMap<String, PreResolvedEntry>()
     private val preResolvingIds = ConcurrentHashMap.newKeySet<String>()
+    private val vkVariantIndexByVideo = ConcurrentHashMap<String, Int>()
+    private val bypassAudioCacheIds = ConcurrentHashMap.newKeySet<String>()
 
     init {
         activeInstance = this
@@ -164,6 +265,14 @@ class HybridStreamResolver(
     private fun invalidateTrackInternal(videoId: String) {
         failedProvidersByVideo.remove(videoId)
         preResolvedCache.remove(videoId)
+        bypassAudioCacheIds.add(videoId)
+    }
+
+    private fun shouldBypassAudioCacheInternal(song: SongItem): Boolean {
+        if (song.id in bypassAudioCacheIds) return true
+        val artist = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
+        val title = (song.canonicalTitle ?: song.title).trim()
+        return configStore.getTrackSourceOverride(song.id, artist, title) != TrackSourcePreference.AUTO
     }
 
     private suspend fun preResolveInternal(song: SongItem) {
@@ -204,7 +313,7 @@ class HybridStreamResolver(
                         sourcePref = manualPref,
                         expiresAtMs = System.currentTimeMillis() + PRE_RESOLVE_TTL_MS,
                     )
-                Log.d(TAG, "Pre-resolved next track: $artist - $title via${resolved.clientName}")
+                Log.d(TAG, "Pre-resolved next track: $artist - $title via ${resolved.clientName}")
             }
         } finally {
             preResolvingIds.remove(videoId)
@@ -253,7 +362,7 @@ class HybridStreamResolver(
                 cached.expiresAtMs > System.currentTimeMillis() &&
                 cached.sourcePref == manualPref
             ) {
-                Log.d(TAG, "Instant pre-resolved hit for $artist -$title")
+                Log.d(TAG, "Instant pre-resolved hit for $artist - $title")
                 return cached.resource
             }
         }
@@ -266,18 +375,11 @@ class HybridStreamResolver(
                 fallbackExplicit = song.isExplicit || song.explicitness == true,
             )
 
-        val aiCensored =
-            if (manualPref == TrackSourcePreference.AUTO &&
-                !reference.isExplicit &&
-                cfg.aiCensorshipCheckEnabled &&
+        val localCensored =
+            manualPref == TrackSourcePreference.AUTO &&
                 cfg.preferVkForExplicit &&
                 cfg.vkToken.isNotBlank() &&
-                shouldEvaluateCensorship(artist, title)
-            ) {
-                evaluateCensorshipWithCache(artist, title)
-            } else {
-                false
-            }
+                LocalCensorshipAdvisor.isLikelyCensoredOnYandex(artist, title)
 
         val (order, reason) =
             when {
@@ -285,19 +387,26 @@ class HybridStreamResolver(
                 manualPref == TrackSourcePreference.VK -> listOf("vk") to "ручной выбор"
                 videoId.startsWith("vk_") -> listOf("vk", "yandex") to "каталог VK"
                 videoId.startsWith("ym_") -> listOf("yandex", "vk") to "каталог Яндекса"
-                (reference.isExplicit || aiCensored) && cfg.preferVkForExplicit && cfg.vkToken.isNotBlank() -> {
-                    val tag = if (aiCensored) "ИИ-антицензура" else "Explicit → VK"
+                (reference.isExplicit || localCensored) && cfg.preferVkForExplicit && cfg.vkToken.isNotBlank() -> {
+                    val tag = if (localCensored) "антицензура → VK" else "Explicit → VK"
                     listOf("vk", "yandex") to tag
                 }
                 else -> listOf("yandex", "vk") to "автокаскад"
             }
 
+        val vkVariant = vkVariantIndexByVideo[videoId] ?: 0
+
         for (provider in order) {
             if (provider in failed || "custom_$provider" in excludedProfiles) continue
+            var variantTag: String? = null
             val resolved =
                 when (provider) {
                     "yandex" -> yandexProvider.resolve(reference)
-                    "vk" -> vkProvider.resolve(reference)
+                    "vk" -> {
+                        val pair = vkProvider.resolveWithVariant(reference, variantIndex = vkVariant)
+                        variantTag = pair?.second
+                        pair?.first
+                    }
                     else -> null
                 } ?: continue
 
@@ -307,6 +416,7 @@ class HybridStreamResolver(
                     bitrate = resolved.bitrate,
                     mimeType = resolved.mimeType,
                     isHls = resolved.isHls,
+                    variantTag = variantTag,
                 ) ?: resolved.clientName
 
             val fullDetail = if (isPreResolve) "$reason • пре-резолв" else reason
@@ -336,25 +446,6 @@ class HybridStreamResolver(
         }
 
         return null
-    }
-
-    private fun shouldEvaluateCensorship(
-        artist: String,
-        title: String,
-    ): Boolean {
-        val combined = "$artist$title"
-        return combined.any { ch -> ch in '\u0400'..'\u04FF' }
-    }
-
-    private suspend fun evaluateCensorshipWithCache(
-        artist: String,
-        title: String,
-    ): Boolean {
-        configStore.getCachedCensorship(artist, title)?.let { return it }
-        val client = GeminiClient.sharedInstance ?: return false
-        val verdict = client.checkCensorshipRisk(artist, title) ?: return false
-        configStore.putCachedCensorship(artist, title, verdict)
-        return verdict
     }
 
     private fun recordYtmFallback(
@@ -423,7 +514,7 @@ class HybridStreamResolver(
         category: PlaybackFailureCategory,
     ) {
         if (clientName == "yandex" || clientName == "vk") {
-            Log.w(TAG, "Custom stream failed ($clientName, code=$responseCode) for$videoId, falling back")
+            Log.w(TAG, "Custom stream failed ($clientName, code=$responseCode) for $videoId, falling back")
             preResolvedCache.remove(videoId)
             failedProvidersByVideo.getOrPut(videoId) { ConcurrentHashMap.newKeySet() }.add(clientName)
             return
@@ -448,6 +539,21 @@ class HybridStreamResolver(
 
         fun invalidateTrack(videoId: String) {
             activeInstance?.invalidateTrackInternal(videoId)
+        }
+
+        fun shouldBypassAudioCache(song: SongItem): Boolean =
+            activeInstance?.shouldBypassAudioCacheInternal(song) == true
+
+        fun cycleVkVariant(videoId: String): Int {
+            val inst = activeInstance ?: return 0
+            val next = (inst.vkVariantIndexByVideo[videoId] ?: 0) + 1
+            inst.vkVariantIndexByVideo[videoId] = next
+            inst.invalidateTrackInternal(videoId)
+            return next
+        }
+
+        fun resetVkVariant(videoId: String) {
+            activeInstance?.vkVariantIndexByVideo?.remove(videoId)
         }
 
         suspend fun preResolve(song: SongItem) {
