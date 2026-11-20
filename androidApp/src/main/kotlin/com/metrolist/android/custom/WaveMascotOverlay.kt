@@ -419,6 +419,18 @@ fun WaveHomeScreen(
                         FilterChip(
                             selected = currentOverride == pref,
                             onClick = {
+                                val alreadyOnVk =
+                                    pref == TrackSourcePreference.VK &&
+                                        (currentOverride == TrackSourcePreference.VK || playbackResource?.clientName == "vk")
+                                if (alreadyOnVk) {
+                                    HybridStreamResolver.cycleVkVariant(song.id)
+                                } else {
+                                    HybridStreamResolver.resetVkVariant(song.id)
+                                    HybridStreamResolver.invalidateTrack(song.id)
+                                }
+                                if (pref == TrackSourcePreference.VK && playbackResource?.clientName == "yandex") {
+                                    LocalCensorshipAdvisor.rememberCensoredArtist(artist)
+                                }
                                 configStore.setTrackSourceOverride(
                                     videoId = song.id,
                                     artist = artist,
@@ -429,7 +441,7 @@ fun WaveHomeScreen(
                                 playerConnection?.reloadCurrentSongForSourceSwitch()
                                 Toast.makeText(
                                     context,
-                                    "Переключаю на ${pref.label}",
+                                    if (alreadyOnVk) "Пробую другую версию из VK…" else "Переключаю на ${pref.label}",
                                     Toast.LENGTH_SHORT,
                                 ).show()
                             },
@@ -438,7 +450,7 @@ fun WaveHomeScreen(
                     }
                 }
                 Text(
-                    text = "Выбор сохранится именно для этого трека и применится сразу без сброса позиции.",
+                    text = "Повторный тап по VK пробует другую версию трека (помогает обойти цензуру).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -989,14 +1001,9 @@ fun CustomEngineSettingsContent(
             onCheckedChange = { v -> configStore.update { it.copy(hybridResolverEnabled = v) } },
         )
         SettingSwitchRow(
-            title = "Приоритет ВК для Explicit-треков",
+            title = "Антицензура (Explicit и РФ-рэп → VK, 0 запросов ИИ)",
             checked = cfg.preferVkForExplicit,
             onCheckedChange = { v -> configStore.update { it.copy(preferVkForExplicit = v) } },
-        )
-        SettingSwitchRow(
-            title = "ИИ-антицензура через Gemini (расходует лимит API)",
-            checked = cfg.aiCensorshipCheckEnabled,
-            onCheckedChange = { v -> configStore.update { it.copy(aiCensorshipCheckEnabled = v) } },
         )
         SettingSwitchRow(
             title = "Открывать вкладку «Волна» при старте",
