@@ -5,6 +5,7 @@ import com.metrolist.shared.api.lastfm.LastFM
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
 import org.json.JSONObject
 
 enum class YandexPlusStatus {
@@ -13,6 +14,26 @@ enum class YandexPlusStatus {
     NO_PLUS,
     INVALID_TOKEN,
     NO_TOKEN,
+}
+
+enum class TrackSourcePreference(
+    val label: String,
+) {
+    AUTO("Авто"),
+    YANDEX("Я.Музыка"),
+    VK("VK"),
+    YTM("YTM"),
+}
+
+data class ArtistReputation(
+    val likes: Int = 0,
+    val dislikes: Int = 0,
+) {
+    val isAutoMuted: Boolean
+        get() = (dislikes >= 4 && likes == 0) || (dislikes >= 6 && dislikes >= likes * 4)
+
+    val isLowWeight: Boolean
+        get() = !isAutoMuted && dislikes >= 3 && dislikes > likes * 2
 }
 
 enum class WaveCharacter(
@@ -59,6 +80,7 @@ enum class NeonColorMode(
 data class CustomAppConfig(
     val hybridResolverEnabled: Boolean = true,
     val preferVkForExplicit: Boolean = true,
+    val aiCensorshipCheckEnabled: Boolean = true,
     val yandexToken: String = "",
     val vkToken: String = "",
     val lastFmApiKey: String = "",
@@ -66,14 +88,17 @@ data class CustomAppConfig(
     val lastFmUsername: String = "",
     val geminiApiKey: String = "",
     val geminiModelMode: String = MODEL_MODE_AUTO,
-    val aiPlaylistSize: Int = 20,
+    val aiPlaylistSize: Int = 25,
     val useWaveAsHome: Boolean = true,
     val mascotEnabled: Boolean = true,
     val mascotFolderUri: String = "",
-    val neonColorMode: NeonColorMode = NeonColorMode.PURPLE,
+    val neonColorMode: NeonColorMode = NeonColorMode.AUTO,
     val waveCharacter: WaveCharacter = WaveCharacter.DEFAULT,
     val waveLanguage: WaveLanguage = WaveLanguage.ANY,
     val waveMood: WaveMood = WaveMood.ANY,
+    val trackSourceOverrides: Map<String, TrackSourcePreference> = emptyMap(),
+    val dislikedTracks: Set<String> = emptySet(),
+    val artistReputation: Map<String, ArtistReputation> = emptyMap(),
 ) {
     fun waveFilterSummary(): String {
         val parts =
@@ -82,7 +107,7 @@ data class CustomAppConfig(
                 if (waveLanguage != WaveLanguage.ANY) add(waveLanguage.label)
                 if (waveMood != WaveMood.ANY) add(waveMood.label)
             }
-        return if (parts.isEmpty()) "Настроить" else parts.joinToString(" • ")
+        return if (parts.isEmpty()) "Настроить волну" else parts.joinToString(" • ")
     }
 
     companion object {
@@ -94,6 +119,7 @@ class CustomConfigStore(
     context: Context,
 ) {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val censorshipPrefs = context.applicationContext.getSharedPreferences(CENSORSHIP_PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _config = MutableStateFlow(loadInitial())
     val config: StateFlow<CustomAppConfig> = _config.asStateFlow()
@@ -119,6 +145,130 @@ class CustomConfigStore(
 
     fun setYandexPlusStatus(status: YandexPlusStatus) {
         _yandexPlusStatus.value = status
+    }
+
+    fun getTrackSourceOverride(
+        videoId: String?,
+        artist: String,
+        title: String,
+    ): TrackSourcePreference {
+        val map = _config.value.trackSourceOverrides
+        if (!videoId.isNullOrBlank()) {
+            map["id::$videoId"]?.let { return it }
+        }
+        val tKey = buildTrackKey(artist, title)
+        if (tKey.isNotBlank()) {
+            map[tKey]?.let { return it }
+        }
+        return TrackSourcePreference.AUTO
+    }
+
+    fun setTrackSourceOverride(
+        videoId: String?,
+        artist: String,
+        title: String,
+        preference: TrackSourcePreference,
+    ) {
+        val tKey = buildTrackKey(artist, title)
+        val idKey = videoId?.takeIf { it.isNotBlank() }?.let { "id::$it" }
+        update { cfg ->
+            val next = cfg.trackSourceOverrides.toMutableMap()
+            if (preference == TrackSourcePreference.AUTO) {
+                if (tKey.isNotBlank()) next.remove(tKey)
+                if (idKey != null) next.remove(idKey)
+            } else {
+                if (tKey.isNotBlank()) next[tKey] = preference
+                if (idKey != null) next[idKey] = preference
+            }
+            cfg.copy(trackSourceOverrides = next)
+        }
+    }
+
+    fun isTrackDisliked(
+        artist: String,
+        title: String,
+    ): Boolean {
+        val key = buildTrackKey(artist, title)
+        return key.isNotBlank() && key in _config.value.dislikedTracks
+    }
+
+    fun isArtistAutoMuted(artist: String): Boolean {
+        val aKey = buildArtistKey(artist)
+        if (aKey.isBlank()) return false
+        return _config.value.artistReputation[aKey]?.isAutoMuted == true
+    }
+
+    fun dislikeTrack(
+        artist: String,
+        title: String,
+    ) {
+        val tKey = buildTrackKey(artist, title)
+        val aKey = buildArtistKey(artist)
+        update { cfg ->
+            val nextDisliked =
+                if (tKey.isNotBlank()) cfg.dislikedTracks + tKey else cfg.dislikedTracks
+            val nextRep = cfg.artistReputation.toMutableMap()
+            if (aKey.isNotBlank()) {
+                val prev = nextRep[aKey] ?: ArtistReputation()
+                nextRep[aKey] = prev.copy(dislikes = prev.dislikes + 1)
+            }
+            cfg.copy(dislikedTracks = nextDisliked, artistReputation = nextRep)
+        }
+    }
+
+    fun likeTrack(
+        artist: String,
+        title: String,
+    ) {
+        val tKey = buildTrackKey(artist, title)
+        val aKey = buildArtistKey(artist)
+        update { cfg ->
+            val nextDisliked =
+                if (tKey.isNotBlank()) cfg.dislikedTracks - tKey else cfg.dislikedTracks
+            val nextRep = cfg.artistReputation.toMutableMap()
+            if (aKey.isNotBlank()) {
+                val prev = nextRep[aKey] ?: ArtistReputation()
+                nextRep[aKey] = prev.copy(likes = prev.likes + 1)
+            }
+            cfg.copy(dislikedTracks = nextDisliked, artistReputation = nextRep)
+        }
+    }
+
+    fun clearDislikedTracks() {
+        update { it.copy(dislikedTracks = emptySet()) }
+    }
+
+    fun resetMutedArtists() {
+        update { cfg ->
+            val cleaned = cfg.artistReputation.filterValues { !it.isAutoMuted }
+            cfg.copy(artistReputation = cleaned)
+        }
+    }
+
+    fun clearTrackSourceOverrides() {
+        update { it.copy(trackSourceOverrides = emptyMap()) }
+    }
+
+    fun getCachedCensorship(
+        artist: String,
+        title: String,
+    ): Boolean? {
+        val key = buildTrackKey(artist, title)
+        if (key.isBlank() || !censorshipPrefs.contains(key)) return null
+        return censorshipPrefs.getBoolean(key, false)
+    }
+
+    fun putCachedCensorship(
+        artist: String,
+        title: String,
+        censored: Boolean,
+    ) {
+        val key = buildTrackKey(artist, title)
+        if (key.isBlank()) return
+        if (censorshipPrefs.all.size > 800) {
+            censorshipPrefs.edit().clear().apply()
+        }
+        censorshipPrefs.edit().putBoolean(key, censored).apply()
     }
 
     fun exportToJson(): String = toJson(_config.value).toString(2)
@@ -159,6 +309,7 @@ class CustomConfigStore(
         JSONObject().apply {
             put("hybridResolverEnabled", cfg.hybridResolverEnabled)
             put("preferVkForExplicit", cfg.preferVkForExplicit)
+            put("aiCensorshipCheckEnabled", cfg.aiCensorshipCheckEnabled)
             put("yandexToken", cfg.yandexToken)
             put("vkToken", cfg.vkToken)
             put("lastFmApiKey", cfg.lastFmApiKey)
@@ -174,13 +325,71 @@ class CustomConfigStore(
             put("waveCharacter", cfg.waveCharacter.name)
             put("waveLanguage", cfg.waveLanguage.name)
             put("waveMood", cfg.waveMood.name)
+
+            val overridesObj = JSONObject()
+            cfg.trackSourceOverrides.forEach { (k, v) -> overridesObj.put(k, v.name) }
+            put("trackSourceOverrides", overridesObj)
+
+            val dislikedArr = JSONArray()
+            cfg.dislikedTracks.forEach { dislikedArr.put(it) }
+            put("dislikedTracks", dislikedArr)
+
+            val repObj = JSONObject()
+            cfg.artistReputation.forEach { (artist, stat) ->
+                repObj.put(
+                    artist,
+                    JSONObject()
+                        .put("l", stat.likes)
+                        .put("d", stat.dislikes),
+                )
+            }
+            put("artistReputation", repObj)
         }
 
     private fun fromJson(obj: JSONObject): CustomAppConfig {
         val defaults = CustomAppConfig()
+
+        val overrides =
+            buildMap<String, TrackSourcePreference> {
+                val mapObj = obj.optJSONObject("trackSourceOverrides") ?: return@buildMap
+                val keys = mapObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val pref = enumByName(mapObj.optString(k), TrackSourcePreference.AUTO)
+                    if (pref != TrackSourcePreference.AUTO) put(k, pref)
+                }
+            }
+
+        val disliked =
+            buildSet<String> {
+                val arr = obj.optJSONArray("dislikedTracks") ?: return@buildSet
+                for (i in 0 until arr.length()) {
+                    val s = arr.optString(i).trim()
+                    if (s.isNotBlank()) add(s)
+                }
+            }
+
+        val repMap =
+            buildMap<String, ArtistReputation> {
+                val repObj = obj.optJSONObject("artistReputation") ?: return@buildMap
+                val keys = repObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val item = repObj.optJSONObject(k) ?: continue
+                    put(
+                        k,
+                        ArtistReputation(
+                            likes = item.optInt("l", 0).coerceAtLeast(0),
+                            dislikes = item.optInt("d", 0).coerceAtLeast(0),
+                        ),
+                    )
+                }
+            }
+
         return CustomAppConfig(
             hybridResolverEnabled = obj.optBoolean("hybridResolverEnabled", defaults.hybridResolverEnabled),
             preferVkForExplicit = obj.optBoolean("preferVkForExplicit", defaults.preferVkForExplicit),
+            aiCensorshipCheckEnabled = obj.optBoolean("aiCensorshipCheckEnabled", defaults.aiCensorshipCheckEnabled),
             yandexToken = obj.optString("yandexToken", defaults.yandexToken),
             vkToken = obj.optString("vkToken", defaults.vkToken),
             lastFmApiKey = obj.optString("lastFmApiKey", defaults.lastFmApiKey),
@@ -188,7 +397,7 @@ class CustomConfigStore(
             lastFmUsername = obj.optString("lastFmUsername", defaults.lastFmUsername),
             geminiApiKey = obj.optString("geminiApiKey", defaults.geminiApiKey),
             geminiModelMode = obj.optString("geminiModelMode", defaults.geminiModelMode).ifBlank { CustomAppConfig.MODEL_MODE_AUTO },
-            aiPlaylistSize = obj.optInt("aiPlaylistSize", defaults.aiPlaylistSize).coerceIn(10, 40),
+            aiPlaylistSize = obj.optInt("aiPlaylistSize", defaults.aiPlaylistSize).coerceIn(10, 100),
             useWaveAsHome = obj.optBoolean("useWaveAsHome", defaults.useWaveAsHome),
             mascotEnabled = obj.optBoolean("mascotEnabled", defaults.mascotEnabled),
             mascotFolderUri = obj.optString("mascotFolderUri", defaults.mascotFolderUri),
@@ -196,6 +405,9 @@ class CustomConfigStore(
             waveCharacter = enumByName(obj.optString("waveCharacter"), defaults.waveCharacter),
             waveLanguage = enumByName(obj.optString("waveLanguage"), defaults.waveLanguage),
             waveMood = enumByName(obj.optString("waveMood"), defaults.waveMood),
+            trackSourceOverrides = overrides,
+            dislikedTracks = disliked,
+            artistReputation = repMap,
         )
     }
 
@@ -206,6 +418,28 @@ class CustomConfigStore(
 
     companion object {
         private const val PREFS_NAME = "stocky_custom_engine_prefs"
+        private const val CENSORSHIP_PREFS_NAME = "stocky_censorship_cache_prefs"
         private const val KEY_CONFIG_JSON = "custom_config_v2"
+
+        fun buildTrackKey(
+            artist: String,
+            title: String,
+        ): String {
+            val a = TrackMatcher.normalize(artist)
+            val t = TrackMatcher.normalize(title)
+            if (t.isBlank()) return ""
+            return "$a::$t"
+        }
+
+        fun buildArtistKey(artist: String): String {
+            val primary =
+                artist
+                    .substringBefore(",")
+                    .substringBefore("&")
+                    .substringBefore("feat.")
+                    .substringBefore("ft.")
+                    .trim()
+            return TrackMatcher.normalize(primary)
+        }
     }
 }
