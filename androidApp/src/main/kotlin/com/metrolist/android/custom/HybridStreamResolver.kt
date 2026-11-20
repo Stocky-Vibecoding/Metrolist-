@@ -22,6 +22,12 @@ data class ResolverLogEntry(
     val detail: String,
 )
 
+private data class PreResolvedEntry(
+    val resource: PlaybackResource,
+    val sourcePref: TrackSourcePreference,
+    val expiresAtMs: Long,
+)
+
 object ResolverDiagnostics {
     private val _logs = MutableStateFlow<List<ResolverLogEntry>>(emptyList())
     val logs: StateFlow<List<ResolverLogEntry>> = _logs.asStateFlow()
@@ -41,7 +47,7 @@ object ResolverDiagnostics {
         if (!hdCoverUrl.isNullOrBlank()) {
             coverByVideo[videoId] = hdCoverUrl
         }
-        val label = if (artist.isNotBlank()) "$artist — $title" else title
+        val label = if (artist.isNotBlank()) "$artist —$title" else title
         val entry =
             ResolverLogEntry(
                 timestampMs = System.currentTimeMillis(),
@@ -108,6 +114,12 @@ class HybridStreamResolver(
     private val vkProvider: VkMusicProvider,
 ) : StreamResolver {
     private val failedProvidersByVideo = ConcurrentHashMap<String, MutableSet<String>>()
+    private val preResolvedCache = ConcurrentHashMap<String, PreResolvedEntry>()
+    private val preResolvingIds = ConcurrentHashMap.newKeySet<String>()
+
+    init {
+        activeInstance = this
+    }
 
     override suspend fun resolve(
         videoId: String,
@@ -127,7 +139,8 @@ class HybridStreamResolver(
         audioQuality: AudioQuality,
         sourceSong: SongItem?,
     ): PlaybackResource {
-        tryResolveCustom(videoId, sourceSong)?.let { return it }
+        preResolvedCache.remove(videoId)
+        tryResolveCustom(videoId, sourceSong, allowPreResolvedCache = false)?.let { return it }
         val fallback = delegate.refresh(videoId, hints, audioQuality, sourceSong)
         recordYtmFallback(videoId, sourceSong, fallback)
         return fallback
@@ -141,16 +154,69 @@ class HybridStreamResolver(
         refresh: Boolean,
         excludedProfiles: Set<String>,
     ): PlaybackResource {
-        tryResolveCustom(videoId, sourceSong, excludedProfiles)?.let { return it }
+        if (refresh) preResolvedCache.remove(videoId)
+        tryResolveCustom(videoId, sourceSong, excludedProfiles, allowPreResolvedCache = !refresh)?.let { return it }
         val fallback = delegate.resolveRemote(videoId, hints, audioQuality, sourceSong, refresh, excludedProfiles)
         recordYtmFallback(videoId, sourceSong, fallback)
         return fallback
+    }
+
+    private fun invalidateTrackInternal(videoId: String) {
+        failedProvidersByVideo.remove(videoId)
+        preResolvedCache.remove(videoId)
+    }
+
+    private suspend fun preResolveInternal(song: SongItem) {
+        val videoId = song.id
+        if (videoId.isBlank()) return
+        val cfg = configStore.current
+        if (!cfg.hybridResolverEnabled) return
+        if (cfg.yandexToken.isBlank() && cfg.vkToken.isBlank()) return
+        if (song.isLocal || song.isUploaded || song.isPodcast || song.isLive) return
+
+        val now = System.currentTimeMillis()
+        preResolvedCache[videoId]?.takeIf { it.expiresAtMs > now }?.let { return }
+        if (!preResolvingIds.add(videoId)) return
+
+        try {
+            val artist = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
+            val title = (song.canonicalTitle ?: song.title).trim()
+            val manualPref = configStore.getTrackSourceOverride(videoId = videoId, artist = artist, title = title)
+            if (manualPref == TrackSourcePreference.YTM) return
+
+            val resolved =
+                tryResolveCustom(
+                    videoId = videoId,
+                    sourceSong = song,
+                    excludedProfiles = emptySet(),
+                    allowPreResolvedCache = false,
+                    isPreResolve = true,
+                )
+            if (resolved != null) {
+                if (preResolvedCache.size > 30) {
+                    val expiredKeys = preResolvedCache.filterValues { it.expiresAtMs <= now }.keys
+                    expiredKeys.forEach { preResolvedCache.remove(it) }
+                    if (preResolvedCache.size > 30) preResolvedCache.clear()
+                }
+                preResolvedCache[videoId] =
+                    PreResolvedEntry(
+                        resource = resolved,
+                        sourcePref = manualPref,
+                        expiresAtMs = System.currentTimeMillis() + PRE_RESOLVE_TTL_MS,
+                    )
+                Log.d(TAG, "Pre-resolved next track: $artist - $title via${resolved.clientName}")
+            }
+        } finally {
+            preResolvingIds.remove(videoId)
+        }
     }
 
     private suspend fun tryResolveCustom(
         videoId: String,
         sourceSong: SongItem?,
         excludedProfiles: Set<String> = emptySet(),
+        allowPreResolvedCache: Boolean = true,
+        isPreResolve: Boolean = false,
     ): PlaybackResource? {
         val cfg = configStore.current
         if (!cfg.hybridResolverEnabled) return null
@@ -169,14 +235,27 @@ class HybridStreamResolver(
 
         val manualPref = configStore.getTrackSourceOverride(videoId = videoId, artist = artist, title = title)
         if (manualPref == TrackSourcePreference.YTM) {
-            ResolverDiagnostics.record(
-                videoId = videoId,
-                artist = artist,
-                title = title,
-                qualityBadge = "YTM",
-                detail = "ручной выбор",
-            )
+            if (!isPreResolve) {
+                ResolverDiagnostics.record(
+                    videoId = videoId,
+                    artist = artist,
+                    title = title,
+                    qualityBadge = "YTM",
+                    detail = "ручной выбор",
+                )
+            }
             return null
+        }
+
+        if (allowPreResolvedCache && failed.isEmpty() && excludedProfiles.isEmpty()) {
+            val cached = preResolvedCache.remove(videoId)
+            if (cached != null &&
+                cached.expiresAtMs > System.currentTimeMillis() &&
+                cached.sourcePref == manualPref
+            ) {
+                Log.d(TAG, "Instant pre-resolved hit for $artist -$title")
+                return cached.resource
+            }
         }
 
         val reference =
@@ -230,12 +309,13 @@ class HybridStreamResolver(
                     isHls = resolved.isHls,
                 ) ?: resolved.clientName
 
+            val fullDetail = if (isPreResolve) "$reason • пре-резолв" else reason
             ResolverDiagnostics.record(
                 videoId = videoId,
                 artist = artist,
                 title = title,
                 qualityBadge = badge,
-                detail = reason,
+                detail = fullDetail,
                 hdCoverUrl = reference.coverXlUrl,
             )
 
@@ -262,7 +342,7 @@ class HybridStreamResolver(
         artist: String,
         title: String,
     ): Boolean {
-        val combined = "$artist $title"
+        val combined = "$artist$title"
         return combined.any { ch -> ch in '\u0400'..'\u04FF' }
     }
 
@@ -312,11 +392,13 @@ class HybridStreamResolver(
     }
 
     override suspend fun invalidateNetworkScope(state: PlaybackNetworkState) {
+        preResolvedCache.clear()
         delegate.invalidateNetworkScope(state)
     }
 
     override suspend fun resetExtractionBackoff() {
         failedProvidersByVideo.clear()
+        preResolvedCache.clear()
         delegate.resetExtractionBackoff()
     }
 
@@ -328,6 +410,7 @@ class HybridStreamResolver(
         delegate.refreshPlayerConfigAfterStreamRejection()
 
     override suspend fun close() {
+        preResolvedCache.clear()
         delegate.close()
     }
 
@@ -340,7 +423,8 @@ class HybridStreamResolver(
         category: PlaybackFailureCategory,
     ) {
         if (clientName == "yandex" || clientName == "vk") {
-            Log.w(TAG, "Custom stream failed ($clientName, code=$responseCode) for $videoId, falling back")
+            Log.w(TAG, "Custom stream failed ($clientName, code=$responseCode) for$videoId, falling back")
+            preResolvedCache.remove(videoId)
             failedProvidersByVideo.getOrPut(videoId) { ConcurrentHashMap.newKeySet() }.add(clientName)
             return
         }
@@ -357,5 +441,17 @@ class HybridStreamResolver(
 
     companion object {
         private const val TAG = "HybridResolver"
+        private const val PRE_RESOLVE_TTL_MS = 12 * 60 * 1_000L
+
+        @Volatile
+        private var activeInstance: HybridStreamResolver? = null
+
+        fun invalidateTrack(videoId: String) {
+            activeInstance?.invalidateTrackInternal(videoId)
+        }
+
+        suspend fun preResolve(song: SongItem) {
+            activeInstance?.preResolveInternal(song)
+        }
     }
 }
