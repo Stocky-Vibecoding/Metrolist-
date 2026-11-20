@@ -1,5 +1,6 @@
 package com.metrolist.android.custom
 
+import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -69,6 +70,35 @@ class GeminiClient(
             ?.replace("\n", " ")
             ?.trim()
             ?.takeIf { it.length in 6..110 }
+    }
+
+    suspend fun generateMascotPhrasePack(
+        moodHint: String? = null,
+        count: Int = 10,
+    ): List<String> {
+        val cfg = configStore.current
+        if (cfg.geminiApiKey.isBlank()) return emptyList()
+
+        val systemInstruction =
+            "Отвечай СТРОГО валидным JSON-массивом строк без пояснений и без markdown. " +
+                "Формат: [\"Фраза 1\", \"Фраза 2\"]."
+
+        val prompt =
+            buildString {
+                append("Придумай $count коротких (до 9 слов каждая), живых и слегка ироничных фраз на русском от лица музыкального маскота в плеере")
+                if (!moodHint.isNullOrBlank()) append(" под настроение «$moodHint»")
+                append(". Без упоминания конкретных треков, без эмодзи, без кавычек внутри строк, чтобы подходили под разные композиции.")
+            }
+
+        val raw =
+            generateText(
+                prompt = prompt,
+                systemInstruction = systemInstruction,
+                expectJson = true,
+                temperature = 0.95,
+            ).getOrNull() ?: return emptyList()
+
+        return parseStringArray(raw)
     }
 
     suspend fun testConnection(apiKeyOverride: String? = null): Result<String> {
@@ -265,6 +295,34 @@ class GeminiClient(
         }
     }
 
+    private fun parseStringArray(raw: String): List<String> {
+        val fence = "`".repeat(3)
+        val cleaned =
+            raw
+                .trim()
+                .removePrefix(fence + "json")
+                .removePrefix(fence)
+                .removeSuffix(fence)
+                .trim()
+
+        val start = cleaned.indexOf('[')
+        val end = cleaned.lastIndexOf(']')
+        if (start < 0 || end <= start) return emptyList()
+
+        val array = JSONArray(cleaned.substring(start, end + 1))
+        return buildList {
+            for (i in 0 until array.length()) {
+                val line =
+                    array
+                        .optString(i)
+                        .replace("\"", "")
+                        .replace("\n", " ")
+                        .trim()
+                if (line.length in 6..110) add(line)
+            }
+        }.distinct()
+    }
+
     companion object {
         private const val TAG = "GeminiClient"
         private const val COOLDOWN_SHORT_MS = 2 * 60 * 1_000L
@@ -283,5 +341,126 @@ class GeminiClient(
                 "gemini-2.0-flash-lite",
                 "gemini-2.5-pro",
             )
+    }
+}
+
+class MascotPhraseBank(
+    context: Context,
+    private val geminiClient: GeminiClient,
+) {
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private var lastShownLine: String? = null
+    private var tracksSinceMoodLine = 1
+
+    suspend fun nextPhraseForTrack(
+        artist: String,
+        title: String,
+        moodKey: String,
+        moodLabel: String,
+        hasGeminiKey: Boolean,
+    ): String? {
+        val trackKey = "${artist.trim().lowercase()}::${title.trim().lowercase()}"
+
+        // 1. Сначала смотрим кэш конкретного трека (0 запросов к API)
+        loadTrackCache().optString(trackKey).takeIf { it.isNotBlank() }?.let { cached ->
+            lastShownLine = cached
+            tracksSinceMoodLine = 0
+            return cached
+        }
+
+        val now = System.currentTimeMillis()
+        val lastTrackAiMs = prefs.getLong(KEY_LAST_TRACK_AI_MS, 0L)
+
+        // 2. Раз в ~8 минут позволяем ИИ написать персональную фразу под трек и сохраняем её навсегда
+        if (hasGeminiKey && now - lastTrackAiMs >= TRACK_AI_COOLDOWN_MS) {
+            prefs.edit().putLong(KEY_LAST_TRACK_AI_MS, now).apply()
+            val generated = geminiClient.generateMascotLine(artist = artist, title = title, moodHint = moodLabel)
+            if (!generated.isNullOrBlank()) {
+                saveTrackPhrase(trackKey, generated)
+                lastShownLine = generated
+                tracksSinceMoodLine = 0
+                return generated
+            }
+        }
+
+        // 3. Для остальных треков — показываем фразу из локального пула примерно через трек
+        tracksSinceMoodLine += 1
+        if (tracksSinceMoodLine < 2) {
+            return null
+        }
+
+        var pool = loadMoodPool(moodKey)
+        val lastPackMs = prefs.getLong(KEY_LAST_PACK_PREFIX + moodKey, 0L)
+        if (hasGeminiKey && pool.size < MIN_POOL_SIZE && now - lastPackMs >= PACK_REFRESH_COOLDOWN_MS) {
+            prefs.edit().putLong(KEY_LAST_PACK_PREFIX + moodKey, now).apply()
+            val fresh = geminiClient.generateMascotPhrasePack(moodHint = moodLabel, count = 10)
+            if (fresh.isNotEmpty()) {
+                pool = (fresh + pool).distinct().take(MAX_MOOD_POOL)
+                saveMoodPool(moodKey, pool)
+            }
+        }
+
+        if (pool.isEmpty()) return null
+
+        val candidates = pool.filterNot { it == lastShownLine }.ifEmpty { pool }
+        val chosen = candidates.random()
+        lastShownLine = chosen
+        tracksSinceMoodLine = 0
+        return chosen
+    }
+
+    private fun loadTrackCache(): JSONObject =
+        runCatching {
+            JSONObject(prefs.getString(KEY_TRACK_CACHE, "{}").orEmpty())
+        }.getOrElse { JSONObject() }
+
+    private fun saveTrackPhrase(
+        trackKey: String,
+        phrase: String,
+    ) {
+        runCatching {
+            val obj = loadTrackCache()
+            obj.put(trackKey, phrase)
+            while (obj.length() > MAX_TRACK_CACHE) {
+                val oldestKey = obj.keys().next()
+                obj.remove(oldestKey)
+            }
+            prefs.edit().putString(KEY_TRACK_CACHE, obj.toString()).apply()
+        }
+    }
+
+    private fun loadMoodPool(moodKey: String): List<String> =
+        runCatching {
+            val arr = JSONArray(prefs.getString(KEY_MOOD_POOL_PREFIX + moodKey, "[]").orEmpty())
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val s = arr.optString(i).trim()
+                    if (s.isNotBlank()) add(s)
+                }
+            }
+        }.getOrDefault(emptyList())
+
+    private fun saveMoodPool(
+        moodKey: String,
+        phrases: List<String>,
+    ) {
+        runCatching {
+            val arr = JSONArray()
+            phrases.take(MAX_MOOD_POOL).forEach { arr.put(it) }
+            prefs.edit().putString(KEY_MOOD_POOL_PREFIX + moodKey, arr.toString()).apply()
+        }
+    }
+
+    companion object {
+        private const val PREFS_NAME = "metrolist_mascot_phrases"
+        private const val KEY_TRACK_CACHE = "track_cache"
+        private const val KEY_MOOD_POOL_PREFIX = "mood_pool_"
+        private const val KEY_LAST_TRACK_AI_MS = "last_track_ai_ms"
+        private const val KEY_LAST_PACK_PREFIX = "last_pack_ai_ms_"
+        private const val MAX_TRACK_CACHE = 120
+        private const val MAX_MOOD_POOL = 25
+        private const val MIN_POOL_SIZE = 4
+        private const val TRACK_AI_COOLDOWN_MS = 8 * 60 * 1_000L
+        private const val PACK_REFRESH_COOLDOWN_MS = 30 * 60 * 1_000L
     }
 }
