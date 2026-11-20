@@ -46,7 +46,6 @@ class VkMusicProvider(
             return Result.failure(IllegalStateException("Токен ВК не указан"))
         }
 
-        // Проверяем напрямую поиск аудио без лишнего users.get, чтобы не провоцировать #9
         val notes = mutableListOf<String>()
         for ((index, profile) in CLIENT_PROFILES.withIndex()) {
             if (index > 0) delay(700L)
@@ -73,7 +72,13 @@ class VkMusicProvider(
         return Result.failure(IllegalStateException("ВК аудио недоступно (${notes.joinToString("; ")})"))
     }
 
-    suspend fun resolve(reference: TrackReference): ResolvedCustomStream? {
+    suspend fun resolve(reference: TrackReference): ResolvedCustomStream? =
+        resolveWithVariant(reference, variantIndex = 0)?.first
+
+    suspend fun resolveWithVariant(
+        reference: TrackReference,
+        variantIndex: Int = 0,
+    ): Pair<ResolvedCustomStream, String?>? {
         if (System.currentTimeMillis() < floodCooldownUntilMs) return null
         val token = sanitizeToken(configStore.current.vkToken)
         if (token.isBlank()) return null
@@ -82,20 +87,27 @@ class VkMusicProvider(
         if (query.isBlank()) return null
 
         val candidates = searchAudio(token, query)
-        val best = pickBestMatch(candidates, reference) ?: return null
+        val ranked = rankMatches(candidates, reference, relaxed = variantIndex > 0)
+        if (ranked.isEmpty()) return null
+
+        val idx = variantIndex.coerceAtLeast(0) % ranked.size
+        val best = ranked[idx]
+        val variantTag = if (ranked.size > 1 && variantIndex > 0) "#${idx + 1}/${ranked.size}" else null
 
         val isHls = best.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)
-        Log.d(TAG, "Resolved via VK (${if (isHls) "HLS" else "MP3"}): ${best.artist} - ${best.title}")
+        Log.d(TAG, "Resolved via VK (${if (isHls) "HLS" else "MP3"} ${variantTag ?: "#1"}): ${best.artist} - ${best.title}")
 
-        return ResolvedCustomStream(
-            url = best.url,
-            headers = mapOf("User-Agent" to activeProfile.userAgent),
-            mimeType = if (isHls) "application/x-mpegURL" else "audio/mpeg",
-            bitrate = null,
-            durationSec = best.durationSec.takeIf { it > 0L },
-            clientName = "vk",
-            isHls = isHls,
-        )
+        val stream =
+            ResolvedCustomStream(
+                url = best.url,
+                headers = mapOf("User-Agent" to activeProfile.userAgent),
+                mimeType = if (isHls) "application/x-mpegURL" else "audio/mpeg",
+                bitrate = null,
+                durationSec = best.durationSec.takeIf { it > 0L },
+                clientName = "vk",
+                isHls = isHls,
+            )
+        return stream to variantTag
     }
 
     private suspend fun testSearchProfile(
@@ -139,7 +151,7 @@ class VkMusicProvider(
             if (System.currentTimeMillis() < floodCooldownUntilMs) return emptyList()
             val result: List<VkAudioCandidate>? =
                 runCatching<List<VkAudioCandidate>?> {
-                    val url = buildSearchUrl(token = token, query = query, count = 15, profile = profile)
+                    val url = buildSearchUrl(token = token, query = query, count = 20, profile = profile)
                     val response =
                         CustomHttp.get(
                             url = url,
@@ -224,14 +236,17 @@ class VkMusicProvider(
         }
     }
 
-    private fun pickBestMatch(
+    private fun rankMatches(
         candidates: List<VkAudioCandidate>,
         reference: TrackReference,
-    ): VkAudioCandidate? =
-        candidates
+        relaxed: Boolean,
+    ): List<VkAudioCandidate> {
+        val tolerance = if (relaxed) 12L else 5L
+        val minScore = if (relaxed) 55 else 65
+        return candidates
             .filter { candidate ->
                 !TrackMatcher.hasForbiddenStopWord(reference.title, candidate.title) &&
-                    TrackMatcher.isDurationAcceptable(reference.durationSec, candidate.durationSec, toleranceSec = 5L)
+                    TrackMatcher.isDurationAcceptable(reference.durationSec, candidate.durationSec, toleranceSec = tolerance)
             }.mapNotNull { candidate ->
                 val score =
                     TrackMatcher.matchScore(
@@ -242,15 +257,17 @@ class VkMusicProvider(
                         candidateTitle = candidate.title,
                         candidateDurationSec = candidate.durationSec,
                     )
-                if (score >= 65) {
+                if (score >= minScore) {
                     val explicitBonus = if (reference.isExplicit && candidate.isExplicit) 12 else 0
                     val directMp3Bonus = if (!candidate.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)) 4 else 0
                     candidate to (score + explicitBonus + directMp3Bonus)
                 } else {
                     null
                 }
-            }.maxByOrNull { it.second }
-            ?.first
+            }.sortedByDescending { it.second }
+            .map { it.first }
+            .distinctBy { it.url.substringBefore('?') }
+    }
 
     private fun sanitizeToken(raw: String): String {
         val trimmed = raw.trim()
