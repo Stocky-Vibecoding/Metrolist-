@@ -520,7 +520,12 @@ fun MetrolistApp(
         val currentRoute = navigationState.backStacks[navigationState.topLevelRoute]?.last()
         val isWaveHomeActive = currentRoute == Screen.Home && customCfg.useWaveAsHome && !forceClassicHomeState.value
         val startupPresentation = LocalStartupPresentation.current
-        SideEffect { startupPresentation?.homeRequired = currentRoute == Screen.Home }
+        SideEffect {
+            startupPresentation?.homeRequired = currentRoute == Screen.Home && !isWaveHomeActive
+            if (isWaveHomeActive) {
+                startupPresentation?.avatarReady = true
+            }
+        }
         val navigator = remember(navigationState) { Navigator(navigationState) }
         val homeScrollToTopEvents =
             remember {
@@ -2334,7 +2339,7 @@ private fun TopBarProfileAvatar(
             } else {
                 Icon(
                     MetrolistIcons.Outlined.AccountCircle,
-                    contentDescription = stringResource(Res.string.profile),
+                    contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(24.dp),
                 )
