@@ -17,6 +17,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 
 data class AiPlaylistResult(
     val query: String,
@@ -28,12 +29,54 @@ class AiWaveEngine(
     private val geminiClient: GeminiClient,
 ) {
     private val waveMutex = Mutex()
+    private val sessionSkippedUntilMs = ConcurrentHashMap<String, Long>()
+    private val sessionSkippedLabels = ConcurrentHashMap<String, String>()
 
     private val _isGeneratingWave = MutableStateFlow(false)
     val isGeneratingWave: StateFlow<Boolean> = _isGeneratingWave.asStateFlow()
 
     private val _statusText = MutableStateFlow<String?>(null)
     val statusText: StateFlow<String?> = _statusText.asStateFlow()
+
+    fun recordSessionSkip(song: SongItem) {
+        val artist = song.artists.joinToString(", ") { it.name }.trim()
+        val key = CustomConfigStore.buildTrackKey(artist, song.title)
+        if (key.isBlank()) return
+        sessionSkippedUntilMs[key] = System.currentTimeMillis() + SESSION_SKIP_COOLDOWN_MS
+        sessionSkippedLabels[key] = if (artist.isNotBlank()) "$artist — ${song.title}" else song.title
+        if (sessionSkippedLabels.size > 20) {
+            val firstKey = sessionSkippedLabels.keys.firstOrNull()
+            if (firstKey != null) sessionSkippedLabels.remove(firstKey)
+        }
+    }
+
+    fun recordDislike(song: SongItem) {
+        val artist = song.artists.joinToString(", ") { it.name }.trim()
+        configStore.dislikeTrack(artist = artist, title = song.title)
+        recordSessionSkip(song)
+    }
+
+    fun recordLike(song: SongItem) {
+        val artist = song.artists.joinToString(", ") { it.name }.trim()
+        configStore.likeTrack(artist = artist, title = song.title)
+        val key = CustomConfigStore.buildTrackKey(artist, song.title)
+        sessionSkippedUntilMs.remove(key)
+        sessionSkippedLabels.remove(key)
+    }
+
+    private fun isSessionSkipped(
+        artist: String,
+        title: String,
+    ): Boolean {
+        val key = CustomConfigStore.buildTrackKey(artist, title)
+        val until = sessionSkippedUntilMs[key] ?: return false
+        if (System.currentTimeMillis() > until) {
+            sessionSkippedUntilMs.remove(key)
+            sessionSkippedLabels.remove(key)
+            return false
+        }
+        return true
+    }
 
     suspend fun generateWaveSongs(
         seedSong: SongItem? = null,
@@ -45,32 +88,17 @@ class AiWaveEngine(
             try {
                 val cfg = configStore.current
                 val tasteSummary = collectTasteSummary(cfg)
-                val prompt =
-                    buildString {
-                        if (seedSong != null) {
-                            val seedArtist = seedSong.artists.joinToString(", ") { it.name }.trim()
-                            appendLine("Собери радио-волну, развивающую трек: \"$seedArtist — ${seedSong.title}\".")
-                            appendLine("Сохраняй близкое звучание, темп и настроение, но добавляй свежие и органичные треки.")
-                        } else {
-                            appendLine("Собери персональную музыкальную волну для пользователя.")
-                            appendLine("Характер волны: ${cfg.waveCharacter.promptHint}.")
-                            appendLine("Язык: ${cfg.waveLanguage.promptHint}.")
-                            appendLine("Настроение: ${cfg.waveMood.promptHint}.")
-                        }
-                        if (tasteSummary.isNotBlank()) {
-                            appendLine("История и вкусы пользователя: $tasteSummary.")
-                        }
-                        if (cfg.waveCharacter == WaveCharacter.DISCOVERY) {
-                            appendLine("ВАЖНО: не предлагай треки и главных артистов из списка истории, ищи свежие варианты.")
-                        }
-                    }
+                val targetCount = count.coerceIn(10, 25)
+                val prompt = buildWavePrompt(cfg = cfg, seedSong = seedSong, tasteSummary = tasteSummary)
 
                 geminiClient
-                    .generateTrackList(prompt = prompt, count = count.coerceIn(10, 40))
+                    .generateTrackList(prompt = prompt, count = targetCount)
                     .mapCatching { suggestions ->
-                        val resolved = resolveSuggestionsToSongs(suggestions)
-                        check(resolved.isNotEmpty()) { "Не удалось найти ни одного трека в каталоге" }
-                        resolved
+                        val filtered = filterSuggestionsByFeedback(suggestions)
+                        val resolved = resolveSuggestionsToSongs(filtered, maxResults = targetCount)
+                        val cleanResolved = filterSongsByFeedback(resolved)
+                        check(cleanResolved.isNotEmpty()) { "Не удалось найти ни одного трека в каталоге" }
+                        cleanResolved
                     }.onSuccess {
                         _statusText.value = null
                     }.onFailure { err ->
@@ -91,25 +119,63 @@ class AiWaveEngine(
         }
         val cfg = configStore.current
         val tasteSummary = collectTasteSummary(cfg)
-        val prompt =
-            buildString {
-                appendLine("Пользователь хочет подобрать музыку по запросу: \"$cleanRequest\".")
-                if (cfg.waveLanguage != WaveLanguage.ANY) {
-                    appendLine("Языковое предпочтение: ${cfg.waveLanguage.promptHint}.")
-                }
-                if (tasteSummary.isNotBlank()) {
-                    appendLine("Дополнительный контекст вкуса пользователя: $tasteSummary.")
-                }
-                appendLine("Подбери треки, которые точно попадают в этот запрос, эпоху, стиль или настроение.")
+        val targetCount = count.coerceIn(10, 100)
+
+        val allSuggestions = mutableListOf<AiTrackSuggestion>()
+        val seenKeys = HashSet<String>()
+
+        // Для 50+ треков запрашиваем двумя пачками, чтобы JSON не обрезался на середине
+        val batchSizes =
+            if (targetCount > 50) {
+                listOf(50, targetCount - 50)
+            } else {
+                listOf(targetCount)
             }
 
-        return geminiClient
-            .generateTrackList(prompt = prompt, count = count.coerceIn(10, 40))
-            .mapCatching { suggestions ->
-                val resolved = resolveSuggestionsToSongs(suggestions)
-                check(resolved.isNotEmpty()) { "Не удалось подобрать треки по запросу" }
-                AiPlaylistResult(query = cleanRequest, songs = resolved)
-            }
+        var lastError: Throwable? = null
+        for ((index, batchCount) in batchSizes.withIndex()) {
+            val prompt =
+                buildString {
+                    appendLine("Пользователь хочет подобрать музыку по запросу: \"$cleanRequest\".")
+                    if (cfg.waveLanguage != WaveLanguage.ANY) {
+                        appendLine("Языковое предпочтение: ${cfg.waveLanguage.promptHint}.")
+                    }
+                    if (tasteSummary.isNotBlank()) {
+                        appendLine("Дополнительный контекст вкуса пользователя: $tasteSummary.")
+                    }
+                    if (index > 0 && allSuggestions.isNotEmpty()) {
+                        val exclude = allSuggestions.takeLast(30).joinToString("; ") { "${it.artist} - ${it.title}" }
+                        appendLine("НЕ повторяй уже предложенные треки: $exclude.")
+                    }
+                    appendFeedbackHints(cfg, includeSessionSkips = false)
+                    appendLine("Подбери треки, которые точно попадают в этот запрос, эпоху, стиль или настроение.")
+                }
+
+            val batchResult = geminiClient.generateTrackList(prompt = prompt, count = batchCount)
+            batchResult
+                .onSuccess { list ->
+                    list.forEach { item ->
+                        val k = CustomConfigStore.buildTrackKey(item.artist, item.title)
+                        if (k.isNotBlank() && seenKeys.add(k)) {
+                            allSuggestions.add(item)
+                        }
+                    }
+                }.onFailure { err ->
+                    lastError = err
+                }
+        }
+
+        if (allSuggestions.isEmpty()) {
+            return Result.failure(lastError ?: IllegalStateException("Не удалось подобрать треки по запросу"))
+        }
+
+        val filtered = filterSuggestionsByFeedback(allSuggestions, respectSessionSkips = false)
+        val resolved = resolveSuggestionsToSongs(filtered, maxResults = targetCount)
+        val cleanResolved = filterSongsByFeedback(resolved, respectSessionSkips = false)
+        if (cleanResolved.isEmpty()) {
+            return Result.failure(IllegalStateException("Не удалось найти треки в каталоге"))
+        }
+        return Result.success(AiPlaylistResult(query = cleanRequest, songs = cleanResolved))
     }
 
     suspend fun generateMascotPhrase(song: SongItem): String? {
@@ -126,6 +192,78 @@ class AiWaveEngine(
             moodHint = moodHint,
         )
     }
+
+    private fun buildWavePrompt(
+        cfg: CustomAppConfig,
+        seedSong: SongItem?,
+        tasteSummary: String,
+    ): String =
+        buildString {
+            if (seedSong != null) {
+                val seedArtist = seedSong.artists.joinToString(", ") { it.name }.trim()
+                appendLine("Собери радио-волну, развивающую трек: \"$seedArtist — ${seedSong.title}\".")
+                appendLine("Сохраняй близкое звучание, темп и настроение, но добавляй свежие и органичные треки.")
+            } else {
+                appendLine("Собери персональную музыкальную волну для пользователя.")
+                appendLine("Характер волны: ${cfg.waveCharacter.promptHint}.")
+                appendLine("Язык: ${cfg.waveLanguage.promptHint}.")
+                appendLine("Настроение: ${cfg.waveMood.promptHint}.")
+            }
+            if (tasteSummary.isNotBlank()) {
+                appendLine("История и вкусы пользователя: $tasteSummary.")
+            }
+            if (cfg.waveCharacter == WaveCharacter.DISCOVERY) {
+                appendLine("ВАЖНО: не предлагай треки и главных артистов из списка истории, ищи свежие варианты.")
+            }
+            appendFeedbackHints(cfg, includeSessionSkips = true)
+        }
+
+    private fun StringBuilder.appendFeedbackHints(
+        cfg: CustomAppConfig,
+        includeSessionSkips: Boolean,
+    ) {
+        val mutedArtists = cfg.artistReputation.filterValues { it.isAutoMuted }.keys.take(15)
+        if (mutedArtists.isNotEmpty()) {
+            appendLine("Исключи артистов, которых пользователь системно дизлайкал: ${mutedArtists.joinToString(", ")}.")
+        }
+        val lowWeightArtists = cfg.artistReputation.filterValues { it.isLowWeight }.keys.take(12)
+        if (lowWeightArtists.isNotEmpty()) {
+            appendLine("Добавляй редко (не больше 1 трека и только лучшие хиты): ${lowWeightArtists.joinToString(", ")}.")
+        }
+        if (includeSessionSkips) {
+            val now = System.currentTimeMillis()
+            val recentSkips =
+                sessionSkippedUntilMs
+                    .filterValues { it > now }
+                    .keys
+                    .mapNotNull { sessionSkippedLabels[it] }
+                    .take(8)
+            if (recentSkips.isNotEmpty()) {
+                appendLine("Недавние пропуски в этой сессии (временно не под настроение, но без вечного бана артистов): ${recentSkips.joinToString("; ")}.")
+            }
+        }
+    }
+
+    private fun filterSuggestionsByFeedback(
+        suggestions: List<AiTrackSuggestion>,
+        respectSessionSkips: Boolean = true,
+    ): List<AiTrackSuggestion> =
+        suggestions.filter { item ->
+            !configStore.isTrackDisliked(item.artist, item.title) &&
+                !configStore.isArtistAutoMuted(item.artist) &&
+                (!respectSessionSkips || !isSessionSkipped(item.artist, item.title))
+        }
+
+    private fun filterSongsByFeedback(
+        songs: List<SongItem>,
+        respectSessionSkips: Boolean = true,
+    ): List<SongItem> =
+        songs.filter { song ->
+            val artist = song.artists.joinToString(", ") { it.name }.trim()
+            !configStore.isTrackDisliked(artist, song.title) &&
+                !configStore.isArtistAutoMuted(artist) &&
+                (!respectSessionSkips || !isSessionSkipped(artist, song.title))
+        }
 
     private suspend fun collectTasteSummary(cfg: CustomAppConfig): String =
         withContext(Dispatchers.IO) {
@@ -171,10 +309,11 @@ class AiWaveEngine(
 
     private suspend fun resolveSuggestionsToSongs(
         suggestions: List<AiTrackSuggestion>,
+        maxResults: Int = 35,
     ): List<SongItem> =
         coroutineScope {
             val found =
-                suggestions.take(35).chunked(5).flatMap { batch ->
+                suggestions.take(maxResults).chunked(6).flatMap { batch ->
                     batch.map { item ->
                         async(Dispatchers.IO) {
                             runCatching {
@@ -220,6 +359,7 @@ class AiWaveEngine(
 
     companion object {
         private const val TAG = "AiWaveEngine"
+        private const val SESSION_SKIP_COOLDOWN_MS = 3 * 60 * 60 * 1_000L
 
         fun isPlaylistLikeQuery(rawQuery: String): Boolean {
             val q = rawQuery.trim().lowercase()
