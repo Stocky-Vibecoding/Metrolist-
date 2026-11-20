@@ -5,15 +5,9 @@ package com.metrolist.android.custom
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.net.Uri
-import android.provider.DocumentsContract
-import android.view.TextureView
 import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
@@ -22,10 +16,12 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -52,7 +48,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -67,15 +62,12 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -87,9 +79,6 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -97,29 +86,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.net.toUri
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.ExoPlayer
 import com.metrolist.android.playback.PlayerConnection
 import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.components.images.AsyncImage
 import com.metrolist.shared.ui.icons.MetrolistIcons
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.sin
-
-private val PurpleNeonPrimary = Color(0xFF9D4EDD)
-private val PurpleNeonGlow = Color(0xFF7B2CBF)
-private val PurpleNeonSoft = Color(0xFFC77DFF)
 
 @Composable
 fun WaveHomeScreen(
@@ -131,7 +105,6 @@ fun WaveHomeScreen(
     playerConnection: PlayerConnection?,
     bottomInset: Dp,
     onExpandPlayer: () -> Unit,
-    onSwitchToClassicHome: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -150,20 +123,15 @@ fun WaveHomeScreen(
 
     var bassEnergy by remember { mutableFloatStateOf(0f) }
     var beatKick by remember { mutableFloatStateOf(0f) }
-    var spectrumBands by remember { mutableStateOf(FloatArray(18)) }
     var mascotPhrase by remember { mutableStateOf<String?>(null) }
     var showWaveSettingsSheet by remember { mutableStateOf(false) }
     var showEngineSettingsSheet by remember { mutableStateOf(false) }
 
-    val accentColor = rememberNeonAccentColor(cfg.neonColorMode, currentSong?.thumbnail)
-
     LaunchedEffect(isPlaying) {
         if (!isPlaying) {
             while (isActive) {
-                bassEnergy = (bassEnergy * 0.84f).coerceAtLeast(0f)
+                bassEnergy = (bassEnergy * 0.85f).coerceAtLeast(0f)
                 beatKick = (beatKick * 0.80f).coerceAtLeast(0f)
-                val decayed = FloatArray(18) { i -> (spectrumBands[i] * 0.82f).coerceAtLeast(0f) }
-                spectrumBands = decayed
                 if (bassEnergy < 0.01f && beatKick < 0.01f) break
                 delay(32L)
             }
@@ -174,22 +142,18 @@ fun WaveHomeScreen(
         try {
             while (isActive) {
                 val levels = com.metrolist.shared.equalizer.AudioSpectrumMeter.levels()
-                val nextBands =
-                    FloatArray(18) { i ->
-                        val raw = levels.getOrElse(i) { 0f }.coerceIn(0f, 1f)
-                        val prev = spectrumBands[i]
-                        if (raw > prev) raw else (prev * 0.72f + raw * 0.28f)
-                    }
-                spectrumBands = nextBands
-
-                val rawBass = ((nextBands[0] * 0.45f) + (nextBands[1] * 0.35f) + (nextBands[2] * 0.20f)).coerceIn(0f, 1f)
+                val rawBass =
+                    (
+                        (levels.getOrElse(0) { 0f } * 0.45f) +
+                            (levels.getOrElse(1) { 0f } * 0.35f) +
+                            (levels.getOrElse(2) { 0f } * 0.20f)
+                    ).coerceIn(0f, 1f)
                 bassEnergy = if (rawBass > bassEnergy) rawBass else (bassEnergy * 0.78f + rawBass * 0.22f)
 
                 val delta = (rawBass - avgBass).coerceAtLeast(0f)
                 avgBass = avgBass * 0.90f + rawBass * 0.10f
-                val kickNow = (delta * 3.4f).coerceIn(0f, 1f)
+                val kickNow = (delta * 3.2f).coerceIn(0f, 1f)
                 beatKick = if (kickNow > beatKick) kickNow else (beatKick * 0.76f)
-
                 delay(32L)
             }
         } finally {
@@ -214,23 +178,25 @@ fun WaveHomeScreen(
             return
         }
         scope.launch {
-            val result = aiWaveEngine.generateWaveSongs()
-            result.onSuccess { songs ->
-                playerConnection?.playQueue(songs, queueTitle = "Моя волна", finite = false)
-            }.onFailure { err ->
-                Toast.makeText(context, err.message ?: "Не удалось запустить волну", Toast.LENGTH_SHORT).show()
-            }
+            aiWaveEngine
+                .generateWaveSongs()
+                .onSuccess { songs ->
+                    playerConnection?.playQueue(songs, queueTitle = "Моя волна", finite = false)
+                }.onFailure { err ->
+                    Toast.makeText(context, err.message ?: "Не удалось запустить волну", Toast.LENGTH_SHORT).show()
+                }
         }
     }
 
-    fun refreshWaveWithCurrentFilters() {
+    fun refreshWave() {
         scope.launch {
-            val result = aiWaveEngine.generateWaveSongs()
-            result.onSuccess { songs ->
-                playerConnection?.playQueue(songs, queueTitle = "Моя волна", finite = false)
-            }.onFailure { err ->
-                Toast.makeText(context, err.message ?: "Не удалось обновить волну", Toast.LENGTH_SHORT).show()
-            }
+            aiWaveEngine
+                .generateWaveSongs()
+                .onSuccess { songs ->
+                    playerConnection?.playQueue(songs, queueTitle = "Моя волна", finite = false)
+                }.onFailure { err ->
+                    Toast.makeText(context, err.message ?: "Не удалось обновить волну", Toast.LENGTH_SHORT).show()
+                }
         }
     }
 
@@ -240,14 +206,14 @@ fun WaveHomeScreen(
         modifier =
             modifier
                 .fillMaxSize()
-                .background(Color.Black)
-                .padding(top = statusBarTop + 8.dp, bottom = bottomInset + 12.dp, start = 18.dp, end = 18.dp),
+                .padding(top = statusBarTop + 8.dp, bottom = bottomInset + 12.dp, start = 16.dp, end = 16.dp),
     ) {
         val isWideLayout = maxWidth >= 600.dp
 
         Column(modifier = Modifier.fillMaxSize()) {
+            // Верхняя панель в родном стиле Metrolist
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
@@ -259,16 +225,16 @@ fun WaveHomeScreen(
                         text = "Моя волна",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color.White,
+                        color = MaterialTheme.colorScheme.onSurface,
                     )
-                    SourceBadge(clientName = playbackResource?.clientName)
+                    NativeSourceBadge(clientName = playbackResource?.clientName)
                 }
 
                 IconButton(onClick = { showEngineSettingsSheet = true }) {
                     Icon(
                         imageVector = MetrolistIcons.Outlined.Settings,
                         contentDescription = "Настройки движка",
-                        tint = Color.White.copy(alpha = 0.85f),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
@@ -279,22 +245,19 @@ fun WaveHomeScreen(
                 Row(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(28.dp),
+                    horizontalArrangement = Arrangement.spacedBy(24.dp),
                 ) {
                     Box(
                         modifier = Modifier.weight(1f),
                         contentAlignment = Alignment.Center,
                     ) {
-                        MascotStage(
-                            mascotEnabled = cfg.mascotEnabled,
-                            folderUri = cfg.mascotFolderUri,
-                            trackKey = currentSong?.id,
-                            accentColor = accentColor,
+                        AmbientWaveButton(
+                            isPlaying = isPlaying,
+                            isGenerating = isGenerating,
                             bassEnergy = bassEnergy,
                             beatKick = beatKick,
-                            spectrumBands = spectrumBands,
-                            isPlaying = isPlaying,
-                            size = 250.dp,
+                            size = 240.dp,
+                            onClick = ::startOrToggleWave,
                         )
                     }
 
@@ -303,17 +266,20 @@ fun WaveHomeScreen(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center,
                     ) {
-                        WaveControlsBlock(
+                        WaveSettingsSlider(
+                            config = cfg,
+                            onOpenFullSettings = { showWaveSettingsSheet = true },
+                            onSelectMood = { mood ->
+                                configStore.update { it.copy(waveMood = mood) }
+                                refreshWave()
+                            },
+                        )
+
+                        WaveBottomStatusAndPlayer(
                             currentSong = currentSong,
-                            isPlaying = isPlaying,
-                            isGenerating = isGenerating,
                             isLiked = isCurrentLiked,
-                            filterSummary = cfg.waveFilterSummary(),
                             statusOrPhrase = waveStatus ?: mascotPhrase,
                             activeModel = activeModel,
-                            accentColor = accentColor,
-                            onPlayPauseClick = ::startOrToggleWave,
-                            onOpenWaveSettings = { showWaveSettingsSheet = true },
                             onToggleLike = { song -> SongLikeState.toggleLike(song) },
                             onNextClick = { playerConnection?.skipToNext() },
                             onOpenFullPlayer = onExpandPlayer,
@@ -326,31 +292,34 @@ fun WaveHomeScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    MascotStage(
-                        mascotEnabled = cfg.mascotEnabled,
-                        folderUri = cfg.mascotFolderUri,
-                        trackKey = currentSong?.id,
-                        accentColor = accentColor,
+                    // Центр: кнопка волны / слот маскота с амбиент-свечением (тап = Play/Pause)
+                    AmbientWaveButton(
+                        isPlaying = isPlaying,
+                        isGenerating = isGenerating,
                         bassEnergy = bassEnergy,
                         beatKick = beatKick,
-                        spectrumBands = spectrumBands,
-                        isPlaying = isPlaying,
-                        size = 252.dp,
+                        size = 248.dp,
+                        onClick = ::startOrToggleWave,
                     )
 
                     Spacer(modifier = Modifier.height(20.dp))
 
-                    WaveControlsBlock(
+                    // Слайдер быстрой настройки волны под центром
+                    WaveSettingsSlider(
+                        config = cfg,
+                        onOpenFullSettings = { showWaveSettingsSheet = true },
+                        onSelectMood = { mood ->
+                            configStore.update { it.copy(waveMood = mood) }
+                            refreshWave()
+                        },
+                    )
+
+                    // Ниже: статус и карточка активного плеера
+                    WaveBottomStatusAndPlayer(
                         currentSong = currentSong,
-                        isPlaying = isPlaying,
-                        isGenerating = isGenerating,
                         isLiked = isCurrentLiked,
-                        filterSummary = cfg.waveFilterSummary(),
                         statusOrPhrase = waveStatus ?: mascotPhrase,
                         activeModel = activeModel,
-                        accentColor = accentColor,
-                        onPlayPauseClick = ::startOrToggleWave,
-                        onOpenWaveSettings = { showWaveSettingsSheet = true },
                         onToggleLike = { song -> SongLikeState.toggleLike(song) },
                         onNextClick = { playerConnection?.skipToNext() },
                         onOpenFullPlayer = onExpandPlayer,
@@ -365,16 +334,13 @@ fun WaveHomeScreen(
         ModalBottomSheet(
             onDismissRequest = { showWaveSettingsSheet = false },
             sheetState = sheetState,
-            containerColor = Color(0xFF121018),
-            contentColor = Color.White,
         ) {
             WaveFilterSheetContent(
                 config = cfg,
-                accentColor = accentColor,
                 onUpdate = { transform -> configStore.update(transform) },
                 onApplyAndWave = {
                     showWaveSettingsSheet = false
-                    refreshWaveWithCurrentFilters()
+                    refreshWave()
                 },
             )
         }
@@ -385,110 +351,206 @@ fun WaveHomeScreen(
         ModalBottomSheet(
             onDismissRequest = { showEngineSettingsSheet = false },
             sheetState = sheetState,
-            containerColor = Color(0xFF121018),
-            contentColor = Color.White,
         ) {
             CustomEngineSettingsContent(
                 configStore = configStore,
                 yandexProvider = yandexProvider,
                 vkProvider = vkProvider,
                 geminiClient = geminiClient,
-                onOpenClassicHome = {
-                    showEngineSettingsSheet = false
-                    onSwitchToClassicHome()
-                },
             )
         }
     }
 }
 
 @Composable
-private fun WaveControlsBlock(
-    currentSong: SongItem?,
+private fun AmbientWaveButton(
     isPlaying: Boolean,
     isGenerating: Boolean,
+    bassEnergy: Float,
+    beatKick: Float,
+    size: Dp,
+    onClick: () -> Unit,
+) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val tertiaryColor = MaterialTheme.colorScheme.tertiary
+    val containerColor = MaterialTheme.colorScheme.primaryContainer
+    val onContainerColor = MaterialTheme.colorScheme.onPrimaryContainer
+
+    val pulse = bassEnergy.coerceIn(0f, 1f)
+    val kick = beatKick.coerceIn(0f, 1f)
+
+    val infiniteTransition = rememberInfiniteTransition(label = "waveAmbient")
+    val idleBreath by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec =
+            infiniteRepeatable(
+                animation = tween(durationMillis = 3200, easing = FastOutSlowInEasing),
+                repeatMode = RepeatMode.Reverse,
+            ),
+        label = "idleBreath",
+    )
+
+    val centerScale by animateFloatAsState(
+        targetValue = if (isPlaying) 1f + pulse * 0.06f + kick * 0.04f else 1f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        label = "centerScale",
+    )
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier.size(size),
+    ) {
+        // Мягкое амбиент-свечение в цветах текущей темы / обложки
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val center = Offset(this.size.width / 2f, this.size.height / 2f)
+            val maxR = this.size.minDimension / 2f
+            val energy = if (isPlaying) pulse else idleBreath * 0.28f
+
+            val outerR = maxR * (0.78f + energy * 0.18f + kick * 0.06f)
+            drawCircle(
+                brush =
+                    Brush.radialGradient(
+                        colors =
+                            listOf(
+                                primaryColor.copy(alpha = (0.34f + energy * 0.28f + kick * 0.12f).coerceIn(0f, 0.72f)),
+                                tertiaryColor.copy(alpha = (0.14f + energy * 0.16f).coerceIn(0f, 0.42f)),
+                                Color.Transparent,
+                            ),
+                        center = center,
+                        radius = outerR,
+                    ),
+                radius = outerR,
+                center = center,
+            )
+
+            val innerR = maxR * (0.50f + energy * 0.12f)
+            drawCircle(
+                brush =
+                    Brush.radialGradient(
+                        colors =
+                            listOf(
+                                primaryColor.copy(alpha = (0.28f + energy * 0.22f).coerceIn(0f, 0.60f)),
+                                Color.Transparent,
+                            ),
+                        center = center,
+                        radius = innerR,
+                    ),
+                radius = innerR,
+                center = center,
+            )
+        }
+
+        // Интерактивный центр (тап = Play/Pause волны; на Этапе 3 здесь встанет встроенный маскот)
+        Surface(
+            onClick = onClick,
+            enabled = !isGenerating,
+            shape = CircleShape,
+            color = containerColor.copy(alpha = 0.92f),
+            contentColor = onContainerColor,
+            tonalElevation = 6.dp,
+            shadowElevation = 10.dp,
+            border = BorderStroke(1.dp, primaryColor.copy(alpha = 0.35f)),
+            modifier = Modifier.size(112.dp).scale(centerScale),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                if (isGenerating) {
+                    CircularProgressIndicator(
+                        color = onContainerColor,
+                        strokeWidth = 3.dp,
+                        modifier = Modifier.size(34.dp),
+                    )
+                } else {
+                    Icon(
+                        imageVector = if (isPlaying) MetrolistIcons.Filled.Pause else MetrolistIcons.Filled.PlayArrow,
+                        contentDescription = if (isPlaying) "Пауза" else "Запустить волну",
+                        modifier = Modifier.size(48.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WaveSettingsSlider(
+    config: CustomAppConfig,
+    onOpenFullSettings: () -> Unit,
+    onSelectMood: (WaveMood) -> Unit,
+) {
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        FilterChip(
+            selected = false,
+            onClick = onOpenFullSettings,
+            leadingIcon = {
+                Icon(
+                    imageVector = MetrolistIcons.Outlined.Tune,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                )
+            },
+            label = {
+                Text(
+                    text = "${config.waveCharacter.label} ·${config.waveLanguage.label}",
+                    maxLines = 1,
+                )
+            },
+        )
+
+        WaveMood.entries.forEach { mood ->
+            FilterChip(
+                selected = config.waveMood == mood,
+                onClick = { onSelectMood(mood) },
+                label = { Text(mood.label, maxLines = 1) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun WaveBottomStatusAndPlayer(
+    currentSong: SongItem?,
     isLiked: Boolean,
-    filterSummary: String,
     statusOrPhrase: String?,
     activeModel: String?,
-    accentColor: Color,
-    onPlayPauseClick: () -> Unit,
-    onOpenWaveSettings: () -> Unit,
     onToggleLike: (SongItem) -> Unit,
     onNextClick: () -> Unit,
     onOpenFullPlayer: () -> Unit,
 ) {
-    val buttonScale by animateFloatAsState(
-        targetValue = if (isPlaying) 1.04f else 1f,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
-        label = "playScale",
-    )
-
-    Surface(
-        onClick = onPlayPauseClick,
-        enabled = !isGenerating,
-        shape = CircleShape,
-        color = accentColor,
-        contentColor = Color.White,
-        shadowElevation = 14.dp,
-        modifier = Modifier.size(74.dp).scale(buttonScale),
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            if (isGenerating) {
-                CircularProgressIndicator(
-                    color = Color.White,
-                    strokeWidth = 3.dp,
-                    modifier = Modifier.size(28.dp),
-                )
-            } else {
-                Icon(
-                    imageVector = if (isPlaying) MetrolistIcons.Filled.Pause else MetrolistIcons.Filled.PlayArrow,
-                    contentDescription = if (isPlaying) "Пауза" else "Запустить волну",
-                    modifier = Modifier.size(36.dp),
-                )
-            }
-        }
+    if (!statusOrPhrase.isNullOrBlank()) {
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = statusOrPhrase,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp),
+        )
     }
 
-    Spacer(modifier = Modifier.height(12.dp))
-
-    Surface(
-        onClick = onOpenWaveSettings,
-        shape = RoundedCornerShape(999.dp),
-        color = Color(0xFF161121),
-        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.40f)),
+    AnimatedVisibility(
+        visible = currentSong != null,
+        enter = fadeIn(),
+        exit = fadeOut(),
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Icon(
-                imageVector = MetrolistIcons.Outlined.Tune,
-                contentDescription = null,
-                tint = PurpleNeonSoft,
-                modifier = Modifier.size(16.dp),
-            )
-            Text(
-                text = filterSummary,
-                style = MaterialTheme.typography.labelLarge,
-                color = Color.White.copy(alpha = 0.92f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-
-    AnimatedVisibility(visible = currentSong != null) {
         val song = currentSong ?: return@AnimatedVisibility
         val artistLine = song.artists.joinToString(", ") { it.name }.trim()
 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(modifier = Modifier.height(18.dp))
+            Spacer(modifier = Modifier.height(16.dp))
             Surface(
                 shape = RoundedCornerShape(22.dp),
-                color = Color(0xFF14101D),
-                border = BorderStroke(1.dp, accentColor.copy(alpha = 0.22f)),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                tonalElevation = 2.dp,
                 modifier = Modifier.fillMaxWidth().widthIn(max = 460.dp),
             ) {
                 Row(
@@ -501,8 +563,8 @@ private fun WaveControlsBlock(
                         contentScale = ContentScale.Crop,
                         modifier =
                             Modifier
-                                .size(44.dp)
-                                .clip(RoundedCornerShape(12.dp))
+                                .size(48.dp)
+                                .clip(RoundedCornerShape(14.dp))
                                 .clickable(onClick = onOpenFullPlayer),
                     )
                     Spacer(modifier = Modifier.width(12.dp))
@@ -513,7 +575,7 @@ private fun WaveControlsBlock(
                             text = song.title,
                             style = MaterialTheme.typography.bodyLarge,
                             fontWeight = FontWeight.Medium,
-                            color = Color.White,
+                            color = MaterialTheme.colorScheme.onSurface,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -521,7 +583,7 @@ private fun WaveControlsBlock(
                             Text(
                                 text = artistLine,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = Color.White.copy(alpha = 0.65f),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -531,14 +593,14 @@ private fun WaveControlsBlock(
                         Icon(
                             imageVector = if (isLiked) MetrolistIcons.Filled.Favorite else MetrolistIcons.Outlined.FavoriteBorder,
                             contentDescription = "Лайк",
-                            tint = if (isLiked) accentColor else Color.White.copy(alpha = 0.75f),
+                            tint = if (isLiked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     IconButton(onClick = onNextClick) {
                         Icon(
                             imageVector = MetrolistIcons.Filled.SkipNext,
                             contentDescription = "Следующий",
-                            tint = Color.White.copy(alpha = 0.85f),
+                            tint = MaterialTheme.colorScheme.onSurface,
                         )
                     }
                 }
@@ -546,257 +608,18 @@ private fun WaveControlsBlock(
         }
     }
 
-    if (!statusOrPhrase.isNullOrBlank()) {
-        Spacer(modifier = Modifier.height(12.dp))
-        Text(
-            text = statusOrPhrase,
-            style = MaterialTheme.typography.bodySmall,
-            color = Color.White.copy(alpha = 0.72f),
-            textAlign = TextAlign.Center,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 12.dp),
-        )
-    }
-
     if (!activeModel.isNullOrBlank()) {
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(modifier = Modifier.height(6.dp))
         Text(
             text = "ИИ: $activeModel",
             style = MaterialTheme.typography.labelSmall,
-            color = PurpleNeonSoft.copy(alpha = 0.60f),
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
         )
     }
 }
 
-@androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-private fun MascotStage(
-    mascotEnabled: Boolean,
-    folderUri: String,
-    trackKey: String?,
-    accentColor: Color,
-    bassEnergy: Float,
-    beatKick: Float,
-    spectrumBands: FloatArray,
-    isPlaying: Boolean,
-    size: Dp,
-) {
-    val context = LocalContext.current
-    val pulse = bassEnergy.coerceIn(0f, 1f)
-    val kick = beatKick.coerceIn(0f, 1f)
-
-    var videos by remember { mutableStateOf<List<Uri>>(emptyList()) }
-    var videoIndex by remember { mutableIntStateOf(0) }
-
-    LaunchedEffect(folderUri, mascotEnabled) {
-        videos =
-            if (!mascotEnabled || folderUri.isBlank()) {
-                emptyList()
-            } else {
-                withContext(Dispatchers.IO) {
-                    listVideoUrisInFolder(context, folderUri.toUri())
-                }
-            }
-        videoIndex = 0
-    }
-
-    LaunchedEffect(trackKey, videos.size) {
-        if (videos.size > 1 && trackKey != null) {
-            videoIndex = (videoIndex + 1) % videos.size
-        }
-    }
-
-    val exoPlayer =
-        remember(videos) {
-            if (videos.isEmpty()) {
-                null
-            } else {
-                ExoPlayer.Builder(context).build().apply {
-                    volume = 0f
-                    repeatMode = Player.REPEAT_MODE_ONE
-                    videos.forEach { uri -> addMediaItem(MediaItem.fromUri(uri)) }
-                    prepare()
-                    playWhenReady = true
-                }
-            }
-        }
-
-    DisposableEffect(exoPlayer) {
-        onDispose { exoPlayer?.release() }
-    }
-
-    LaunchedEffect(exoPlayer, isPlaying, videoIndex, videos.size) {
-        val player = exoPlayer ?: return@LaunchedEffect
-        if (videos.isNotEmpty() && player.currentMediaItemIndex != videoIndex) {
-            player.seekTo(videoIndex.coerceIn(0, videos.lastIndex), 0L)
-        }
-        player.playWhenReady = isPlaying
-    }
-
-    val infiniteTransition = rememberInfiniteTransition(label = "neonWaveIdle")
-    val idleBreath by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec =
-            infiniteRepeatable(
-                animation = tween(durationMillis = 2800, easing = FastOutSlowInEasing),
-                repeatMode = RepeatMode.Reverse,
-            ),
-        label = "breath",
-    )
-    val phaseDeg by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec =
-            infiniteRepeatable(
-                animation = tween(durationMillis = 16000, easing = LinearEasing),
-                repeatMode = RepeatMode.Restart,
-            ),
-        label = "phase",
-    )
-
-    val secondaryColor = remember(accentColor) { lerp(accentColor, PurpleNeonSoft, 0.55f) }
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier =
-            Modifier
-                .size(size)
-                .clickable(enabled = videos.size > 1) {
-                    videoIndex = (videoIndex + 1) % videos.size
-                },
-    ) {
-        // Реактивная плазма и 36-лучевой неоновый спектр вокруг центра
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val center = Offset(this.size.width / 2f, this.size.height / 2f)
-            val maxR = this.size.minDimension / 2f
-            val energy = if (isPlaying) pulse else idleBreath * 0.22f
-            val auraRadius = maxR * (0.76f + energy * 0.22f + kick * 0.10f)
-
-            drawCircle(
-                brush =
-                    Brush.radialGradient(
-                        colors =
-                            listOf(
-                                accentColor.copy(alpha = (0.36f + energy * 0.34f + kick * 0.16f).coerceIn(0f, 0.85f)),
-                                PurpleNeonGlow.copy(alpha = (0.16f + energy * 0.22f).coerceIn(0f, 0.55f)),
-                                Color.Transparent,
-                            ),
-                        center = center,
-                        radius = auraRadius,
-                    ),
-                radius = auraRadius,
-                center = center,
-            )
-
-            // Кольцо ударной волны при ударе бочки
-            if (kick > 0.08f) {
-                drawCircle(
-                    color = secondaryColor.copy(alpha = (kick * 0.55f).coerceIn(0f, 0.6f)),
-                    radius = maxR * (0.58f + kick * 0.26f),
-                    center = center,
-                    style = Stroke(width = (1.5f + kick * 2.5f).dp.toPx()),
-                )
-            }
-
-            // 36 неоновых штрихов спектра по кругу (зеркалируем 18 полос)
-            val barCount = 36
-            val innerR = maxR * (0.48f + energy * 0.05f)
-            val maxBarLen = maxR * 0.30f
-            for (i in 0 until barCount) {
-                val bandIdx = if (i < 18) i else (35 - i)
-                val level =
-                    if (isPlaying) {
-                        spectrumBands.getOrElse(bandIdx) { 0f }
-                    } else {
-                        val wave = sin(((phaseDeg + i * 20f) * PI / 180.0)).toFloat() * 0.5f + 0.5f
-                        0.08f + wave * 0.14f
-                    }
-                val angleRad = ((i * (360f / barCount) + phaseDeg * 0.25f) * PI / 180.0)
-                val cosA = cos(angleRad).toFloat()
-                val sinA = sin(angleRad).toFloat()
-                val barLen = (maxBarLen * (0.14f + level * 0.86f + kick * 0.12f)).coerceAtMost(maxBarLen * 1.15f)
-                val start = Offset(center.x + cosA * innerR, center.y + sinA * innerR)
-                val end = Offset(center.x + cosA * (innerR + barLen), center.y + sinA * (innerR + barLen))
-                val barColor = lerp(accentColor, secondaryColor, level.coerceIn(0f, 1f))
-                drawLine(
-                    color = barColor.copy(alpha = (0.38f + level * 0.60f).coerceIn(0f, 1f)),
-                    start = start,
-                    end = end,
-                    strokeWidth = 2.6.dp.toPx(),
-                    cap = StrokeCap.Round,
-                )
-            }
-
-            // Если нет видео — рисуем живое неоновое ядро вместо пустого круга
-            if (exoPlayer == null || videos.isEmpty()) {
-                val coreR = maxR * (0.34f + energy * 0.09f + kick * 0.05f)
-                drawCircle(
-                    brush =
-                        Brush.radialGradient(
-                            colors =
-                                listOf(
-                                    secondaryColor.copy(alpha = 0.85f),
-                                    accentColor.copy(alpha = 0.62f),
-                                    PurpleNeonGlow.copy(alpha = 0.18f),
-                                    Color.Transparent,
-                                ),
-                            center = center,
-                            radius = coreR,
-                        ),
-                    radius = coreR,
-                    center = center,
-                )
-            }
-        }
-
-        // Если выбрана папка с видео маскота — плавно вплавляем видео в чёрный фон без жёсткой рамки
-        if (exoPlayer != null && videos.isNotEmpty()) {
-            val videoBoxSize = size * 0.68f
-            Box(
-                modifier =
-                    Modifier
-                        .size(videoBoxSize)
-                        .scale(1f + pulse * 0.05f + kick * 0.04f)
-                        .clip(CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                AndroidView(
-                    factory = { ctx ->
-                        TextureView(ctx).apply {
-                            exoPlayer.setVideoTextureView(this)
-                        }
-                    },
-                    update = { view ->
-                        exoPlayer.setVideoTextureView(view)
-                    },
-                    modifier = Modifier.fillMaxSize(),
-                )
-                // Мягкая чёрная виньетка по краю, чтобы видео растворялось в OLED-фоне
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val c = Offset(this.size.width / 2f, this.size.height / 2f)
-                    val r = this.size.minDimension / 2f
-                    drawCircle(
-                        brush =
-                            Brush.radialGradient(
-                                0.68f to Color.Transparent,
-                                0.90f to Color.Black.copy(alpha = 0.72f),
-                                1.0f to Color.Black,
-                                center = c,
-                                radius = r,
-                            ),
-                        radius = r,
-                        center = c,
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SourceBadge(clientName: String?) {
+private fun NativeSourceBadge(clientName: String?) {
     val label =
         when (clientName) {
             "yandex" -> "Я.Музыка"
@@ -804,23 +627,16 @@ private fun SourceBadge(clientName: String?) {
             null, "" -> return
             else -> "YTM"
         }
-    val tint =
-        when (clientName) {
-            "yandex" -> Color(0xFFFFCC00)
-            "vk" -> Color(0xFF4C9AFF)
-            else -> PurpleNeonSoft
-        }
     Surface(
         shape = RoundedCornerShape(8.dp),
-        color = tint.copy(alpha = 0.16f),
-        border = BorderStroke(1.dp, tint.copy(alpha = 0.45f)),
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
     ) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Medium,
-            color = tint,
-            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
         )
     }
 }
@@ -828,7 +644,6 @@ private fun SourceBadge(clientName: String?) {
 @Composable
 private fun WaveFilterSheetContent(
     config: CustomAppConfig,
-    accentColor: Color,
     onUpdate: ((CustomAppConfig) -> CustomAppConfig) -> Unit,
     onApplyAndWave: () -> Unit,
 ) {
@@ -844,17 +659,15 @@ private fun WaveFilterSheetContent(
             text = "Настройка волны",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
-            color = Color.White,
         )
 
         FilterGroupTitle("Характер")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             WaveCharacter.entries.forEach { item ->
-                NeonFilterChip(
+                FilterChip(
                     selected = config.waveCharacter == item,
-                    label = item.label,
-                    accentColor = accentColor,
                     onClick = { onUpdate { it.copy(waveCharacter = item) } },
+                    label = { Text(item.label, maxLines = 1) },
                 )
             }
         }
@@ -862,11 +675,10 @@ private fun WaveFilterSheetContent(
         FilterGroupTitle("Язык")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             WaveLanguage.entries.forEach { item ->
-                NeonFilterChip(
+                FilterChip(
                     selected = config.waveLanguage == item,
-                    label = item.label,
-                    accentColor = accentColor,
                     onClick = { onUpdate { it.copy(waveLanguage = item) } },
+                    label = { Text(item.label, maxLines = 1) },
                 )
             }
         }
@@ -874,18 +686,16 @@ private fun WaveFilterSheetContent(
         FilterGroupTitle("Настроение")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             WaveMood.entries.forEach { item ->
-                NeonFilterChip(
+                FilterChip(
                     selected = config.waveMood == item,
-                    label = item.label,
-                    accentColor = accentColor,
                     onClick = { onUpdate { it.copy(waveMood = item) } },
+                    label = { Text(item.label, maxLines = 1) },
                 )
             }
         }
 
         Button(
             onClick = onApplyAndWave,
-            colors = ButtonDefaults.buttonColors(containerColor = accentColor, contentColor = Color.White),
             modifier = Modifier.fillMaxWidth().height(48.dp),
         ) {
             Text("Запустить с настройками", fontWeight = FontWeight.SemiBold)
@@ -900,35 +710,7 @@ private fun FilterGroupTitle(text: String) {
     Text(
         text = text,
         style = MaterialTheme.typography.labelLarge,
-        color = Color.White.copy(alpha = 0.7f),
-    )
-}
-
-@Composable
-private fun NeonFilterChip(
-    selected: Boolean,
-    label: String,
-    accentColor: Color,
-    onClick: () -> Unit,
-) {
-    FilterChip(
-        selected = selected,
-        onClick = onClick,
-        label = { Text(label, maxLines = 1) },
-        colors =
-            FilterChipDefaults.filterChipColors(
-                containerColor = Color(0xFF1C1729),
-                labelColor = Color.White.copy(alpha = 0.8f),
-                selectedContainerColor = accentColor.copy(alpha = 0.28f),
-                selectedLabelColor = Color.White,
-            ),
-        border =
-            FilterChipDefaults.filterChipBorder(
-                enabled = true,
-                selected = selected,
-                borderColor = Color.White.copy(alpha = 0.14f),
-                selectedBorderColor = accentColor,
-            ),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
 }
 
@@ -955,20 +737,6 @@ fun CustomEngineSettingsContent(
     var jsonBackupInput by remember { mutableStateOf("") }
     var statusMessage by remember { mutableStateOf<String?>(null) }
 
-    val folderPicker =
-        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
-            if (treeUri != null) {
-                runCatching {
-                    context.contentResolver.takePersistableUriPermission(
-                        treeUri,
-                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                    )
-                }
-                configStore.update { it.copy(mascotFolderUri = treeUri.toString()) }
-                statusMessage = "Папка маскота сохранена"
-            }
-        }
-
     fun persistInputs() {
         configStore.update {
             it.copy(
@@ -991,10 +759,9 @@ fun CustomEngineSettingsContent(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(
-            text = "Движок, ИИ и маскот",
+            text = "Источники и ИИ-движок",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
-            color = Color.White,
         )
 
         SettingSwitchRow(
@@ -1008,57 +775,23 @@ fun CustomEngineSettingsContent(
             onCheckedChange = { v -> configStore.update { it.copy(preferVkForExplicit = v) } },
         )
         SettingSwitchRow(
-            title = "Открывать «Мою волну» на главной",
+            title = "Открывать вкладку «Волна» при старте",
             checked = cfg.useWaveAsHome,
             onCheckedChange = { v -> configStore.update { it.copy(useWaveAsHome = v) } },
         )
-        SettingSwitchRow(
-            title = "Видео-маскот (без папки работает неоновый спектр)",
-            checked = cfg.mascotEnabled,
-            onCheckedChange = { v -> configStore.update { it.copy(mascotEnabled = v) } },
-        )
-
-        FilterGroupTitle("Цвет басового неона")
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            NeonColorMode.entries.forEach { mode ->
-                NeonFilterChip(
-                    selected = cfg.neonColorMode == mode,
-                    label = mode.label,
-                    accentColor = PurpleNeonPrimary,
-                    onClick = { configStore.update { it.copy(neonColorMode = mode) } },
-                )
-            }
-        }
 
         FilterGroupTitle("Треков в подборках ИИ: ${cfg.aiPlaylistSize}")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             listOf(15, 20, 25, 35).forEach { size ->
-                NeonFilterChip(
+                FilterChip(
                     selected = cfg.aiPlaylistSize == size,
-                    label = "$size",
-                    accentColor = PurpleNeonPrimary,
                     onClick = { configStore.update { it.copy(aiPlaylistSize = size) } },
+                    label = { Text("$size", maxLines = 1) },
                 )
             }
         }
 
-        OutlinedButton(
-            onClick = { folderPicker.launch(null) },
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(
-                text = if (cfg.mascotFolderUri.isBlank()) "Выбрать папку с видео маскота (.mp4)" else "Сменить папку видео маскота",
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        if (cfg.mascotFolderUri.isNotBlank()) {
-            TextButton(onClick = { configStore.update { it.copy(mascotFolderUri = "") } }) {
-                Text("Сбросить папку и вернуть неоновый спектр", color = PurpleNeonSoft)
-            }
-        }
-
-        HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
+        HorizontalDivider()
 
         OutlinedTextField(
             value = yandexInput,
@@ -1093,7 +826,7 @@ fun CustomEngineSettingsContent(
             Text(
                 text = "Статус: ${yandexPlus.name}",
                 style = MaterialTheme.typography.bodySmall,
-                color = Color.White.copy(alpha = 0.7f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
 
@@ -1150,18 +883,16 @@ fun CustomEngineSettingsContent(
 
         FilterGroupTitle("Режим моделей Gemini (автопереключение при 429/503)")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            NeonFilterChip(
+            FilterChip(
                 selected = cfg.geminiModelMode == CustomAppConfig.MODEL_MODE_AUTO,
-                label = "AUTO (каскад)",
-                accentColor = PurpleNeonPrimary,
                 onClick = { configStore.update { it.copy(geminiModelMode = CustomAppConfig.MODEL_MODE_AUTO) } },
+                label = { Text("AUTO (каскад)", maxLines = 1) },
             )
             GeminiClient.DEFAULT_MODELS.forEach { modelName ->
-                NeonFilterChip(
+                FilterChip(
                     selected = cfg.geminiModelMode == modelName,
-                    label = modelName.removePrefix("gemini-"),
-                    accentColor = PurpleNeonPrimary,
                     onClick = { configStore.update { it.copy(geminiModelMode = modelName) } },
+                    label = { Text(modelName.removePrefix("gemini-"), maxLines = 1) },
                 )
             }
         }
@@ -1169,7 +900,7 @@ fun CustomEngineSettingsContent(
             Text(
                 text = "Последняя рабочая модель: $activeModel",
                 style = MaterialTheme.typography.bodySmall,
-                color = PurpleNeonSoft,
+                color = MaterialTheme.colorScheme.primary,
             )
         }
 
@@ -1192,13 +923,12 @@ fun CustomEngineSettingsContent(
                 persistInputs()
                 statusMessage = "Ключи и настройки сохранены"
             },
-            colors = ButtonDefaults.buttonColors(containerColor = PurpleNeonPrimary, contentColor = Color.White),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Сохранить ключи")
         }
 
-        HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
+        HorizontalDivider()
 
         FilterGroupTitle("JSON-бэкап ключей и настроек")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1252,12 +982,8 @@ fun CustomEngineSettingsContent(
             Text(
                 text = statusMessage.orEmpty(),
                 style = MaterialTheme.typography.bodySmall,
-                color = PurpleNeonSoft,
+                color = MaterialTheme.colorScheme.primary,
             )
-        }
-
-        TextButton(onClick = onOpenClassicHome) {
-            Text("Открыть стандартную ленту YTM", color = Color.White.copy(alpha = 0.5f))
         }
 
         Spacer(modifier = Modifier.height(20.dp))
@@ -1278,7 +1004,6 @@ private fun SettingSwitchRow(
         Text(
             text = title,
             style = MaterialTheme.typography.bodyMedium,
-            color = Color.White,
             modifier = Modifier.weight(1f).padding(end = 12.dp),
         )
         Switch(checked = checked, onCheckedChange = onCheckedChange)
@@ -1311,7 +1036,7 @@ fun SearchAiPlaylistCard(
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        border = BorderStroke(1.dp, PurpleNeonPrimary.copy(alpha = 0.35f)),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)),
         modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
@@ -1322,7 +1047,7 @@ fun SearchAiPlaylistCard(
                 Icon(
                     imageVector = MetrolistIcons.Outlined.AutoAwesome,
                     contentDescription = null,
-                    tint = PurpleNeonSoft,
+                    tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(18.dp),
                 )
                 Text(
@@ -1422,65 +1147,3 @@ fun SearchAiPlaylistCard(
         }
     }
 }
-
-@Composable
-private fun rememberNeonAccentColor(
-    mode: NeonColorMode,
-    artworkUrl: String?,
-): Color =
-    remember(mode, artworkUrl) {
-        when (mode) {
-            NeonColorMode.PURPLE -> PurpleNeonPrimary
-            NeonColorMode.CYAN -> Color(0xFF00E5FF)
-            NeonColorMode.CRIMSON -> Color(0xFFFF2E63)
-            NeonColorMode.AUTO -> {
-                if (artworkUrl.isNullOrBlank()) {
-                    PurpleNeonPrimary
-                } else {
-                    val hash = artworkUrl.hashCode()
-                    val hueShift = ((hash and 0xFF) / 255f)
-                    lerp(PurpleNeonPrimary, PurpleNeonGlow, hueShift)
-                }
-            }
-        }
-    }
-
-private fun listVideoUrisInFolder(
-    context: Context,
-    treeUri: Uri,
-): List<Uri> =
-    runCatching {
-        val docId = DocumentsContract.getTreeDocumentId(treeUri)
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
-        val out = mutableListOf<Uri>()
-        context.contentResolver
-            .query(
-                childrenUri,
-                arrayOf(
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                ),
-                null,
-                null,
-                null,
-            )?.use { cursor ->
-                val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                while (cursor.moveToNext()) {
-                    val id = if (idIdx >= 0) cursor.getString(idIdx) else continue
-                    val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx).orEmpty() else ""
-                    val name = if (nameIdx >= 0) cursor.getString(nameIdx).orEmpty().lowercase() else ""
-                    val isVideo =
-                        mime.startsWith("video/") ||
-                            name.endsWith(".mp4") ||
-                            name.endsWith(".webm") ||
-                            name.endsWith(".mkv")
-                    if (isVideo) {
-                        out += DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
-                    }
-                }
-            }
-        out
-    }.getOrDefault(emptyList())
