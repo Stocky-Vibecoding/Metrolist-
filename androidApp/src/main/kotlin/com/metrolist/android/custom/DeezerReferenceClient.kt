@@ -113,7 +113,7 @@ class DeezerReferenceClient {
     ): TrackReference {
         val cleanArtist = TrackMatcher.cleanSearchTerm(artist)
         val cleanTitle = TrackMatcher.cleanSearchTerm(title)
-        val cacheKey = "${cleanArtist.lowercase()}\vert{}${cleanTitle.lowercase()}"
+        val cacheKey = "${cleanArtist.lowercase()}::${cleanTitle.lowercase()}"
         cache[cacheKey]?.let { return it }
 
         val fallback =
@@ -156,7 +156,7 @@ class DeezerReferenceClient {
                     }
                 pickBestDeezerMatch(candidates, cleanArtist, cleanTitle, fallbackDurationSec)
             }.onFailure { error ->
-                Log.d(TAG, "Deezer lookup skipped for $cleanArtist - $cleanTitle:${error.message}")
+                Log.d(TAG, "Deezer lookup skipped for $cleanArtist - $cleanTitle: ${error.message}")
             }.getOrNull()
 
         val resolved =
