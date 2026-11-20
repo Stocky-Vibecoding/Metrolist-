@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+
 package com.metrolist.android.custom
 
 import android.content.ClipData
@@ -9,7 +11,6 @@ import android.view.TextureView
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
@@ -18,7 +19,6 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
@@ -75,6 +76,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
@@ -87,7 +89,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.net.toUri
-import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -105,7 +106,6 @@ private val PurpleNeonPrimary = Color(0xFF9D4EDD)
 private val PurpleNeonGlow = Color(0xFF7B2CBF)
 private val PurpleNeonSoft = Color(0xFFC77DFF)
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WaveHomeScreen(
     configStore: CustomConfigStore,
@@ -214,7 +214,6 @@ fun WaveHomeScreen(
         val isWideLayout = maxWidth >= 600.dp
 
         Column(modifier = Modifier.fillMaxSize()) {
-            // Компактная верхняя панель без лишнего шума
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -395,7 +394,6 @@ private fun WaveControlsBlock(
         label = "playScale",
     )
 
-    // Главная кнопка Play / Pause
     Surface(
         onClick = onPlayPauseClick,
         enabled = !isGenerating,
@@ -424,7 +422,6 @@ private fun WaveControlsBlock(
 
     Spacer(modifier = Modifier.height(12.dp))
 
-    // Небольшая капсула настройки волны под кнопкой Play
     Surface(
         onClick = onOpenWaveSettings,
         shape = RoundedCornerShape(999.dp),
@@ -452,7 +449,6 @@ private fun WaveControlsBlock(
         }
     }
 
-    // Строка воспроизведения появляется при наличии активного трека
     AnimatedVisibility(visible = currentSong != null) {
         val song = currentSong ?: return@AnimatedVisibility
         val artistLine = song.artists.joinToString(", ") { it.name }.trim()
@@ -539,7 +535,7 @@ private fun WaveControlsBlock(
     }
 }
 
-@OptIn(UnstableApi::class)
+@androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 private fun MascotWithBassNeon(
     mascotEnabled: Boolean,
@@ -643,7 +639,6 @@ private fun MascotWithBassNeon(
                     modifier = Modifier.fillMaxSize(),
                 )
             } else {
-                // Минималистичный басовый неон-символ, если папка маскота не задана
                 Box(
                     modifier =
                         Modifier
@@ -694,7 +689,6 @@ private fun SourceBadge(clientName: String?) {
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun WaveFilterSheetContent(
     config: CustomAppConfig,
@@ -802,7 +796,6 @@ private fun NeonFilterChip(
     )
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun CustomEngineSettingsContent(
     configStore: CustomConfigStore,
@@ -926,8 +919,6 @@ fun CustomEngineSettingsContent(
             onClick = { folderPicker.launch(null) },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Icon(MetrolistIcons.Outlined.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = if (cfg.mascotFolderUri.isBlank()) "Выбрать папку с видео маскота" else "Сменить папку видео маскота",
                 maxLines = 1,
@@ -1075,7 +1066,6 @@ fun CustomEngineSettingsContent(
 
         HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
 
-        // JSON бэкап / импорт
         FilterGroupTitle("JSON-бэкап ключей и настроек")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
@@ -1109,7 +1099,7 @@ fun CustomEngineSettingsContent(
                         }
                 },
             ) {
-                Icon(MetrolistIcons.Outlined.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                Icon(MetrolistIcons.Outlined.Download, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Импорт JSON")
             }
