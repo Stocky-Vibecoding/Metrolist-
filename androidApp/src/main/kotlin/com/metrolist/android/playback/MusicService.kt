@@ -41,6 +41,7 @@ import androidx.media3.session.SessionResult
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.android.App
 import com.metrolist.android.MainActivity
 import com.metrolist.android.R
@@ -1704,8 +1705,9 @@ class MusicService :
         var urlRecoveryBudget: PlaybackRecoveryBudget? = null
         val started =
             withQueueLoading(isPlaybackLoading = true) {
+                val bypassCache = PlaybackNetworkStateStore.current.connected && HybridStreamResolver.shouldBypassAudioCache(sourceSong)
                 val cachedAudio =
-                    if (!wantVideo && sourceSong.canSwitchToAudioTrack) {
+                    if (!wantVideo && !bypassCache && sourceSong.canSwitchToAudioTrack) {
                         audioCacheManager.getCachedPlaybackResource(sourceSong)
                     } else {
                         null
@@ -2712,9 +2714,12 @@ class MusicService :
         wantVideo: Boolean = song.isVideoSong,
     ): PlaybackFetchResult =
         withContext(Dispatchers.IO) {
-            val connected = PlaybackNetworkStateStore.current.connected
-            cachedAudioResource(wantVideo && connected) { audioCacheManager.getCachedPlaybackResource(song) }
-                ?.let { return@withContext PlaybackFetchResult(resource = it) }
+          val connected = PlaybackNetworkStateStore.current.connected
+            val bypassCache = connected && HybridStreamResolver.shouldBypassAudioCache(song)
+            if (!bypassCache) {
+                cachedAudioResource(wantVideo && connected) { audioCacheManager.getCachedPlaybackResource(song) }
+                    ?.let { return@withContext PlaybackFetchResult(resource = it) }
+            }
             if (!connected && !song.isLocal && !song.id.startsWith("local_")) return@withContext PlaybackFetchResult()
             val hints = song.toAndroidContentHints(wantVideo = wantVideo)
             Timber.tag(MUSIC_VIDEO_TAG).d(
