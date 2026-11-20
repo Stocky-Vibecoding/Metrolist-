@@ -7,6 +7,13 @@ package com.metrolist.android.di
 
 import coil3.ImageLoader
 import coil3.imageLoader
+import com.metrolist.android.custom.AiWaveEngine
+import com.metrolist.android.custom.CustomConfigStore
+import com.metrolist.android.custom.DeezerReferenceClient
+import com.metrolist.android.custom.GeminiClient
+import com.metrolist.android.custom.HybridStreamResolver
+import com.metrolist.android.custom.VkMusicProvider
+import com.metrolist.android.custom.YandexMusicProvider
 import com.metrolist.android.playback.AudioCacheManager
 import com.metrolist.android.playback.ExoPlaybackBenchmarkPlayer
 import com.metrolist.android.playback.PlayerConnection
@@ -31,6 +38,7 @@ import com.metrolist.shared.youtube.benchmark.PlaybackBenchmarkRunner
 import com.metrolist.shared.youtube.logging.MetrolistInnerTubeLogger
 import com.metrolist.shared.youtube.playback.DefaultStreamResolver
 import com.metrolist.shared.youtube.playback.LocalAudioSource
+import com.metrolist.shared.youtube.playback.StreamResolver
 import com.metrolist.shared.youtube.strategy.ClientHealthTracker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -100,6 +108,40 @@ val appModule =
                 context = androidContext(),
                 playlistWidgetManager = get(),
                 imageLoader = get(),
+            )
+        }
+
+        single(createdAtStart = true) {
+            CustomConfigStore(androidContext())
+        }
+
+        single { DeezerReferenceClient() }
+
+        single { YandexMusicProvider(get()) }
+
+        single { VkMusicProvider(get()) }
+
+        single { GeminiClient(get()) }
+
+        single { AiWaveEngine(get(), get()) }
+
+        single<StreamResolver> {
+            val baseResolver =
+                DefaultStreamResolver(
+                    extractor = get(),
+                    innerTube = get(),
+                    tokenProvider = getOrNull(),
+                    clientHealthTracker = get(),
+                    playerConfigRefresh = { get<YouTubeCipherService>().refreshAfterStreamRejection() },
+                    musicVideoResolver = get(),
+                    localAudioSource = getOrNull<LocalAudioSource>(),
+                )
+            HybridStreamResolver(
+                delegate = baseResolver,
+                configStore = get(),
+                deezerClient = get(),
+                yandexProvider = get(),
+                vkProvider = get(),
             )
         }
 
