@@ -1,6 +1,8 @@
 package com.metrolist.android.custom
 
 import android.util.Log
+import kotlinx.coroutines.delay
+import org.json.JSONArray
 import org.json.JSONObject
 
 private data class VkAudioCandidate(
@@ -11,10 +13,16 @@ private data class VkAudioCandidate(
     val isExplicit: Boolean,
 )
 
+private enum class VkSearchEndpoint(val label: String) {
+    CATALOG("catalog"),
+    LEGACY("audio.search"),
+}
+
 private data class VkClientProfile(
     val label: String,
     val userAgent: String,
     val apiVersion: String,
+    val endpoint: VkSearchEndpoint,
 )
 
 class VkMusicProvider(
@@ -35,73 +43,83 @@ class VkMusicProvider(
             return Result.failure(IllegalStateException("Токен ВК не указан"))
         }
 
-        // Шаг 1: проверяем, что сам токен живой
+        // Шаг 1: проверяем сам токен
         var accountName: String? = null
-        runCatching {
-            val userUrl =
-                "${apiBaseUrl()}/users.get" +
-                    "?access_token=${CustomHttp.urlEncode(cleanToken)}" +
-                    "&v=5.131"
-            val userResp = CustomHttp.get(userUrl, headers = mapOf("User-Agent" to activeProfile.userAgent), timeoutMs = 8_000)
-            if (userResp.isSuccess) {
-                val root = JSONObject(userResp.body)
+        val userCheck =
+            runCatching<Result<String?>> {
+                val userUrl =
+                    "${apiBaseUrl()}/users.get" +
+                        "?access_token=${CustomHttp.urlEncode(cleanToken)}" +
+                        "&v=5.131"
+                val resp = CustomHttp.get(userUrl, headers = mapOf("User-Agent" to activeProfile.userAgent), timeoutMs = 8_000)
+                if (!resp.isSuccess) {
+                    return@runCatching Result.failure<String?>(IllegalStateException("VK HTTP ${resp.code}"))
+                }
+                val root = JSONObject(resp.body)
                 if (root.has("error")) {
                     val err = root.optJSONObject("error")
                     val code = err?.optInt("error_code", -1) ?: -1
                     val msg = err?.optString("error_msg").orEmpty()
-                    return Result.failure(IllegalStateException("Токен невалиден — VK #$code: $msg"))
+                    val readable =
+                        when (code) {
+                            9 -> "VK #9: Флуд-контроль — подожди 1-2 минуты и проверь снова"
+                            5 -> "Токен истёк или отозван (VK #5)"
+                            else -> "VK #$code: $msg"
+                        }
+                    return@runCatching Result.failure<String?>(IllegalStateException(readable))
                 }
                 val first = root.optJSONArray("response")?.optJSONObject(0)
-                if (first != null) {
-                    accountName = listOf(first.optString("first_name"), first.optString("last_name"))
-                        .filter { it.isNotBlank() }
-                        .joinToString(" ")
-                }
-            }
-        }
+                val fullName =
+                    first?.let {
+                        listOf(it.optString("first_name"), it.optString("last_name"))
+                            .filter { part -> part.isNotBlank() }
+                            .joinToString(" ")
+                    }
+                Result.success(fullName)
+            }.getOrElse { Result.failure(it) }
 
-        // Шаг 2: подбираем рабочую пару User-Agent + версия API для audio.search
-        var lastError = "Нет ответа от VK API"
+        if (userCheck.isFailure) {
+            return Result.failure(userCheck.exceptionOrNull() ?: IllegalStateException("Ошибка подключения к ВК"))
+        }
+        accountName = userCheck.getOrNull()
+
+        // Шаг 2: аккуратно проверяем рабочий метод поиска с паузами, чтобы не словить Flood control
+        val notes = mutableListOf<String>()
         for (profile in CLIENT_PROFILES) {
-            val attempt =
-                runCatching {
-                    val url =
-                        "${apiBaseUrl()}/audio.search" +
-                            "?q=test&count=1&lang=ru" +
-                            "&access_token=${CustomHttp.urlEncode(cleanToken)}" +
-                            "&v=${profile.apiVersion}"
-                    val response =
-                        CustomHttp.get(
-                            url = url,
-                            headers = mapOf("User-Agent" to profile.userAgent),
-                            timeoutMs = 8_000,
-                        )
-                    if (!response.isSuccess) {
-                        return@runCatching Result.failure<String>(IllegalStateException("VK HTTP ${response.code}"))
-                    }
-                    val root = JSONObject(response.body)
-                    if (root.has("error")) {
-                        val err = root.optJSONObject("error")
-                        val code = err?.optInt("error_code", -1) ?: -1
-                        val msg = err?.optString("error_msg").orEmpty()
-                        Result.failure<String>(IllegalStateException("VK #$code: $msg"))
-                    } else if (root.has("response")) {
-                        activeProfile = profile
-                        val who = accountName?.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
-                        Result.success("ВК аудио работает (${profile.label}$who)")
-                    } else {
-                        Result.failure<String>(IllegalStateException("Пустой ответ от VK"))
-                    }
-                }.getOrElse { err ->
-                    Result.failure(err)
-                }
-
-            if (attempt.isSuccess) return attempt
-            lastError = attempt.exceptionOrNull()?.message ?: lastError
+            delay(450L)
+            val attempt = testSearchProfile(cleanToken, profile)
+            if (attempt.isSuccess) {
+                activeProfile = profile
+                val who = accountName?.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
+                return Result.success("ВК аудио работает (${profile.label}/${profile.endpoint.label}$who)")
+            }
+            val errMsg = attempt.exceptionOrNull()?.message.orEmpty()
+            if (errMsg.contains("#9")) {
+                return Result.failure(IllegalStateException("VK #9: Флуд-контроль — подожди 1-2 минуты и повтори"))
+            }
+            notes.add("${profile.label}/${profile.endpoint.label}: $errMsg")
         }
 
-        val prefix = accountName?.takeIf { it.isNotBlank() }?.let { "Аккаунт $it найден, но аудио закрыто: " }.orEmpty()
-        return Result.failure(IllegalStateException("$prefix$lastError"))
+        // Шаг 3: проверяем audio.get, чтобы понять, открыт ли вообще доступ к аудио у этого токена
+        delay(450L)
+        val audioGetNote =
+            runCatching<String> {
+                val url =
+                    "${apiBaseUrl()}/audio.get" +
+                        "?count=1&access_token=${CustomHttp.urlEncode(cleanToken)}&v=5.95"
+                val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to KATE_UA), timeoutMs = 8_000)
+                val root = JSONObject(resp.body)
+                if (root.has("error")) {
+                    val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
+                    "audio.get=#$code"
+                } else {
+                    "audio.get=OK"
+                }
+            }.getOrDefault("audio.get=err")
+
+        val who = accountName?.takeIf { it.isNotBlank() }?.let { "Аккаунт $it найден, но поиск закрыт" } ?: "Поиск аудио закрыт"
+        val details = (notes.take(2) + audioGetNote).joinToString("; ")
+        return Result.failure(IllegalStateException("$who ($details)"))
     }
 
     suspend fun resolve(reference: TrackReference): ResolvedCustomStream? {
@@ -128,6 +146,29 @@ class VkMusicProvider(
         )
     }
 
+    private suspend fun testSearchProfile(
+        token: String,
+        profile: VkClientProfile,
+    ): Result<Unit> =
+        runCatching<Result<Unit>> {
+            val url = buildSearchUrl(token = token, query = "test", count = 3, profile = profile)
+            val response = CustomHttp.get(url, headers = mapOf("User-Agent" to profile.userAgent), timeoutMs = 8_000)
+            if (!response.isSuccess) {
+                return@runCatching Result.failure<Unit>(IllegalStateException("HTTP ${response.code}"))
+            }
+            val root = JSONObject(response.body)
+            if (root.has("error")) {
+                val err = root.optJSONObject("error")
+                val code = err?.optInt("error_code", -1) ?: -1
+                val msg = err?.optString("error_msg").orEmpty()
+                Result.failure<Unit>(IllegalStateException("#$code $msg"))
+            } else if (root.has("response")) {
+                Result.success(Unit)
+            } else {
+                Result.failure<Unit>(IllegalStateException("пустой ответ"))
+            }
+        }.getOrElse { Result.failure(it) }
+
     private suspend fun searchAudio(
         token: String,
         query: String,
@@ -136,15 +177,7 @@ class VkMusicProvider(
         for (profile in profilesToTry) {
             val result: List<VkAudioCandidate>? =
                 runCatching<List<VkAudioCandidate>?> {
-                    val url =
-                        "${apiBaseUrl()}/audio.search" +
-                            "?q=${CustomHttp.urlEncode(query)}" +
-                            "&count=15" +
-                            "&sort=2" +
-                            "&auto_complete=1" +
-                            "&lang=ru" +
-                            "&access_token=${CustomHttp.urlEncode(token)}" +
-                            "&v=${profile.apiVersion}"
+                    val url = buildSearchUrl(token = token, query = query, count = 15, profile = profile)
                     val response =
                         CustomHttp.get(
                             url = url,
@@ -155,36 +188,74 @@ class VkMusicProvider(
                     val root = JSONObject(response.body)
                     if (root.has("error")) {
                         val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
-                        Log.w(TAG, "VK ${profile.label} error #$code")
+                        Log.w(TAG, "VK ${profile.label}/${profile.endpoint.label} error #$code")
                         return@runCatching null
                     }
                     activeProfile = profile
-                    val items = root.optJSONObject("response")?.optJSONArray("items")
-                        ?: return@runCatching emptyList<VkAudioCandidate>()
-                    buildList<VkAudioCandidate> {
-                        for (i in 0 until items.length()) {
-                            val item = items.optJSONObject(i) ?: continue
-                            val streamUrl = item.optString("url").trim()
-                            if (streamUrl.isBlank()) continue
-                            val title = item.optString("title")
-                            val subtitle = item.optString("subtitle")
-                            val fullTitle = if (subtitle.isNotBlank()) "$title ($subtitle)" else title
-                            add(
-                                VkAudioCandidate(
-                                    artist = item.optString("artist"),
-                                    title = fullTitle,
-                                    durationSec = item.optLong("duration", 0L),
-                                    url = streamUrl,
-                                    isExplicit = item.optBoolean("is_explicit", false),
-                                ),
-                            )
+                    val respObj = root.optJSONObject("response") ?: return@runCatching emptyList<VkAudioCandidate>()
+                    val array =
+                        when (profile.endpoint) {
+                            VkSearchEndpoint.CATALOG -> respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
+                            VkSearchEndpoint.LEGACY -> respObj.optJSONArray("items") ?: respObj.optJSONArray("audios")
                         }
-                    }
+                    parseAudioArray(array)
                 }.getOrNull()
 
             if (result != null) return result
         }
         return emptyList()
+    }
+
+    private fun buildSearchUrl(
+        token: String,
+        query: String,
+        count: Int,
+        profile: VkClientProfile,
+    ): String {
+        val encodedQuery = CustomHttp.urlEncode(query)
+        val encodedToken = CustomHttp.urlEncode(token)
+        return when (profile.endpoint) {
+            VkSearchEndpoint.CATALOG ->
+                "${apiBaseUrl()}/catalog.getAudioSearch" +
+                    "?query=$encodedQuery" +
+                    "&need_blocks=1" +
+                    "&lang=ru" +
+                    "&access_token=$encodedToken" +
+                    "&v=${profile.apiVersion}"
+
+            VkSearchEndpoint.LEGACY ->
+                "${apiBaseUrl()}/audio.search" +
+                    "?q=$encodedQuery" +
+                    "&count=$count" +
+                    "&sort=2" +
+                    "&auto_complete=1" +
+                    "&lang=ru" +
+                    "&access_token=$encodedToken" +
+                    "&v=${profile.apiVersion}"
+        }
+    }
+
+    private fun parseAudioArray(items: JSONArray?): List<VkAudioCandidate> {
+        if (items == null) return emptyList()
+        return buildList<VkAudioCandidate> {
+            for (i in 0 until items.length()) {
+                val item = items.optJSONObject(i) ?: continue
+                val streamUrl = item.optString("url").trim()
+                if (streamUrl.isBlank()) continue
+                val title = item.optString("title")
+                val subtitle = item.optString("subtitle")
+                val fullTitle = if (subtitle.isNotBlank()) "$title ($subtitle)" else title
+                add(
+                    VkAudioCandidate(
+                        artist = item.optString("artist"),
+                        title = fullTitle,
+                        durationSec = item.optLong("duration", 0L),
+                        url = streamUrl,
+                        isExplicit = item.optBoolean("is_explicit", false),
+                    ),
+                )
+            }
+        }
     }
 
     private fun pickBestMatch(
@@ -229,6 +300,11 @@ class VkMusicProvider(
     companion object {
         private const val TAG = "VkProvider"
 
+        private const val KATE_UA =
+            "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
+        private const val VK_ANDROID_UA =
+            "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)"
+
         private fun apiBaseUrl(): String {
             val host = listOf("api", "vk", "com").joinToString(".")
             return "https://" + host + "/method"
@@ -237,29 +313,22 @@ class VkMusicProvider(
         private val CLIENT_PROFILES =
             listOf(
                 VkClientProfile(
-                    label = "Kate 103",
-                    userAgent = "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)",
+                    label = "Kate",
+                    userAgent = KATE_UA,
                     apiVersion = "5.131",
+                    endpoint = VkSearchEndpoint.CATALOG,
                 ),
                 VkClientProfile(
-                    label = "Kate 56",
-                    userAgent = "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)",
+                    label = "Kate",
+                    userAgent = KATE_UA,
                     apiVersion = "5.95",
+                    endpoint = VkSearchEndpoint.LEGACY,
                 ),
                 VkClientProfile(
-                    label = "Kate 95",
-                    userAgent = "KateMobileAndroid/95.1 lite-536 (Android 12; SDK 31; arm64-v8a; Pixel 6; ru)",
+                    label = "VKApp",
+                    userAgent = VK_ANDROID_UA,
                     apiVersion = "5.131",
-                ),
-                VkClientProfile(
-                    label = "VK Android 8",
-                    userAgent = "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)",
-                    apiVersion = "5.131",
-                ),
-                VkClientProfile(
-                    label = "VK Android 7",
-                    userAgent = "VKAndroidApp/7.26-13561 (Android 11; SDK 30; arm64-v8a; Xiaomi MI 9; ru; 2340x1080)",
-                    apiVersion = "5.119",
+                    endpoint = VkSearchEndpoint.CATALOG,
                 ),
             )
     }
