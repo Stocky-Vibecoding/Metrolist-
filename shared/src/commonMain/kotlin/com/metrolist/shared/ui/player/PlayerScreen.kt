@@ -72,6 +72,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.Canvas
 import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.DropdownMenuItem
@@ -104,6 +105,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -2055,39 +2058,76 @@ fun PlayerScreen(
                                                 buttonColor = textBackgroundColor,
                                                 onButtonColor = vintageOnButtonColor(textBackgroundColor),
                                             )
-                                        } else {
-                                            PlayerActionRow(
-                                                isLyricsVisible = uiState.isLyricsVisible,
-                                                isLyricsExpanded = uiState.isLyricsExpanded,
-                                                onToggleLyricsExpanded = {
-                                                    Logger.d(
-                                                        "Haptics",
-                                                        "Trigger PlayerScreen lyrics expand click expanded=${!uiState.isLyricsExpanded}",
-                                                    )
-                                                    hapticManager.perform(HapticEvent.PRESS)
-                                                    viewModel.setLyricsExpanded(!uiState.isLyricsExpanded)
-                                                },
-                                                onShowLyricsMenu = { showLyricsMenu = true },
-                                                isLiked = isLiked,
-                                                onLikeClick = {
-                                                    Logger.d("Haptics", "Trigger PlayerScreen like click liked=$isLiked")
-                                                    hapticManager.toggle(!isLiked)
-                                                    toggleDisplayedLike()
-                                                },
-                                                onShareClick = {
-                                                    Logger.d("Haptics", "Trigger PlayerScreen share click")
-                                                    hapticManager.perform(HapticEvent.PRESS)
-                                                    shareDisplayedSong()
-                                                },
-                                                onAltShareClick = {
-                                                    Logger.d("Haptics", "Trigger PlayerScreen alt share click")
-                                                    hapticManager.perform(HapticEvent.PRESS)
-                                                    copyDisplayedSongLink()
-                                                },
-                                            )
+                                       } else {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            ) {
+                                                if (!uiState.isLyricsVisible && !isListenTogetherGuest && currentSong != null) {
+                                                    FilledIconButton(
+                                                        onClick = {
+                                                            if (displaysPlayingSong) {
+                                                                hapticManager.perform(HapticEvent.PRESS)
+                                                                playerConnection?.onSongDisliked(currentSong.id)
+                                                            }
+                                                        },
+                                                        shapes = IconButtonDefaults.shapes(shape = CircleShape),
+                                                        colors =
+                                                            IconButtonDefaults.filledIconButtonColors(
+                                                                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                                                contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            ),
+                                                        modifier = Modifier.size(40.dp).playerControlBlend(),
+                                                    ) {
+                                                        val tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                                        Canvas(modifier = Modifier.size(18.dp)) {
+                                                            val strokePx = 1.8.dp.toPx()
+                                                            val r = size.minDimension / 2f - strokePx
+                                                            drawCircle(color = tint, radius = r, style = Stroke(width = strokePx))
+                                                            val inset = r * 0.68f
+                                                            val cx = size.width / 2f
+                                                            val cy = size.height / 2f
+                                                            drawLine(
+                                                                color = tint,
+                                                                start = Offset(cx - inset, cy - inset),
+                                                                end = Offset(cx + inset, cy + inset),
+                                                                strokeWidth = strokePx,
+                                                                cap = StrokeCap.Round,
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                                PlayerActionRow(
+                                                    isLyricsVisible = uiState.isLyricsVisible,
+                                                    isLyricsExpanded = uiState.isLyricsExpanded,
+                                                    onToggleLyricsExpanded = {
+                                                        Logger.d(
+                                                            "Haptics",
+                                                            "Trigger PlayerScreen lyrics expand click expanded=${!uiState.isLyricsExpanded}",
+                                                        )
+                                                        hapticManager.perform(HapticEvent.PRESS)
+                                                        viewModel.setLyricsExpanded(!uiState.isLyricsExpanded)
+                                                    },
+                                                    onShowLyricsMenu = { showLyricsMenu = true },
+                                                    isLiked = isLiked,
+                                                    onLikeClick = {
+                                                        Logger.d("Haptics", "Trigger PlayerScreen like click liked=$isLiked")
+                                                        hapticManager.toggle(!isLiked)
+                                                        toggleDisplayedLike()
+                                                    },
+                                                    onShareClick = {
+                                                        Logger.d("Haptics", "Trigger PlayerScreen share click")
+                                                        hapticManager.perform(HapticEvent.PRESS)
+                                                        shareDisplayedSong()
+                                                    },
+                                                    onAltShareClick = {
+                                                        Logger.d("Haptics", "Trigger PlayerScreen alt share click")
+                                                        hapticManager.perform(HapticEvent.PRESS)
+                                                        copyDisplayedSongLink()
+                                                    },
+                                                )
+                                            }
                                         }
-                                    }
-                                }
 
                                 Spacer(modifier = Modifier.height(12.dp))
 
