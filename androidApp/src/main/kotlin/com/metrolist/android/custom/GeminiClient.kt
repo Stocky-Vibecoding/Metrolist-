@@ -21,11 +21,25 @@ class GeminiClient(
     private val consecutive429 = ConcurrentHashMap<String, Int>()
     private val unavailableModels = ConcurrentHashMap.newKeySet<String>()
 
+    @Volatile
+    private var discoveredModels: List<String> = emptyList()
+
+    @Volatile
+    private var discoveredForKey: String = ""
+
+    @Volatile
+    private var lastDiscoveryMs: Long = 0L
+
     private val _activeModel = MutableStateFlow<String?>(null)
     val activeModel: StateFlow<String?> = _activeModel.asStateFlow()
 
     init {
         sharedInstance = this
+    }
+
+    fun hasActiveCooldown(): Boolean {
+        val now = System.currentTimeMillis()
+        return cooldownUntilMs.values.any { it > now }
     }
 
     suspend fun generateTrackList(
@@ -54,7 +68,7 @@ class GeminiClient(
         title: String,
     ): Boolean? {
         val cfg = configStore.current
-        if (cfg.geminiApiKey.isBlank()) return null
+        if (cfg.geminiApiKey.isBlank() || hasActiveCooldown()) return null
 
         val systemInstruction =
             "Отвечай СТРОГО валидным JSON без markdown: {\"censored\":true} или {\"censored\":false}."
@@ -140,13 +154,100 @@ class GeminiClient(
     suspend fun testConnection(apiKeyOverride: String? = null): Result<String> {
         val key = (apiKeyOverride ?: configStore.current.geminiApiKey).trim()
         if (key.isBlank()) return Result.failure(IllegalStateException("Укажи Gemini API ключ"))
+        refreshDiscoveredModelsIfNeeded(key, force = true)
         return generateText(
             prompt = "Ответь одним словом: OK",
             systemInstruction = null,
             expectJson = false,
             temperature = 0.0,
             apiKeyOverride = key,
-        ).map { _activeModel.value ?: DEFAULT_MODELS.first() }
+        ).map {
+            val used = _activeModel.value ?: DEFAULT_MODELS.first()
+            val total = discoveredModels.size
+            if (total > 0) "$used (найдено моделей: $total)" else used
+        }
+    }
+
+    private suspend fun refreshDiscoveredModelsIfNeeded(
+        apiKey: String,
+        force: Boolean = false,
+    ) {
+        val now = System.currentTimeMillis()
+        if (!force && discoveredForKey == apiKey && discoveredModels.isNotEmpty() && now - lastDiscoveryMs < DISCOVERY_TTL_MS) {
+            return
+        }
+        val found =
+            runCatching<List<String>> {
+                val url = "${apiBaseUrl()}/models?pageSize=100"
+                val resp = CustomHttp.get(url, headers = mapOf("x-goog-api-key" to apiKey), timeoutMs = 8_000)
+                if (!resp.isSuccess) return@runCatching emptyList<String>()
+                val arr = JSONObject(resp.body).optJSONArray("models") ?: return@runCatching emptyList<String>()
+                val badTokens =
+                    listOf(
+                        "embedding",
+                        "imagen",
+                        "veo",
+                        "tts",
+                        "audio",
+                        "live",
+                        "aqa",
+                        "robotics",
+                        "computer-use",
+                        "deep-research",
+                        "transcribe",
+                        "vision",
+                        "nano",
+                    )
+                val candidates = mutableListOf<String>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val rawName = obj.optString("name").removePrefix("models/").trim()
+                    if (rawName.isBlank()) continue
+                    val lower = rawName.lowercase()
+                    if (!lower.startsWith("gemini-") && !lower.startsWith("gemma-3-")) continue
+                    if (badTokens.any { lower.contains(it) }) continue
+                    val methods = obj.optJSONArray("supportedGenerationMethods")
+                    var supportsGenerate = false
+                    if (methods != null) {
+                        for (j in 0 until methods.length()) {
+                            if (methods.optString(j) == "generateContent") {
+                                supportsGenerate = true
+                                break
+                            }
+                        }
+                    }
+                    if (supportsGenerate) candidates.add(rawName)
+                }
+                candidates.distinct().sortedBy { modelPriority(it) }
+            }.getOrDefault(emptyList())
+
+        if (found.isNotEmpty()) {
+            discoveredModels = found
+            discoveredForKey = apiKey
+            lastDiscoveryMs = now
+            unavailableModels.removeAll(found.toSet())
+            Log.d(TAG, "Discovered ${found.size} models: ${found.take(8).joinToString()}")
+        }
+    }
+
+    private fun modelPriority(name: String): Int {
+        val lower = name.lowercase()
+        return when {
+            lower == "gemini-2.5-flash" -> 1
+            lower == "gemini-2.5-flash-lite" -> 2
+            lower.contains("3") && lower.contains("flash-lite") -> 3
+            lower.contains("3") && lower.contains("flash") -> 4
+            lower == "gemini-2.0-flash" -> 5
+            lower == "gemini-2.0-flash-lite" -> 6
+            lower.contains("flash-lite") -> 7
+            lower.contains("flash") -> 8
+            lower.contains("2.5-pro") -> 12
+            lower.contains("pro") -> 14
+            lower.startsWith("gemma-3-27b") -> 20
+            lower.startsWith("gemma-3-12b") -> 21
+            lower.startsWith("gemma-3-") -> 22
+            else -> 30
+        }
     }
 
     private suspend fun generateText(
@@ -162,11 +263,15 @@ class GeminiClient(
             return Result.failure(IllegalStateException("Не задан Gemini API ключ"))
         }
 
+        if (discoveredModels.isEmpty() || discoveredForKey != apiKey) {
+            refreshDiscoveredModelsIfNeeded(apiKey, force = false)
+        }
+
         val modelsToTry = resolveCandidateModels(cfg.geminiModelMode)
-        var lastError: Throwable = IllegalStateException("Все модели Gemini временно недоступны")
+        val attempts = mutableListOf<String>()
 
         for (model in modelsToTry) {
-            val payload = buildRequestPayload(prompt, systemInstruction, expectJson, temperature)
+            val payload = buildRequestPayload(model, prompt, systemInstruction, expectJson, temperature)
             val url = "${apiBaseUrl()}/models/$model:generateContent"
 
             val response =
@@ -178,7 +283,7 @@ class GeminiClient(
                         timeoutMs = 25_000,
                     )
                 }.getOrElse { err ->
-                    lastError = err
+                    attempts.add("${shortName(model)}:net")
                     Log.w(TAG, "Network error on $model: ${err.message}")
                     continue
                 }
@@ -192,69 +297,101 @@ class GeminiClient(
                         _activeModel.value = model
                         return Result.success(text)
                     }
-                    lastError = IllegalStateException("Пустой ответ от $model")
+                    attempts.add("${shortName(model)}:empty")
                 }
 
                 response.code == 429 -> {
                     val hits = (consecutive429[model] ?: 0) + 1
                     consecutive429[model] = hits
                     val waitMs =
-                        response.retryAfterSeconds?.let { it * 1_000L }
+                        response.retryAfterSeconds?.let { (it * 1_000L).coerceAtMost(COOLDOWN_LONG_MS) }
                             ?: if (hits >= 2) COOLDOWN_LONG_MS else COOLDOWN_SHORT_MS
                     cooldownUntilMs[model] = System.currentTimeMillis() + waitMs
+                    attempts.add("${shortName(model)}:429")
                     Log.w(TAG, "Model $model hit 429 (hits=$hits), cooldown ${waitMs / 1000}s")
-                    lastError = IllegalStateException("Лимит 429 на $model")
                 }
 
                 response.code == 503 || response.code == 500 -> {
                     cooldownUntilMs[model] = System.currentTimeMillis() + COOLDOWN_SHORT_MS
+                    attempts.add("${shortName(model)}:${response.code}")
                     Log.w(TAG, "Model $model returned ${response.code}")
-                    lastError = IllegalStateException("Сервер ${response.code} на $model")
                 }
 
                 response.code == 404 -> {
                     unavailableModels.add(model)
+                    attempts.add("${shortName(model)}:404")
                     Log.w(TAG, "Model $model not found (404)")
-                    lastError = IllegalStateException("Модель $model недоступна (404)")
                 }
 
-                response.code == 400 || response.code == 401 || response.code == 403 -> {
+                response.code == 401 || response.code == 403 -> {
                     val msg = extractErrorMessage(response.body) ?: "HTTP ${response.code}"
                     return Result.failure(IllegalStateException("Ошибка ключа Gemini: $msg"))
                 }
 
+                response.code == 400 -> {
+                    val msg = extractErrorMessage(response.body).orEmpty()
+                    if (msg.contains("API key", ignoreCase = true) || msg.contains("API_KEY", ignoreCase = true)) {
+                        return Result.failure(IllegalStateException("Ошибка ключа Gemini: $msg"))
+                    }
+                    unavailableModels.add(model)
+                    attempts.add("${shortName(model)}:400")
+                    Log.w(TAG, "Model $model rejected payload (400): $msg")
+                }
+
                 else -> {
-                    val msg = extractErrorMessage(response.body) ?: "HTTP ${response.code}"
-                    lastError = IllegalStateException("Gemini $model: $msg")
+                    attempts.add("${shortName(model)}:${response.code}")
                 }
             }
         }
 
-        return Result.failure(lastError)
+        val summary = attempts.take(5).joinToString(", ")
+        return Result.failure(
+            IllegalStateException(
+                if (summary.isNotBlank()) "Лимит/ошибки моделей ($summary)" else "Все модели Gemini временно недоступны",
+            ),
+        )
     }
+
+    private fun shortName(model: String): String =
+        model.removePrefix("gemini-").removePrefix("gemma-")
 
     private fun resolveCandidateModels(mode: String): List<String> {
         val now = System.currentTimeMillis()
-        if (mode != CustomAppConfig.MODEL_MODE_AUTO && mode.isNotBlank()) {
-            val ordered = (listOf(mode) + DEFAULT_MODELS).distinct()
-            val ready = ordered.filter { it !in unavailableModels && (cooldownUntilMs[it] ?: 0L) <= now }
-            return ready.ifEmpty { ordered.filterNot { it in unavailableModels } }.ifEmpty { listOf(mode) }
-        }
+        val combinedPool =
+            (discoveredModels + DEFAULT_MODELS)
+                .distinct()
+                .filterNot { it in unavailableModels }
+                .ifEmpty { DEFAULT_MODELS }
 
-        val available = DEFAULT_MODELS.filterNot { it in unavailableModels }
-        val ready = available.filter { (cooldownUntilMs[it] ?: 0L) <= now }
+        val ordered =
+            if (mode != CustomAppConfig.MODEL_MODE_AUTO && mode.isNotBlank()) {
+                (listOf(mode) + combinedPool).distinct()
+            } else {
+                combinedPool
+            }
+
+        val ready = ordered.filter { (cooldownUntilMs[it] ?: 0L) <= now }
         if (ready.isNotEmpty()) return ready
-        return available.sortedBy { cooldownUntilMs[it] ?: 0L }.ifEmpty { DEFAULT_MODELS }
+        return ordered.sortedBy { cooldownUntilMs[it] ?: 0L }
     }
 
     private fun buildRequestPayload(
+        model: String,
         prompt: String,
         systemInstruction: String?,
         expectJson: Boolean,
         temperature: Double,
     ): String {
+        val isGemma = model.startsWith("gemma-", ignoreCase = true)
         val root = JSONObject()
-        if (!systemInstruction.isNullOrBlank()) {
+        val finalPrompt =
+            if (isGemma && !systemInstruction.isNullOrBlank()) {
+                "$systemInstruction\n\n$prompt"
+            } else {
+                prompt
+            }
+
+        if (!isGemma && !systemInstruction.isNullOrBlank()) {
             root.put(
                 "systemInstruction",
                 JSONObject().put(
@@ -268,11 +405,11 @@ class GeminiClient(
             JSONArray().put(
                 JSONObject()
                     .put("role", "user")
-                    .put("parts", JSONArray().put(JSONObject().put("text", prompt))),
+                    .put("parts", JSONArray().put(JSONObject().put("text", finalPrompt))),
             ),
         )
         val genConfig = JSONObject().put("temperature", temperature)
-        if (expectJson) {
+        if (expectJson && !isGemma) {
             genConfig.put("responseMimeType", "application/json")
         }
         root.put("generationConfig", genConfig)
@@ -357,6 +494,7 @@ class GeminiClient(
         private const val TAG = "GeminiClient"
         private const val COOLDOWN_SHORT_MS = 2 * 60 * 1_000L
         private const val COOLDOWN_LONG_MS = 15 * 60 * 1_000L
+        private const val DISCOVERY_TTL_MS = 12 * 60 * 60 * 1_000L
 
         @Volatile
         var sharedInstance: GeminiClient? = null
@@ -371,9 +509,11 @@ class GeminiClient(
             listOf(
                 "gemini-2.5-flash",
                 "gemini-2.5-flash-lite",
+                "gemini-3-flash-preview",
                 "gemini-2.0-flash",
                 "gemini-2.0-flash-lite",
                 "gemini-2.5-pro",
+                "gemma-3-27b-it",
             )
     }
 }
@@ -404,7 +544,7 @@ class MascotPhraseBank(
         val now = System.currentTimeMillis()
         val lastTrackAiMs = prefs.getLong(KEY_LAST_TRACK_AI_MS, 0L)
 
-        if (hasGeminiKey && now - lastTrackAiMs >= TRACK_AI_COOLDOWN_MS) {
+        if (hasGeminiKey && !geminiClient.hasActiveCooldown() && now - lastTrackAiMs >= TRACK_AI_COOLDOWN_MS) {
             prefs.edit().putLong(KEY_LAST_TRACK_AI_MS, now).apply()
             val generated = geminiClient.generateMascotLine(artist = artist, title = title, moodHint = moodLabel)
             if (!generated.isNullOrBlank()) {
@@ -422,7 +562,7 @@ class MascotPhraseBank(
 
         var pool = loadMoodPool(moodKey)
         val lastPackMs = prefs.getLong(KEY_LAST_PACK_PREFIX + moodKey, 0L)
-        if (hasGeminiKey && pool.size < MIN_POOL_SIZE && now - lastPackMs >= PACK_REFRESH_COOLDOWN_MS) {
+        if (hasGeminiKey && !geminiClient.hasActiveCooldown() && pool.size < MIN_POOL_SIZE && now - lastPackMs >= PACK_REFRESH_COOLDOWN_MS) {
             prefs.edit().putLong(KEY_LAST_PACK_PREFIX + moodKey, now).apply()
             val fresh = geminiClient.generateMascotPhrasePack(moodHint = moodLabel, count = 10)
             if (fresh.isNotEmpty()) {
