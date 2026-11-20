@@ -9,12 +9,14 @@ import android.content.res.Configuration
 import android.nfc.NfcAdapter
 import android.os.Build
 import android.provider.MediaStore
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.LocalOverscrollFactory
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -26,6 +28,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.asPaddingValues
@@ -45,12 +48,15 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.systemGestureExclusion
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
@@ -60,6 +66,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -129,6 +136,7 @@ import androidx.compose.ui.semantics.hideFromAccessibility
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
@@ -165,6 +173,12 @@ import com.metrolist.android.LocalPlayerExpandedOrExpanding
 import com.metrolist.android.LocalPlaylistAdder
 import com.metrolist.android.LocalStartupPresentation
 import com.metrolist.android.MainActivity
+import com.metrolist.android.custom.AiWaveEngine
+import com.metrolist.android.custom.CustomConfigStore
+import com.metrolist.android.custom.GeminiClient
+import com.metrolist.android.custom.VkMusicProvider
+import com.metrolist.android.custom.WaveHomeScreen
+import com.metrolist.android.custom.YandexMusicProvider
 import com.metrolist.android.deviceconnect.AndroidDeviceConnect
 import com.metrolist.android.extensions.findActivity
 import com.metrolist.android.listentogether.AndroidListenTogetherManager
@@ -420,6 +434,15 @@ fun MetrolistApp(
         onStopOrDispose { }
     }
 
+    val customConfigStore: CustomConfigStore = koinInject()
+    val aiWaveEngine: AiWaveEngine = koinInject()
+    val geminiClient: GeminiClient = koinInject()
+    val yandexProvider: YandexMusicProvider = koinInject()
+    val vkProvider: VkMusicProvider = koinInject()
+    val customCfg by customConfigStore.config.collectAsState()
+    val isGeneratingWave by aiWaveEngine.isGeneratingWave.collectAsState()
+    val forceClassicHomeState = rememberSaveable { mutableStateOf(false) }
+
     val materialYouEnabled = Settings.shared.materialYouEnabled
     val songArtworkColorsEnabled = materialYouEnabled && Settings.shared.dynamicTheme
 
@@ -495,6 +518,7 @@ fun MetrolistApp(
             }
 
         val currentRoute = navigationState.backStacks[navigationState.topLevelRoute]?.last()
+        val isWaveHomeActive = currentRoute == Screen.Home && customCfg.useWaveAsHome && !forceClassicHomeState.value
         val startupPresentation = LocalStartupPresentation.current
         SideEffect { startupPresentation?.homeRequired = currentRoute == Screen.Home }
         val navigator = remember(navigationState) { Navigator(navigationState) }
@@ -807,11 +831,11 @@ fun MetrolistApp(
         val shouldHideMiniPlayerForIme = isLandscape && isImeVisible
         val shouldShowMiniPlayer = hasMedia
         val immersiveContent = remember { mutableStateOf(false) }
-        val shouldRenderMiniPlayer = shouldShowMiniPlayer && !shouldHideMiniPlayerForIme
+        val shouldRenderMiniPlayer = shouldShowMiniPlayer && !shouldHideMiniPlayerForIme && !isWaveHomeActive
 
         val topLevelScreens = remember { setOf(Screen.Home, Screen.Library, Screen.EasterEgg) }
         val shouldShowTopBar =
-            navigationState.topLevelRoute in topLevelScreens && currentRoute in topLevelScreens
+            navigationState.topLevelRoute in topLevelScreens && currentRoute in topLevelScreens && !isWaveHomeActive
 
         val useFloatingTopBar = Settings.shared.floatingTopBar && !hasDesktopCaption
         val topAppBarScrollBehavior = appBarScrollBehavior()
@@ -1030,8 +1054,9 @@ fun MetrolistApp(
                     .drawBehind {
                         val left = horizontalSystemBars.getLeft(this, layoutDirection).toFloat()
                         val right = horizontalSystemBars.getRight(this, layoutDirection).toFloat()
-                        if (left > 0f) drawRect(appBackground, size = Size(left, size.height))
-                        if (right > 0f) drawRect(appBackground, topLeft = Offset(size.width - right, 0f), size = Size(right, size.height))
+                        val bgColor = if (isWaveHomeActive) Color.Black else appBackground
+                        if (left > 0f) drawRect(bgColor, size = Size(left, size.height))
+                        if (right > 0f) drawRect(bgColor, topLeft = Offset(size.width - right, 0f), size = Size(right, size.height))
                     },
             ) {
                 DesktopCaptionBar(
@@ -1412,7 +1437,7 @@ fun MetrolistApp(
                                 adaptiveLayout = adaptiveLayout,
                                 navigationSuiteType = navigationSuiteType,
                                 navigationVisible = shouldShowNavigationBar,
-                                containerColor = if (pureBlack) Color.Black else MaterialTheme.colorScheme.surface,
+                                containerColor = if (pureBlack || isWaveHomeActive) Color.Black else MaterialTheme.colorScheme.surface,
                                 onSearchLongClick = { navigator.navigate(Screen.Recognition) },
                                 floatingNavigation = useFloatingNavBar,
                                 onFloatingNavigationOccupiedHeightChanged = {
@@ -1519,6 +1544,18 @@ fun MetrolistApp(
                                                         emptyList()
                                                     }
                                                 val topBarActions: @Composable RowScope.() -> Unit = {
+                                                    if (navigationState.topLevelRoute == Screen.Home && !isWaveHomeActive) {
+                                                        TextButton(
+                                                            onClick = {
+                                                                forceClassicHomeState.value = false
+                                                                if (!customCfg.useWaveAsHome) {
+                                                                    customConfigStore.update { it.copy(useWaveAsHome = true) }
+                                                                }
+                                                            },
+                                                        ) {
+                                                            Text("Волна")
+                                                        }
+                                                    }
                                                     if (navigationState.topLevelRoute == Screen.Home && Screen.History !in railScreens) {
                                                         TopBarIconButton(
                                                             floating = useFloatingTopBar,
@@ -1680,19 +1717,31 @@ fun MetrolistApp(
                                                             homeScrollToTopEvents,
                                                             libraryScrollToTopEvents,
                                                             libraryViewModel,
+                                                            playerConnection,
                                                         ) {
                                                             getEntryProvider(
-                                                                navigator,
-                                                                authManager,
-                                                                context,
-                                                                coroutineScope,
-                                                                { pendingSearchQuery },
-                                                                { pendingSearchQuery = null },
-                                                                { pendingRoomCode },
-                                                                floatingActionsBottomInset,
-                                                                homeScrollToTopEvents,
-                                                                libraryScrollToTopEvents,
-                                                                libraryViewModel,
+                                                                navigator = navigator,
+                                                                authManager = authManager,
+                                                                context = context,
+                                                                scope = coroutineScope,
+                                                                pendingSearchQuery = { pendingSearchQuery },
+                                                                onSearchQueryConsumed = { pendingSearchQuery = null },
+                                                                pendingRoomCode = { pendingRoomCode },
+                                                                floatingActionsBottomInset = floatingActionsBottomInset,
+                                                                homeScrollToTopEvents = homeScrollToTopEvents,
+                                                                libraryScrollToTopEvents = libraryScrollToTopEvents,
+                                                                libraryViewModel = libraryViewModel,
+                                                                customConfigStore = customConfigStore,
+                                                                aiWaveEngine = aiWaveEngine,
+                                                                geminiClient = geminiClient,
+                                                                yandexProvider = yandexProvider,
+                                                                vkProvider = vkProvider,
+                                                                playerConnection = playerConnection,
+                                                                forceClassicHome = { forceClassicHomeState.value },
+                                                                onSwitchToClassicHome = { forceClassicHomeState.value = true },
+                                                                onExpandPlayer = {
+                                                                    coroutineScope.launch { playerBottomSheetState.expandSoft() }
+                                                                },
                                                                 onSearchResultsVisible = { searchResultsVisible = it },
                                                             )
                                                         }
@@ -1837,7 +1886,10 @@ fun MetrolistApp(
                                             Modifier.windowInsetsPadding(horizontalSystemBars.only(WindowInsetsSides.Horizontal))
                                         },
                                     ).zIndex(
-                                        if (playerBottomSheetState.isDismissed || !shouldShowMiniPlayer || immersiveContent.value) {
+                                        if ((playerBottomSheetState.isDismissed && !isPlayerExpandedOrExpanding) ||
+                                            !shouldShowMiniPlayer ||
+                                            immersiveContent.value
+                                        ) {
                                             -1f
                                         } else {
                                             1f
@@ -1917,39 +1969,160 @@ fun MetrolistApp(
                             },
                         ) {
                             val playerLifecycleState by lifecycleOwner.lifecycle.currentStateAsState()
-                            PlayerScreen(
-                                isScreenVisible = playerLifecycleState.isAtLeast(Lifecycle.State.STARTED),
-                                viewModel = playerViewModel,
-                                bottomSheetState = playerBottomSheetState,
-                                requestPlayPauseFocus = focusPlayPauseOnPlayerExpand,
-                                onPlayPauseFocusRequested = { focusPlayPauseOnPlayerExpand = false },
-                                onLyricsVisibleChange = { lyricsVisible = it },
-                                onClose = {
-                                    playerBottomSheetState.collapseSoft()
-                                    if (usesDirectionalNavigation) {
-                                        coroutineScope.launch {
-                                            delay(250.milliseconds)
-                                            runCatching { miniPlayerFocusRequester.requestFocus() }
+                            Box(Modifier.fillMaxSize()) {
+                                PlayerScreen(
+                                    isScreenVisible = playerLifecycleState.isAtLeast(Lifecycle.State.STARTED),
+                                    viewModel = playerViewModel,
+                                    bottomSheetState = playerBottomSheetState,
+                                    requestPlayPauseFocus = focusPlayPauseOnPlayerExpand,
+                                    onPlayPauseFocusRequested = { focusPlayPauseOnPlayerExpand = false },
+                                    onLyricsVisibleChange = { lyricsVisible = it },
+                                    onClose = {
+                                        playerBottomSheetState.collapseSoft()
+                                        if (usesDirectionalNavigation) {
+                                            coroutineScope.launch {
+                                                delay(250.milliseconds)
+                                                runCatching { miniPlayerFocusRequester.requestFocus() }
+                                            }
+                                        }
+                                    },
+                                    onNavigateToAlbum = { albumId ->
+                                        playerBottomSheetState.collapseSoft()
+                                        navigator.navigate(Screen.Album(albumId))
+                                    },
+                                    onNavigateToArtist = { artistId ->
+                                        playerBottomSheetState.collapseSoft()
+                                        navigator.navigate(Screen.Artist(artistId))
+                                    },
+                                    onNavigateToListenTogether = {
+                                        playerBottomSheetState.collapseSoft()
+                                        navigator.navigate(Screen.ListenTogether)
+                                    },
+                                    onNavigateToIntegrations = {
+                                        playerBottomSheetState.collapseSoft()
+                                        navigator.navigate(Screen.Integrations)
+                                    },
+                                )
+
+                                if (isPlayerExpanded && !lyricsVisible && currentSong != null) {
+                                    val activeSong = currentSong!!
+                                    val sourceLabel =
+                                        when (playbackResource?.clientName) {
+                                            "yandex" -> "Я.Музыка"
+                                            "vk" -> "VK"
+                                            null, "" -> null
+                                            else -> "YTM"
+                                        }
+                                    if (sourceLabel != null) {
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = Color.Black.copy(alpha = 0.55f),
+                                            border = BorderStroke(1.dp, Color(0xFF9D4EDD).copy(alpha = 0.5f)),
+                                            modifier =
+                                                Modifier
+                                                    .align(Alignment.TopCenter)
+                                                    .windowInsetsPadding(WindowInsets.statusBars)
+                                                    .padding(top = 42.dp),
+                                        ) {
+                                            Text(
+                                                text = sourceLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = Color.White.copy(alpha = 0.9f),
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                            )
                                         }
                                     }
-                                },
-                                onNavigateToAlbum = { albumId ->
-                                    playerBottomSheetState.collapseSoft()
-                                    navigator.navigate(Screen.Album(albumId))
-                                },
-                                onNavigateToArtist = { artistId ->
-                                    playerBottomSheetState.collapseSoft()
-                                    navigator.navigate(Screen.Artist(artistId))
-                                },
-                                onNavigateToListenTogether = {
-                                    playerBottomSheetState.collapseSoft()
-                                    navigator.navigate(Screen.ListenTogether)
-                                },
-                                onNavigateToIntegrations = {
-                                    playerBottomSheetState.collapseSoft()
-                                    navigator.navigate(Screen.Integrations)
-                                },
-                            )
+
+                                    Surface(
+                                        onClick = {
+                                            if (!isGeneratingWave) {
+                                                coroutineScope.launch {
+                                                    aiWaveEngine
+                                                        .generateWaveSongs(seedSong = activeSong)
+                                                        .onSuccess { songs ->
+                                                            playerConnection.playQueue(
+                                                                songs = songs,
+                                                                startIndex = 0,
+                                                                queueTitle = "Волна: ${activeSong.title}",
+                                                                finite = false,
+                                                            )
+                                                            Toast
+                                                                .makeText(
+                                                                    context,
+                                                                    "Моя волна по треку «${activeSong.title}»",
+                                                                    Toast.LENGTH_SHORT,
+                                                                ).show()
+                                                        }.onFailure { err ->
+                                                            Toast
+                                                                .makeText(
+                                                                    context,
+                                                                    err.message ?: "Не удалось собрать волну",
+                                                                    Toast.LENGTH_SHORT,
+                                                                ).show()
+                                                        }
+                                                }
+                                            }
+                                        },
+                                        shape = RoundedCornerShape(16.dp),
+                                        color = Color(0xFF171322).copy(alpha = 0.92f),
+                                        border = BorderStroke(1.dp, Color(0xFF9D4EDD).copy(alpha = 0.45f)),
+                                        modifier =
+                                            Modifier
+                                                .align(Alignment.BottomCenter)
+                                                .windowInsetsPadding(WindowInsets.navigationBars)
+                                                .padding(horizontal = 24.dp, vertical = 8.dp)
+                                                .fillMaxWidth()
+                                                .widthIn(max = 420.dp),
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.Center,
+                                        ) {
+                                            if (isGeneratingWave) {
+                                                CircularProgressIndicator(
+                                                    strokeWidth = 2.dp,
+                                                    color = Color(0xFFC77DFF),
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                                Spacer(Modifier.width(8.dp))
+                                                Text(
+                                                    text = "Собираю волну…",
+                                                    style = MaterialTheme.typography.labelLarge,
+                                                    color = Color.White,
+                                                )
+                                            } else {
+                                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                    Text(
+                                                        text = "Моя волна по треку",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = Color.White.copy(alpha = 0.65f),
+                                                    )
+                                                    Row(
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = MetrolistIcons.Filled.PlayArrow,
+                                                            contentDescription = null,
+                                                            tint = Color(0xFFC77DFF),
+                                                            modifier = Modifier.size(16.dp),
+                                                        )
+                                                        Text(
+                                                            text = activeSong.title,
+                                                            style = MaterialTheme.typography.labelLarge,
+                                                            fontWeight = FontWeight.SemiBold,
+                                                            color = Color.White,
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis,
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -2045,7 +2218,6 @@ fun MetrolistApp(
         }
     }
 }
-
 @Composable
 private fun ListenTogetherPlaybackRequestHandler(playerConnection: PlayerConnection) {
     var request by remember { mutableStateOf<ListenTogetherPlaybackRequest?>(null) }
@@ -2463,32 +2635,56 @@ fun getEntryProvider(
     homeScrollToTopEvents: SharedFlow<Long>,
     libraryScrollToTopEvents: SharedFlow<Long>,
     libraryViewModel: LibraryViewModel,
+    customConfigStore: CustomConfigStore,
+    aiWaveEngine: AiWaveEngine,
+    geminiClient: GeminiClient,
+    yandexProvider: YandexMusicProvider,
+    vkProvider: VkMusicProvider,
+    playerConnection: PlayerConnection,
+    forceClassicHome: () -> Boolean,
+    onSwitchToClassicHome: () -> Unit,
+    onExpandPlayer: () -> Unit,
     onSearchResultsVisible: (Boolean) -> Unit = {},
 ): (NavKey) -> NavEntry<NavKey> =
     entryProvider<NavKey> {
         entry<Screen.Home>(metadata = navTabMetadata) {
-            HomeScreen(
-                floatingActionsBottomInset = floatingActionsBottomInset,
-                onNavigateToAlbum = { albumId -> navigator.navigate(Screen.Album(albumId)) },
-                onNavigateToArtist = { artistId -> navigator.navigate(Screen.Artist(artistId)) },
-                onNavigateToPlaylist = { id, thumbnail -> navigator.navigate(Screen.Playlist(id, thumbnailHint = thumbnail)) },
-                onNavigateToPodcast = { podcastId -> navigator.navigate(Screen.Podcast(podcastId)) },
-                onNavigateToRecognition = { navigator.navigate(Screen.Recognition) },
-                onNavigateToLibrary = { filter ->
-                    filter?.let { Settings.shared.libraryFilter = it }
-                    navigator.navigate(Screen.Library)
-                },
-                onNavigateToBrowse = { browseId, params, title ->
-                    navigator.navigate(Screen.Browse(browseId, params, title))
-                },
-                onNavigateToVideoBrowse = { browseId, params, title ->
-                    navigator.navigate(Screen.Browse(browseId, params, title))
-                },
-                onNavigateToHomeSection = { shelf ->
-                    navigator.navigate(Screen.HomeSection(shelf.pageKey, shelf.title, shelf.toHomeSection()))
-                },
-                scrollToTopEvents = homeScrollToTopEvents,
-            )
+            val customCfg by customConfigStore.config.collectAsState()
+            if (customCfg.useWaveAsHome && !forceClassicHome()) {
+                WaveHomeScreen(
+                    configStore = customConfigStore,
+                    aiWaveEngine = aiWaveEngine,
+                    geminiClient = geminiClient,
+                    yandexProvider = yandexProvider,
+                    vkProvider = vkProvider,
+                    playerConnection = playerConnection,
+                    bottomInset = floatingActionsBottomInset.value,
+                    onExpandPlayer = onExpandPlayer,
+                    onSwitchToClassicHome = onSwitchToClassicHome,
+                )
+            } else {
+                HomeScreen(
+                    floatingActionsBottomInset = floatingActionsBottomInset,
+                    onNavigateToAlbum = { albumId -> navigator.navigate(Screen.Album(albumId)) },
+                    onNavigateToArtist = { artistId -> navigator.navigate(Screen.Artist(artistId)) },
+                    onNavigateToPlaylist = { id, thumbnail -> navigator.navigate(Screen.Playlist(id, thumbnailHint = thumbnail)) },
+                    onNavigateToPodcast = { podcastId -> navigator.navigate(Screen.Podcast(podcastId)) },
+                    onNavigateToRecognition = { navigator.navigate(Screen.Recognition) },
+                    onNavigateToLibrary = { filter ->
+                        filter?.let { Settings.shared.libraryFilter = it }
+                        navigator.navigate(Screen.Library)
+                    },
+                    onNavigateToBrowse = { browseId, params, title ->
+                        navigator.navigate(Screen.Browse(browseId, params, title))
+                    },
+                    onNavigateToVideoBrowse = { browseId, params, title ->
+                        navigator.navigate(Screen.Browse(browseId, params, title))
+                    },
+                    onNavigateToHomeSection = { shelf ->
+                        navigator.navigate(Screen.HomeSection(shelf.pageKey, shelf.title, shelf.toHomeSection()))
+                    },
+                    scrollToTopEvents = homeScrollToTopEvents,
+                )
+            }
         }
 
         entry<Screen.EasterEgg>(metadata = navTabMetadata) {
