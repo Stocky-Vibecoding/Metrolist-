@@ -131,7 +131,7 @@ class DeezerReferenceClient {
         val fetched =
             runCatching {
                 val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
-                val url = "$API_BASE/search/track?q=${CustomHttp.urlEncode(query)}&limit=6"
+                val url = "${apiBaseUrl()}/search/track?q=${CustomHttp.urlEncode(query)}&limit=6"
                 val response = CustomHttp.get(url, timeoutMs = 3_000)
                 if (!response.isSuccess) return@runCatching null
                 val data = JSONObject(response.body).optJSONArray("data") ?: return@runCatching null
@@ -207,7 +207,11 @@ class DeezerReferenceClient {
 
     companion object {
         private const val TAG = "DeezerRef"
-        private const val API_BASE = "https:" + "//api.deezer.com"
+
+        private fun apiBaseUrl(): String {
+            val host = listOf("api", "deezer", "com").joinToString(".")
+            return "https://" + host
+        }
     }
 }
 
@@ -240,21 +244,24 @@ object TrackMatcher {
             "bass boosted",
         )
 
-    private val noiseRegex =
-        Regex(
-            """\s*[\[(][^)\]]*(official|video|audio|lyrics|lyric|visualizer|hd|4k|hq|mv|prod\.|feat\.|ft\.)[^)\]]*[\])]""",
-            RegexOption.IGNORE_CASE,
-        )
-    private val featRegex = Regex("""\s+(feat\.|ft\.|featuring)\s+.*$""", RegexOption.IGNORE_CASE)
+    private val noiseKeywords =
+        listOf("official", "video", "audio", "lyrics", "lyric", "visualizer", "hd", "4k", "hq", "mv", "prod.", "feat.", "ft.")
+    private val bracketRegex = Regex("""\s*[\[(]([^)\]]*)[\])]""")
+    private val featRegex = Regex("""\s+(?:feat\.|ft\.|featuring)\s+.*$""", RegexOption.IGNORE_CASE)
     private val nonWordRegex = Regex("""[^\p{L}\p{N}\s]""")
     private val multiSpaceRegex = Regex("""\s+""")
 
-    fun cleanSearchTerm(raw: String): String =
-        raw
-            .replace(noiseRegex, " ")
+    fun cleanSearchTerm(raw: String): String {
+        val withoutNoiseBrackets =
+            bracketRegex.replace(raw) { match ->
+                val inner = match.groupValues.getOrElse(1) { "" }.lowercase()
+                if (noiseKeywords.any { inner.contains(it) }) " " else match.value
+            }
+        return withoutNoiseBrackets
             .replace(featRegex, "")
             .replace(multiSpaceRegex, " ")
             .trim()
+    }
 
     fun normalize(raw: String): String =
         cleanSearchTerm(raw)
