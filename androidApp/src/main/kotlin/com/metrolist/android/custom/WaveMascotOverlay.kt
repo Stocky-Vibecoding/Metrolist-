@@ -21,7 +21,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -51,7 +50,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -211,7 +209,6 @@ fun WaveHomeScreen(
         val isWideLayout = maxWidth >= 600.dp
 
         Column(modifier = Modifier.fillMaxSize()) {
-            // Верхняя панель в родном стиле Metrolist
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -266,13 +263,9 @@ fun WaveHomeScreen(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center,
                     ) {
-                        WaveSettingsSlider(
-                            config = cfg,
-                            onOpenFullSettings = { showWaveSettingsSheet = true },
-                            onSelectMood = { mood ->
-                                configStore.update { it.copy(waveMood = mood) }
-                                refreshWave()
-                            },
+                        WaveFilterPillButton(
+                            label = cfg.waveFilterSummary(),
+                            onClick = { showWaveSettingsSheet = true },
                         )
 
                         WaveBottomStatusAndPlayer(
@@ -292,7 +285,6 @@ fun WaveHomeScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    // Центр: кнопка волны / слот маскота с амбиент-свечением (тап = Play/Pause)
                     AmbientWaveButton(
                         isPlaying = isPlaying,
                         isGenerating = isGenerating,
@@ -302,19 +294,13 @@ fun WaveHomeScreen(
                         onClick = ::startOrToggleWave,
                     )
 
-                    Spacer(modifier = Modifier.height(20.dp))
+                    Spacer(modifier = Modifier.height(18.dp))
 
-                    // Слайдер быстрой настройки волны под центром
-                    WaveSettingsSlider(
-                        config = cfg,
-                        onOpenFullSettings = { showWaveSettingsSheet = true },
-                        onSelectMood = { mood ->
-                            configStore.update { it.copy(waveMood = mood) }
-                            refreshWave()
-                        },
+                    WaveFilterPillButton(
+                        label = cfg.waveFilterSummary(),
+                        onClick = { showWaveSettingsSheet = true },
                     )
 
-                    // Ниже: статус и карточка активного плеера
                     WaveBottomStatusAndPlayer(
                         currentSong = currentSong,
                         isLiked = isCurrentLiked,
@@ -401,7 +387,6 @@ private fun AmbientWaveButton(
         contentAlignment = Alignment.Center,
         modifier = Modifier.size(size),
     ) {
-        // Мягкое амбиент-свечение в цветах текущей темы / обложки
         Canvas(modifier = Modifier.fillMaxSize()) {
             val center = Offset(this.size.width / 2f, this.size.height / 2f)
             val maxR = this.size.minDimension / 2f
@@ -441,7 +426,6 @@ private fun AmbientWaveButton(
             )
         }
 
-        // Интерактивный центр (тап = Play/Pause волны; на Этапе 3 здесь встанет встроенный маскот)
         Surface(
             onClick = onClick,
             enabled = !isGenerating,
@@ -473,42 +457,33 @@ private fun AmbientWaveButton(
 }
 
 @Composable
-private fun WaveSettingsSlider(
-    config: CustomAppConfig,
-    onOpenFullSettings: () -> Unit,
-    onSelectMood: (WaveMood) -> Unit,
+private fun WaveFilterPillButton(
+    label: String,
+    onClick: () -> Unit,
 ) {
-    Row(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(999.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.78f),
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)),
     ) {
-        FilterChip(
-            selected = false,
-            onClick = onOpenFullSettings,
-            leadingIcon = {
-                Icon(
-                    imageVector = MetrolistIcons.Outlined.Tune,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                )
-            },
-            label = {
-                Text(
-                    text = "${config.waveCharacter.label} ·${config.waveLanguage.label}",
-                    maxLines = 1,
-                )
-            },
-        )
-
-        WaveMood.entries.forEach { mood ->
-            FilterChip(
-                selected = config.waveMood == mood,
-                onClick = { onSelectMood(mood) },
-                label = { Text(mood.label, maxLines = 1) },
+        Row(
+            modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                imageVector = MetrolistIcons.Outlined.Tune,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -546,7 +521,7 @@ private fun WaveBottomStatusAndPlayer(
         val artistLine = song.artists.joinToString(", ") { it.name }.trim()
 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(18.dp))
             Surface(
                 shape = RoundedCornerShape(22.dp),
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -833,13 +808,14 @@ fun CustomEngineSettingsContent(
         OutlinedTextField(
             value = vkInput,
             onValueChange = { vkInput = it },
-            label = { Text("Токен ВК (Kate / audio)") },
+            label = { Text("Токен ВК (Kate / VK Android)") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedButton(
             onClick = {
                 persistInputs()
+                statusMessage = "Проверяю ВК…"
                 scope.launch {
                     vkProvider
                         .checkTokenDetailed(vkInput.trim())
