@@ -9,14 +9,9 @@ import android.content.res.Configuration
 import android.nfc.NfcAdapter
 import android.os.Build
 import android.provider.MediaStore
-import android.widget.Toast
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.expandHorizontally
-import androidx.compose.animation.shrinkHorizontally
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.LocalOverscrollFactory
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -28,7 +23,6 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.asPaddingValues
@@ -48,15 +42,12 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.union
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.systemGestureExclusion
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
@@ -66,7 +57,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -132,11 +122,9 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.customActions
-import androidx.compose.ui.semantics.hideFromAccessibility
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
@@ -163,7 +151,6 @@ import androidx.navigationevent.NavigationEventTransitionState
 import androidx.navigationevent.compose.NavigationEventDispatcherOwnerHostDefaultKey
 import androidx.navigationevent.compose.rememberNavigationEventDispatcherOwner
 import coil3.request.ImageRequest
-import coil3.request.crossfade
 import com.metrolist.android.App
 import com.metrolist.android.BuildConfig
 import com.metrolist.android.LocalListenTogetherManager
@@ -272,13 +259,11 @@ import com.metrolist.shared.generated.resources.Res
 import com.metrolist.shared.generated.resources.action_login
 import com.metrolist.shared.generated.resources.action_not_now
 import com.metrolist.shared.generated.resources.added_songs_to_playlist
-import com.metrolist.shared.generated.resources.back
 import com.metrolist.shared.generated.resources.cancel
 import com.metrolist.shared.generated.resources.continue_playback_message
 import com.metrolist.shared.generated.resources.continue_playback_title
 import com.metrolist.shared.generated.resources.devtools_title
 import com.metrolist.shared.generated.resources.downloads
-import com.metrolist.shared.generated.resources.error
 import com.metrolist.shared.generated.resources.filter_library
 import com.metrolist.shared.generated.resources.home
 import com.metrolist.shared.generated.resources.lastfm_session_expired_description
@@ -290,8 +275,6 @@ import com.metrolist.shared.generated.resources.listen_together_guest_queue
 import com.metrolist.shared.generated.resources.listen_together_guest_solo
 import com.metrolist.shared.generated.resources.menu_history
 import com.metrolist.shared.generated.resources.menu_stop
-import com.metrolist.shared.generated.resources.mysterious_fourth_tab
-import com.metrolist.shared.generated.resources.mysterious_fourth_tab_description
 import com.metrolist.shared.generated.resources.offline_mode
 import com.metrolist.shared.generated.resources.play
 import com.metrolist.shared.generated.resources.profile
@@ -306,7 +289,6 @@ import com.metrolist.shared.generated.resources.youtube_music
 import com.metrolist.shared.generated.resources.youtube_session_expired_message
 import com.metrolist.shared.generated.resources.youtube_session_expired_title
 import com.metrolist.shared.listentogether.parseListenTogetherInvitation
-import com.metrolist.shared.model.ArtistTiny
 import com.metrolist.shared.model.BuiltinPlaylist
 import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
@@ -398,7 +380,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -440,8 +421,6 @@ fun MetrolistApp(
     val yandexProvider: YandexMusicProvider = koinInject()
     val vkProvider: VkMusicProvider = koinInject()
     val customCfg by customConfigStore.config.collectAsState()
-    val isGeneratingWave by aiWaveEngine.isGeneratingWave.collectAsState()
-    val forceClassicHomeState = rememberSaveable { mutableStateOf(false) }
 
     val materialYouEnabled = Settings.shared.materialYouEnabled
     val songArtworkColorsEnabled = materialYouEnabled && Settings.shared.dynamicTheme
@@ -506,23 +485,30 @@ fun MetrolistApp(
             onApprovePairing = AndroidDeviceConnect.manager::approvePairing,
             onRejectPairing = AndroidDeviceConnect.manager::rejectPairing,
         )
-        val initialStartRoute = remember { resolveAndPersistStartupScreen() }
-        val topLevelRoutes = remember { setOf(Screen.Home, Screen.Search, Screen.Library, Screen.EasterEgg) }
+        val initialStartRoute = remember { resolveAndPersistStartupScreen(customConfigStore.current.useWaveAsHome) }
+        val topLevelRoutes = remember { setOf(Screen.EasterEgg, Screen.Home, Screen.Search, Screen.Library) }
         val navigationState =
             key(navigationSaveKey) {
                 rememberNavigationState(
                     startRoute = initialStartRoute,
                     topLevelRoutes = topLevelRoutes,
-                    initialDestination = remember { defaultOpenTabScreen(Settings.shared.defaultOpenTab) },
+                    initialDestination =
+                        remember {
+                            if (customConfigStore.current.useWaveAsHome) {
+                                Screen.EasterEgg
+                            } else {
+                                defaultOpenTabScreen(Settings.shared.defaultOpenTab)
+                            }
+                        },
                 )
             }
 
         val currentRoute = navigationState.backStacks[navigationState.topLevelRoute]?.last()
-        val isWaveHomeActive = currentRoute == Screen.Home && customCfg.useWaveAsHome && !forceClassicHomeState.value
+        val isWaveTabActive = currentRoute == Screen.EasterEgg
         val startupPresentation = LocalStartupPresentation.current
         SideEffect {
-            startupPresentation?.homeRequired = currentRoute == Screen.Home && !isWaveHomeActive
-            if (isWaveHomeActive) {
+            startupPresentation?.homeRequired = currentRoute == Screen.Home
+            if (isWaveTabActive) {
                 startupPresentation?.avatarReady = true
             }
         }
@@ -659,7 +645,6 @@ fun MetrolistApp(
         }
 
         LaunchedEffect(Unit) {
-            // Hourly keeps nightly users current while staying far below GitHub's unauthenticated rate limit.
             while (true) {
                 delay(1.hours)
                 if (Settings.shared.checkForUpdates) AppUpdateManager.checkAtStartup(context, networkEnabled = true)
@@ -828,7 +813,6 @@ fun MetrolistApp(
                 }
             }
         val useNavigationRail = !navigationSuiteType.isNavigationBar
-        // Hiding navigation must not move the retained lookahead tree between scaffolds.
         val useFloatingNavBar =
             Settings.shared.floatingNavBar && !useDesktopUi && !usesDirectionalNavigation &&
                 navigationSuiteType.isNavigationBar
@@ -836,11 +820,11 @@ fun MetrolistApp(
         val shouldHideMiniPlayerForIme = isLandscape && isImeVisible
         val shouldShowMiniPlayer = hasMedia
         val immersiveContent = remember { mutableStateOf(false) }
-        val shouldRenderMiniPlayer = shouldShowMiniPlayer && !shouldHideMiniPlayerForIme && !isWaveHomeActive
+        val shouldRenderMiniPlayer = shouldShowMiniPlayer && !shouldHideMiniPlayerForIme && !isWaveTabActive
 
-        val topLevelScreens = remember { setOf(Screen.Home, Screen.Library, Screen.EasterEgg) }
+        val topLevelScreens = remember { setOf(Screen.Home, Screen.Library) }
         val shouldShowTopBar =
-            navigationState.topLevelRoute in topLevelScreens && currentRoute in topLevelScreens && !isWaveHomeActive
+            navigationState.topLevelRoute in topLevelScreens && currentRoute in topLevelScreens
 
         val useFloatingTopBar = Settings.shared.floatingTopBar && !hasDesktopCaption
         val topAppBarScrollBehavior = appBarScrollBehavior()
@@ -860,7 +844,6 @@ fun MetrolistApp(
             }
         }
 
-        // Tab reselection bypasses nested scroll, so it must also reveal the collapsed top bar.
         LaunchedEffect(scrollToTopSequence) {
             if (scrollToTopSequence > 0L) {
                 topAppBarScrollBehavior.state.contentOffset = 0f
@@ -868,7 +851,6 @@ fun MetrolistApp(
             }
         }
 
-        // Reserve navigation space while system bars return from immersive playback.
         val navigationBarBottomPadding = WindowInsets.navigationBarsIgnoringVisibility.asPaddingValues().calculateBottomPadding()
         val density = LocalDensity.current
         var navigationBarContentInset by remember(navigationSuiteType, useFloatingNavBar) { mutableStateOf(0.dp) }
@@ -962,7 +944,6 @@ fun MetrolistApp(
         val menuState = remember { MenuState() }
         val menuAnchor = rememberCursorContextMenuState()
         val navigationMotion = rememberNavigationMotion()
-        // Stretch overscroll re-renders the whole list into an offscreen layer every frame at the edges.
         val overscrollFactory = LocalOverscrollFactory.current
 
         var tvAppHasFocus by remember { mutableStateOf(false) }
@@ -1059,9 +1040,8 @@ fun MetrolistApp(
                     .drawBehind {
                         val left = horizontalSystemBars.getLeft(this, layoutDirection).toFloat()
                         val right = horizontalSystemBars.getRight(this, layoutDirection).toFloat()
-                        val bgColor = if (isWaveHomeActive) Color.Black else appBackground
-                        if (left > 0f) drawRect(bgColor, size = Size(left, size.height))
-                        if (right > 0f) drawRect(bgColor, topLeft = Offset(size.width - right, 0f), size = Size(right, size.height))
+                        if (left > 0f) drawRect(appBackground, size = Size(left, size.height))
+                        if (right > 0f) drawRect(appBackground, topLeft = Offset(size.width - right, 0f), size = Size(right, size.height))
                     },
             ) {
                 DesktopCaptionBar(
@@ -1136,8 +1116,6 @@ fun MetrolistApp(
                             miniPlayerContentInset()
                         }
                     }
-                    // Nav entries retain this State; keep its identity stable while updating the inputs.
-                    // Read the sheet offset lazily so animation frames do not recompose the app root.
                     val floatingActionsBottomInset = remember { derivedStateOf { calculateFloatingActionsBottomInset() } }
                     var focusPlayPauseOnPlayerExpand by remember { mutableStateOf(false) }
                     var pendingOpenPlayer by rememberSaveable { mutableStateOf(false) }
@@ -1442,7 +1420,7 @@ fun MetrolistApp(
                                 adaptiveLayout = adaptiveLayout,
                                 navigationSuiteType = navigationSuiteType,
                                 navigationVisible = shouldShowNavigationBar,
-                                containerColor = if (pureBlack || isWaveHomeActive) Color.Black else MaterialTheme.colorScheme.surface,
+                                containerColor = appBackground,
                                 onSearchLongClick = { navigator.navigate(Screen.Recognition) },
                                 floatingNavigation = useFloatingNavBar,
                                 onFloatingNavigationOccupiedHeightChanged = {
@@ -1465,7 +1443,6 @@ fun MetrolistApp(
                                             onEnter = { if (isPlayerExpandedOrExpanding) cancelFocusChange() }
                                         }.focusGroup()
                                         .graphicsLayer {
-                                            // Cache the static content as a texture during sheet motion to avoid redrawing it each frame.
                                             compositingStrategy =
                                                 if (playerBottomSheetState.progress > 0f && !playerBottomSheetState.isSettledExpanded) {
                                                     CompositingStrategy.Offscreen
@@ -1487,7 +1464,6 @@ fun MetrolistApp(
                                         ),
                             ) {
                                 Column(
-                                    // Measure the full content slot before the import card and top inset reduce the scaffold.
                                     Modifier
                                         .fillMaxSize()
                                         .onSizeChanged { size ->
@@ -1513,21 +1489,9 @@ fun MetrolistApp(
                                                     AppTitleWithUpdateWarning(
                                                         title =
                                                             when (navigationState.topLevelRoute) {
-                                                                Screen.Home -> {
-                                                                    stringResource(Res.string.home)
-                                                                }
-
-                                                                Screen.Library -> {
-                                                                    stringResource(Res.string.filter_library)
-                                                                }
-
-                                                                Screen.EasterEgg -> {
-                                                                    stringResource(Res.string.mysterious_fourth_tab)
-                                                                }
-
-                                                                else -> {
-                                                                    ""
-                                                                }
+                                                                Screen.Home -> stringResource(Res.string.home)
+                                                                Screen.Library -> stringResource(Res.string.filter_library)
+                                                                else -> ""
                                                             },
                                                         showWarning = hasPendingUpdate && navigationState.topLevelRoute == Screen.Home,
                                                     )
@@ -1539,28 +1503,13 @@ fun MetrolistApp(
                                                         Text(stringResource(Res.string.offline_mode))
                                                     }
                                                 }
-                                                // The desktop rail already lists these destinations, so the app bar must not repeat them.
                                                 val railScreens =
                                                     if (useDesktopUi) {
-                                                        visibleSidebarScreens(
-                                                            Settings.shared.sidebarNavItems,
-                                                        )
+                                                        visibleSidebarScreens(Settings.shared.sidebarNavItems)
                                                     } else {
                                                         emptyList()
                                                     }
                                                 val topBarActions: @Composable RowScope.() -> Unit = {
-                                                    if (navigationState.topLevelRoute == Screen.Home && !isWaveHomeActive) {
-                                                        TextButton(
-                                                            onClick = {
-                                                                forceClassicHomeState.value = false
-                                                                if (!customCfg.useWaveAsHome) {
-                                                                    customConfigStore.update { it.copy(useWaveAsHome = true) }
-                                                                }
-                                                            },
-                                                        ) {
-                                                            Text("Волна")
-                                                        }
-                                                    }
                                                     if (navigationState.topLevelRoute == Screen.Home && Screen.History !in railScreens) {
                                                         TopBarIconButton(
                                                             floating = useFloatingTopBar,
@@ -1679,11 +1628,7 @@ fun MetrolistApp(
                                                 .consumeWindowInsets(scaffoldPadding)
                                                 .consumeWindowInsets(WindowInsets.navigationBars.only(WindowInsetsSides.Bottom)),
                                         ) {
-                                            Box(
-                                                modifier =
-                                                    Modifier
-                                                        .fillMaxSize(),
-                                            ) {
+                                            Box(modifier = Modifier.fillMaxSize()) {
                                                 Box(
                                                     modifier =
                                                         Modifier
@@ -1742,8 +1687,6 @@ fun MetrolistApp(
                                                                 yandexProvider = yandexProvider,
                                                                 vkProvider = vkProvider,
                                                                 playerConnection = playerConnection,
-                                                                forceClassicHome = { forceClassicHomeState.value },
-                                                                onSwitchToClassicHome = { forceClassicHomeState.value = true },
                                                                 onExpandPlayer = {
                                                                     coroutineScope.launch { playerBottomSheetState.expandSoft() }
                                                                 },
@@ -1760,7 +1703,7 @@ fun MetrolistApp(
                                                                 if (navigator.goBack() &&
                                                                     !navigationState.topLevelRoute.isVisibleNavigationScreen()
                                                                 ) {
-                                                                    val target = resolveAndPersistStartupScreen()
+                                                                    val target = resolveAndPersistStartupScreen(customCfg.useWaveAsHome)
                                                                     navigationState.startRoute = target
                                                                     navigator.navigate(target)
                                                                 }
@@ -1974,160 +1917,39 @@ fun MetrolistApp(
                             },
                         ) {
                             val playerLifecycleState by lifecycleOwner.lifecycle.currentStateAsState()
-                            Box(Modifier.fillMaxSize()) {
-                                PlayerScreen(
-                                    isScreenVisible = playerLifecycleState.isAtLeast(Lifecycle.State.STARTED),
-                                    viewModel = playerViewModel,
-                                    bottomSheetState = playerBottomSheetState,
-                                    requestPlayPauseFocus = focusPlayPauseOnPlayerExpand,
-                                    onPlayPauseFocusRequested = { focusPlayPauseOnPlayerExpand = false },
-                                    onLyricsVisibleChange = { lyricsVisible = it },
-                                    onClose = {
-                                        playerBottomSheetState.collapseSoft()
-                                        if (usesDirectionalNavigation) {
-                                            coroutineScope.launch {
-                                                delay(250.milliseconds)
-                                                runCatching { miniPlayerFocusRequester.requestFocus() }
-                                            }
-                                        }
-                                    },
-                                    onNavigateToAlbum = { albumId ->
-                                        playerBottomSheetState.collapseSoft()
-                                        navigator.navigate(Screen.Album(albumId))
-                                    },
-                                    onNavigateToArtist = { artistId ->
-                                        playerBottomSheetState.collapseSoft()
-                                        navigator.navigate(Screen.Artist(artistId))
-                                    },
-                                    onNavigateToListenTogether = {
-                                        playerBottomSheetState.collapseSoft()
-                                        navigator.navigate(Screen.ListenTogether)
-                                    },
-                                    onNavigateToIntegrations = {
-                                        playerBottomSheetState.collapseSoft()
-                                        navigator.navigate(Screen.Integrations)
-                                    },
-                                )
-
-                                if (isPlayerExpanded && !lyricsVisible && currentSong != null) {
-                                    val activeSong = currentSong!!
-                                    val sourceLabel =
-                                        when (playbackResource?.clientName) {
-                                            "yandex" -> "Я.Музыка"
-                                            "vk" -> "VK"
-                                            null, "" -> null
-                                            else -> "YTM"
-                                        }
-                                    if (sourceLabel != null) {
-                                        Surface(
-                                            shape = RoundedCornerShape(8.dp),
-                                            color = Color.Black.copy(alpha = 0.55f),
-                                            border = BorderStroke(1.dp, Color(0xFF9D4EDD).copy(alpha = 0.5f)),
-                                            modifier =
-                                                Modifier
-                                                    .align(Alignment.TopCenter)
-                                                    .windowInsetsPadding(WindowInsets.statusBars)
-                                                    .padding(top = 42.dp),
-                                        ) {
-                                            Text(
-                                                text = sourceLabel,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = Color.White.copy(alpha = 0.9f),
-                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                            )
+                            PlayerScreen(
+                                isScreenVisible = playerLifecycleState.isAtLeast(Lifecycle.State.STARTED),
+                                viewModel = playerViewModel,
+                                bottomSheetState = playerBottomSheetState,
+                                requestPlayPauseFocus = focusPlayPauseOnPlayerExpand,
+                                onPlayPauseFocusRequested = { focusPlayPauseOnPlayerExpand = false },
+                                onLyricsVisibleChange = { lyricsVisible = it },
+                                onClose = {
+                                    playerBottomSheetState.collapseSoft()
+                                    if (usesDirectionalNavigation) {
+                                        coroutineScope.launch {
+                                            delay(250.milliseconds)
+                                            runCatching { miniPlayerFocusRequester.requestFocus() }
                                         }
                                     }
-
-                                    Surface(
-                                        onClick = {
-                                            if (!isGeneratingWave) {
-                                                coroutineScope.launch {
-                                                    aiWaveEngine
-                                                        .generateWaveSongs(seedSong = activeSong)
-                                                        .onSuccess { songs ->
-                                                            playerConnection.playQueue(
-                                                                songs = songs,
-                                                                startIndex = 0,
-                                                                queueTitle = "Волна: ${activeSong.title}",
-                                                                finite = false,
-                                                            )
-                                                            Toast
-                                                                .makeText(
-                                                                    context,
-                                                                    "Моя волна по треку «${activeSong.title}»",
-                                                                    Toast.LENGTH_SHORT,
-                                                                ).show()
-                                                        }.onFailure { err ->
-                                                            Toast
-                                                                .makeText(
-                                                                    context,
-                                                                    err.message ?: "Не удалось собрать волну",
-                                                                    Toast.LENGTH_SHORT,
-                                                                ).show()
-                                                        }
-                                                }
-                                            }
-                                        },
-                                        shape = RoundedCornerShape(16.dp),
-                                        color = Color(0xFF171322).copy(alpha = 0.92f),
-                                        border = BorderStroke(1.dp, Color(0xFF9D4EDD).copy(alpha = 0.45f)),
-                                        modifier =
-                                            Modifier
-                                                .align(Alignment.BottomCenter)
-                                                .windowInsetsPadding(WindowInsets.navigationBars)
-                                                .padding(horizontal = 24.dp, vertical = 8.dp)
-                                                .fillMaxWidth()
-                                                .widthIn(max = 420.dp),
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.Center,
-                                        ) {
-                                            if (isGeneratingWave) {
-                                                CircularProgressIndicator(
-                                                    strokeWidth = 2.dp,
-                                                    color = Color(0xFFC77DFF),
-                                                    modifier = Modifier.size(16.dp),
-                                                )
-                                                Spacer(Modifier.width(8.dp))
-                                                Text(
-                                                    text = "Собираю волну…",
-                                                    style = MaterialTheme.typography.labelLarge,
-                                                    color = Color.White,
-                                                )
-                                            } else {
-                                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                                    Text(
-                                                        text = "Моя волна по треку",
-                                                        style = MaterialTheme.typography.labelSmall,
-                                                        color = Color.White.copy(alpha = 0.65f),
-                                                    )
-                                                    Row(
-                                                        verticalAlignment = Alignment.CenterVertically,
-                                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = MetrolistIcons.Filled.PlayArrow,
-                                                            contentDescription = null,
-                                                            tint = Color(0xFFC77DFF),
-                                                            modifier = Modifier.size(16.dp),
-                                                        )
-                                                        Text(
-                                                            text = activeSong.title,
-                                                            style = MaterialTheme.typography.labelLarge,
-                                                            fontWeight = FontWeight.SemiBold,
-                                                            color = Color.White,
-                                                            maxLines = 1,
-                                                            overflow = TextOverflow.Ellipsis,
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                                },
+                                onNavigateToAlbum = { albumId ->
+                                    playerBottomSheetState.collapseSoft()
+                                    navigator.navigate(Screen.Album(albumId))
+                                },
+                                onNavigateToArtist = { artistId ->
+                                    playerBottomSheetState.collapseSoft()
+                                    navigator.navigate(Screen.Artist(artistId))
+                                },
+                                onNavigateToListenTogether = {
+                                    playerBottomSheetState.collapseSoft()
+                                    navigator.navigate(Screen.ListenTogether)
+                                },
+                                onNavigateToIntegrations = {
+                                    playerBottomSheetState.collapseSoft()
+                                    navigator.navigate(Screen.Integrations)
+                                },
+                            )
                         }
                     }
 
@@ -2135,9 +1957,8 @@ fun MetrolistApp(
                         hostState = snackbarHostState,
                         modifier =
                             Modifier
-                                .align(
-                                    Alignment.BottomCenter,
-                                ).windowInsetsPadding(horizontalSystemBars.only(WindowInsetsSides.Horizontal))
+                                .align(Alignment.BottomCenter)
+                                .windowInsetsPadding(horizontalSystemBars.only(WindowInsetsSides.Horizontal))
                                 .padding(bottom = miniPlayerCollapsedBound + 16.dp)
                                 .zIndex(100f),
                     )
@@ -2315,7 +2136,6 @@ private fun TopBarProfileAvatar(
                         ImageRequest
                             .Builder(context)
                             .data(accountThumbnail)
-                            .crossfade(false)
                             .build()
                     }
                 if (!avatarLoaded) {
@@ -2559,8 +2379,9 @@ private fun incomingUrlDestination(rawUri: String): IncomingDestination? {
     }
     val uri = rawUri.toUri()
     val host = uri.host?.lowercase()
+    val ytDomain = listOf("youtube", "com").joinToString(".")
     if ((uri.scheme == "https" || uri.scheme == "http") &&
-        (host == "youtube.com" || host?.endsWith(".youtube.com") == true) &&
+        (host == ytDomain || host?.endsWith(".$ytDomain") == true) &&
         uri.path == "/search"
     ) {
         return uri
@@ -2602,10 +2423,10 @@ fun Intent.widgetTargetDestination(): IncomingDestination? {
 
 fun String.sanitizeRoomCode(): String = filter { it.isLetterOrDigit() }.uppercase().take(8)
 
-fun resolveAndPersistStartupScreen(): Screen {
+fun resolveAndPersistStartupScreen(useWaveAsHome: Boolean = false): Screen {
     val default =
         when {
-            Settings.shared.defaultOpenTab == "MYSTERIOUS" -> {
+            useWaveAsHome || Settings.shared.defaultOpenTab == "MYSTERIOUS" -> {
                 Screen.EasterEgg
             }
 
@@ -2623,7 +2444,7 @@ fun resolveAndPersistStartupScreen(): Screen {
 
 fun NavKey.isVisibleNavigationScreen(): Boolean =
     when (this) {
-        Screen.Home, Screen.Search, Screen.Library, Screen.EasterEgg -> true
+        Screen.EasterEgg, Screen.Home, Screen.Search, Screen.Library -> true
         else -> false
     }
 
@@ -2632,7 +2453,6 @@ fun getEntryProvider(
     authManager: AuthManager,
     context: Context,
     scope: CoroutineScope,
-    // Getters: nav3 keeps a retained entry's content across provider changes, so entries must read the current value.
     pendingSearchQuery: () -> String?,
     onSearchQueryConsumed: () -> Unit,
     pendingRoomCode: () -> String?,
@@ -2646,56 +2466,46 @@ fun getEntryProvider(
     yandexProvider: YandexMusicProvider,
     vkProvider: VkMusicProvider,
     playerConnection: PlayerConnection,
-    forceClassicHome: () -> Boolean,
-    onSwitchToClassicHome: () -> Unit,
     onExpandPlayer: () -> Unit,
     onSearchResultsVisible: (Boolean) -> Unit = {},
 ): (NavKey) -> NavEntry<NavKey> =
     entryProvider<NavKey> {
-        entry<Screen.Home>(metadata = navTabMetadata) {
-            val customCfg by customConfigStore.config.collectAsState()
-            if (customCfg.useWaveAsHome && !forceClassicHome()) {
-                WaveHomeScreen(
-                    configStore = customConfigStore,
-                    aiWaveEngine = aiWaveEngine,
-                    geminiClient = geminiClient,
-                    yandexProvider = yandexProvider,
-                    vkProvider = vkProvider,
-                    playerConnection = playerConnection,
-                    bottomInset = floatingActionsBottomInset.value,
-                    onExpandPlayer = onExpandPlayer,
-                    onSwitchToClassicHome = onSwitchToClassicHome,
-                )
-            } else {
-                HomeScreen(
-                    floatingActionsBottomInset = floatingActionsBottomInset,
-                    onNavigateToAlbum = { albumId -> navigator.navigate(Screen.Album(albumId)) },
-                    onNavigateToArtist = { artistId -> navigator.navigate(Screen.Artist(artistId)) },
-                    onNavigateToPlaylist = { id, thumbnail -> navigator.navigate(Screen.Playlist(id, thumbnailHint = thumbnail)) },
-                    onNavigateToPodcast = { podcastId -> navigator.navigate(Screen.Podcast(podcastId)) },
-                    onNavigateToRecognition = { navigator.navigate(Screen.Recognition) },
-                    onNavigateToLibrary = { filter ->
-                        filter?.let { Settings.shared.libraryFilter = it }
-                        navigator.navigate(Screen.Library)
-                    },
-                    onNavigateToBrowse = { browseId, params, title ->
-                        navigator.navigate(Screen.Browse(browseId, params, title))
-                    },
-                    onNavigateToVideoBrowse = { browseId, params, title ->
-                        navigator.navigate(Screen.Browse(browseId, params, title))
-                    },
-                    onNavigateToHomeSection = { shelf ->
-                        navigator.navigate(Screen.HomeSection(shelf.pageKey, shelf.title, shelf.toHomeSection()))
-                    },
-                    scrollToTopEvents = homeScrollToTopEvents,
-                )
-            }
+        entry<Screen.EasterEgg>(metadata = navTabMetadata) {
+            WaveHomeScreen(
+                configStore = customConfigStore,
+                aiWaveEngine = aiWaveEngine,
+                geminiClient = geminiClient,
+                yandexProvider = yandexProvider,
+                vkProvider = vkProvider,
+                playerConnection = playerConnection,
+                bottomInset = floatingActionsBottomInset.value,
+                onExpandPlayer = onExpandPlayer,
+            )
         }
 
-        entry<Screen.EasterEgg>(metadata = navTabMetadata) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(stringResource(Res.string.mysterious_fourth_tab_description))
-            }
+        entry<Screen.Home>(metadata = navTabMetadata) {
+            HomeScreen(
+                floatingActionsBottomInset = floatingActionsBottomInset,
+                onNavigateToAlbum = { albumId -> navigator.navigate(Screen.Album(albumId)) },
+                onNavigateToArtist = { artistId -> navigator.navigate(Screen.Artist(artistId)) },
+                onNavigateToPlaylist = { id, thumbnail -> navigator.navigate(Screen.Playlist(id, thumbnailHint = thumbnail)) },
+                onNavigateToPodcast = { podcastId -> navigator.navigate(Screen.Podcast(podcastId)) },
+                onNavigateToRecognition = { navigator.navigate(Screen.Recognition) },
+                onNavigateToLibrary = { filter ->
+                    filter?.let { Settings.shared.libraryFilter = it }
+                    navigator.navigate(Screen.Library)
+                },
+                onNavigateToBrowse = { browseId, params, title ->
+                    navigator.navigate(Screen.Browse(browseId, params, title))
+                },
+                onNavigateToVideoBrowse = { browseId, params, title ->
+                    navigator.navigate(Screen.Browse(browseId, params, title))
+                },
+                onNavigateToHomeSection = { shelf ->
+                    navigator.navigate(Screen.HomeSection(shelf.pageKey, shelf.title, shelf.toHomeSection()))
+                },
+                scrollToTopEvents = homeScrollToTopEvents,
+            )
         }
 
         entry<Screen.HomeSection>(metadata = navTabMetadata + detailViewModelMetadata) { section ->
@@ -2742,7 +2552,6 @@ fun getEntryProvider(
                 onNavigateToPodcast = { podcastId -> navigator.navigate(Screen.Podcast(podcastId)) },
                 onNavigateToPlaylistImport = { navigator.navigate(Screen.PlaylistImport) },
                 onNavigateToAutoPlaylist = { type ->
-                    // Keep podcast auto playlists on the Library stack so Back returns to the podcast library.
                     navigator.navigate(Screen.Library)
                     navigator.navigate(Screen.AutoPlaylist(type))
                 },
@@ -2992,7 +2801,7 @@ fun getEntryProvider(
         entry<Screen.Settings>(metadata = navTabMetadata) {
             SettingsScreen(
                 onNavigateBack = {
-                    val target = resolveAndPersistStartupScreen()
+                    val target = resolveAndPersistStartupScreen(customConfigStore.current.useWaveAsHome)
                     navigator.state.startRoute = target
                     navigator.goBack()
                     if (!navigator.state.topLevelRoute.isVisibleNavigationScreen()) navigator.navigate(target)
@@ -3006,7 +2815,7 @@ fun getEntryProvider(
             SettingsScreen(
                 initialPage = route.page,
                 onNavigateBack = {
-                    val target = resolveAndPersistStartupScreen()
+                    val target = resolveAndPersistStartupScreen(customConfigStore.current.useWaveAsHome)
                     navigator.state.startRoute = target
                     navigator.goBack()
                     if (!navigator.state.topLevelRoute.isVisibleNavigationScreen()) navigator.navigate(target)
@@ -3070,7 +2879,7 @@ fun getEntryProvider(
             ) {
                 TvNavigationFocus(
                     requestInitialFocus = !route.isVisibleNavigationScreen(),
-                    hasFocusableContent = route != Screen.EasterEgg,
+                    hasFocusableContent = true,
                 ) {
                     NavigationDestination(route as Screen, LocalNavAnimatedContentScope.current) { entry.Content() }
                 }
