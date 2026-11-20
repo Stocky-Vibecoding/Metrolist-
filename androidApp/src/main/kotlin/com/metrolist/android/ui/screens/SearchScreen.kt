@@ -16,21 +16,15 @@ import android.speech.RecognizerIntent
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
@@ -47,16 +41,13 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.input.rememberTextFieldState
-import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SearchBarDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -66,24 +57,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -97,6 +79,8 @@ import androidx.compose.ui.unit.dp
 import com.metrolist.android.LocalMiniPlayerBottomInset
 import com.metrolist.android.LocalPlayerExpanded
 import com.metrolist.android.LocalPlaylistAdder
+import com.metrolist.android.custom.AiWaveEngine
+import com.metrolist.android.custom.SearchAiPlaylistCard
 import com.metrolist.android.extensions.findActivity
 import com.metrolist.android.playback.LocalPlayerConnection
 import com.metrolist.android.ui.component.AdaptiveModalBottomSheet
@@ -112,7 +96,6 @@ import com.metrolist.android.ui.utils.playSong
 import com.metrolist.android.utils.startActivitySafely
 import com.metrolist.android.viewmodels.SearchViewModel
 import com.metrolist.innertubex.utils.YouTubeUrlParser
-import com.metrolist.shared.api.playlistSongs
 import com.metrolist.shared.generated.resources.Res
 import com.metrolist.shared.generated.resources.album_link
 import com.metrolist.shared.generated.resources.artist_link
@@ -160,6 +143,7 @@ import kotlinx.coroutines.launch
 import org.jetbrains.compose.resources.getString
 import org.jetbrains.compose.resources.stringResource
 import org.koin.androidx.compose.koinViewModel
+import org.koin.compose.koinInject
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -177,6 +161,9 @@ fun SearchScreen(
     val albumLinkText = stringResource(Res.string.album_link)
     val artistLinkText = stringResource(Res.string.artist_link)
     val playlistLinkText = stringResource(Res.string.playlist_link)
+
+    val aiWaveEngine: AiWaveEngine = koinInject()
+    var dismissedAiQuery by rememberSaveable { mutableStateOf<String?>(null) }
 
     val searchUiState by searchViewModel.shared.uiState.collectAsState()
     val query = searchUiState.query
@@ -297,6 +284,7 @@ fun SearchScreen(
     val returnToMainSearch = {
         dismissKeyboardAndFocus()
         isResultsPage = false
+        dismissedAiQuery = null
         searchViewModel.hasRequestedInitialFocus = false
         selectedFilterState?.let { searchViewModel.shared.clearFilter() }
         searchViewModel.shared.resetSearch()
@@ -360,6 +348,7 @@ fun SearchScreen(
             keyboardController?.hide()
             focusManager.clearFocus(force = true)
             if (!routeYouTubeUrl(normalized)) {
+                dismissedAiQuery = null
                 isResultsPage = true
                 searchViewModel.shared.onQueryChange(normalized)
                 searchViewModel.shared.searchQuery(normalized)
@@ -459,133 +448,165 @@ fun SearchScreen(
                                 },
                             ),
                 ) {
-                    SearchScreen(
-                        uiState =
-                            if (submitted || !isResultsPage) {
-                                searchUiState
-                            } else {
-                                searchUiState.copy(
-                                    query = "",
-                                    isQuerySubmitted = false,
-                                    hasSearched = false,
-                                    searchSuggestions = null,
-                                )
-                            },
-                        text = searchScreenText(),
-                        onQueryChange = searchViewModel.shared::onQueryChange,
-                        onSearch = submitSearch,
-                        onBack = returnToMainSearch,
-                        onVideoItemClick = { item ->
-                            dismissKeyboardAndFocus()
-                            if (item is SongItem) {
-                                searchViewModel.shared.addPlayedSearchSong(item)
-                                playSong(item, playerConnection, scope, startVideo = true)
-                            }
-                        },
-                        onItemClick = { item ->
-                            dismissKeyboardAndFocus()
-                            when (item) {
-                                is SongItem -> {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        SearchScreen(
+                            uiState =
+                                if (submitted || !isResultsPage) {
+                                    searchUiState
+                                } else {
+                                    searchUiState.copy(
+                                        query = "",
+                                        isQuerySubmitted = false,
+                                        hasSearched = false,
+                                        searchSuggestions = null,
+                                    )
+                                },
+                            text = searchScreenText(),
+                            onQueryChange = searchViewModel.shared::onQueryChange,
+                            onSearch = submitSearch,
+                            onBack = returnToMainSearch,
+                            onVideoItemClick = { item ->
+                                dismissKeyboardAndFocus()
+                                if (item is SongItem) {
                                     searchViewModel.shared.addPlayedSearchSong(item)
-                                    playSong(item, playerConnection, scope)
+                                    playSong(item, playerConnection, scope, startVideo = true)
                                 }
-
-                                is AlbumItem -> {
-                                    navigator.navigate(Screen.Album(item.id))
-                                }
-
-                                is ArtistItem -> {
-                                    CollectionPreviews.record(item)
-                                    navigator.navigate(Screen.Artist(item.id))
-                                }
-
-                                is PlaylistItem -> {
-                                    navigator.navigate(Screen.Playlist(item.id, thumbnailHint = item.thumbnail))
-                                }
-
-                                is PodcastItem -> {
-                                    navigator.navigate(Screen.Podcast(item.id))
-                                }
-
-                                is EpisodeItem -> {
-                                    playSong(item.toSongItem(), playerConnection, scope)
-                                }
-
-                                else -> {}
-                            }
-                        },
-                        onAlbumPlay = { album ->
-                            dismissKeyboardAndFocus()
-                            playerConnection?.playAlbum(album.id, album.title)
-                        },
-                        onItemLongClick = { item ->
-                            when (item) {
-                                is SongItem -> showSongMenu = item
-                                is AlbumItem -> showAlbumMenu = item
-                                is ArtistItem -> showArtistMenu = item
-                                is PlaylistItem -> showPlaylistMenu = item
-                                is PodcastItem -> showPodcastMenu = item
-                                else -> Unit
-                            }
-                        },
-                        onSongSave = { addToPlaylist(listOf(it)) },
-                        onHistoryItemClick = submitSearch,
-                        onHistoryItemInsert = { historyItem ->
-                            searchViewModel.shared.onQueryChange(historyItem)
-                            focusRequester.requestFocus()
-                            keyboardController?.show()
-                        },
-                        onRemoveHistoryItem = searchViewModel.shared::removeSearchHistoryItem,
-                        onClearHistory = searchViewModel.shared::clearSearchHistory,
-                        onRemoveRecentItem = searchViewModel.shared::removeRecentPlayedSearchSong,
-                        onClearRecentItems = searchViewModel.shared::clearRecentPlayedSearchSongs,
-                        onFilterSelected = { filter ->
-                            if (filter == null) searchViewModel.shared.clearFilter() else searchViewModel.shared.searchFiltered(filter)
-                        },
-                        onLoadMore = searchViewModel.shared::loadMoreFilteredResults,
-                        onRetryLoadMore = searchViewModel.shared::retryLoadMoreFilteredResults,
-                        currentSongId = currentSong?.id,
-                        isPlaying = isPlaying,
-                        contentPadding = PaddingValues(bottom = bottomOverlayInset + 24.dp),
-                        onArtistClick = { artistId ->
-                            dismissKeyboardAndFocus()
-                            navigator.navigate(Screen.Artist(artistId))
-                        },
-                        onAlbumClick = { albumId ->
-                            dismissKeyboardAndFocus()
-                            navigator.navigate(Screen.Album(albumId))
-                        },
-                        onShuffleClick = { item ->
-                            dismissKeyboardAndFocus()
-                            if (item is ArtistItem) {
-                                scope.launch {
-                                    GlobalYouTubeRepository.instance.getArtistSongs(item.id).takeIf { it.isNotEmpty() }?.let {
-                                        playerConnection?.shuffleQueue(it, item.title, songsOnly = true)
-                                    }
-                                }
-                            }
-                        },
-                        onMixClick = { item ->
-                            dismissKeyboardAndFocus()
-                            if (item is ArtistItem) {
-                                scope.launch {
-                                    GlobalYouTubeRepository.instance.startArtistRadio(item.id).takeIf { it.isNotEmpty() }?.let {
-                                        playerConnection?.playQueue(it, 0, "${item.title} Radio")
-                                    }
-                                }
-                            }
-                        },
-                        itemContainer = itemContainer,
-                        onMicrophoneClick =
-                            if (voiceSearchEnabled) {
-                                launchVoiceSearch
-                            } else {
-                                { navigator.navigate(Screen.Recognition) }
                             },
-                        focusRequester = focusRequester,
-                        searchBarEndPadding = searchBarEndPadding,
-                        modifier = Modifier.fillMaxSize(),
-                    )
+                            onItemClick = { item ->
+                                dismissKeyboardAndFocus()
+                                when (item) {
+                                    is SongItem -> {
+                                        searchViewModel.shared.addPlayedSearchSong(item)
+                                        playSong(item, playerConnection, scope)
+                                    }
+
+                                    is AlbumItem -> {
+                                        navigator.navigate(Screen.Album(item.id))
+                                    }
+
+                                    is ArtistItem -> {
+                                        CollectionPreviews.record(item)
+                                        navigator.navigate(Screen.Artist(item.id))
+                                    }
+
+                                    is PlaylistItem -> {
+                                        navigator.navigate(Screen.Playlist(item.id, thumbnailHint = item.thumbnail))
+                                    }
+
+                                    is PodcastItem -> {
+                                        navigator.navigate(Screen.Podcast(item.id))
+                                    }
+
+                                    is EpisodeItem -> {
+                                        playSong(item.toSongItem(), playerConnection, scope)
+                                    }
+
+                                    else -> {}
+                                }
+                            },
+                            onAlbumPlay = { album ->
+                                dismissKeyboardAndFocus()
+                                playerConnection?.playAlbum(album.id, album.title)
+                            },
+                            onItemLongClick = { item ->
+                                when (item) {
+                                    is SongItem -> showSongMenu = item
+                                    is AlbumItem -> showAlbumMenu = item
+                                    is ArtistItem -> showArtistMenu = item
+                                    is PlaylistItem -> showPlaylistMenu = item
+                                    is PodcastItem -> showPodcastMenu = item
+                                    else -> Unit
+                                }
+                            },
+                            onSongSave = { addToPlaylist(listOf(it)) },
+                            onHistoryItemClick = submitSearch,
+                            onHistoryItemInsert = { historyItem ->
+                                searchViewModel.shared.onQueryChange(historyItem)
+                                focusRequester.requestFocus()
+                                keyboardController?.show()
+                            },
+                            onRemoveHistoryItem = searchViewModel.shared::removeSearchHistoryItem,
+                            onClearHistory = searchViewModel.shared::clearSearchHistory,
+                            onRemoveRecentItem = searchViewModel.shared::removeRecentPlayedSearchSong,
+                            onClearRecentItems = searchViewModel.shared::clearRecentPlayedSearchSongs,
+                            onFilterSelected = { filter ->
+                                if (filter == null) searchViewModel.shared.clearFilter() else searchViewModel.shared.searchFiltered(filter)
+                            },
+                            onLoadMore = searchViewModel.shared::loadMoreFilteredResults,
+                            onRetryLoadMore = searchViewModel.shared::retryLoadMoreFilteredResults,
+                            currentSongId = currentSong?.id,
+                            isPlaying = isPlaying,
+                            contentPadding = PaddingValues(bottom = bottomOverlayInset + 24.dp),
+                            onArtistClick = { artistId ->
+                                dismissKeyboardAndFocus()
+                                navigator.navigate(Screen.Artist(artistId))
+                            },
+                            onAlbumClick = { albumId ->
+                                dismissKeyboardAndFocus()
+                                navigator.navigate(Screen.Album(albumId))
+                            },
+                            onShuffleClick = { item ->
+                                dismissKeyboardAndFocus()
+                                if (item is ArtistItem) {
+                                    scope.launch {
+                                        GlobalYouTubeRepository.instance.getArtistSongs(item.id).takeIf { it.isNotEmpty() }?.let {
+                                            playerConnection?.shuffleQueue(it, item.title, songsOnly = true)
+                                        }
+                                    }
+                                }
+                            },
+                            onMixClick = { item ->
+                                dismissKeyboardAndFocus()
+                                if (item is ArtistItem) {
+                                    scope.launch {
+                                        GlobalYouTubeRepository.instance.startArtistRadio(item.id).takeIf { it.isNotEmpty() }?.let {
+                                            playerConnection?.playQueue(it, 0, "${item.title} Radio")
+                                        }
+                                    }
+                                }
+                            },
+                            itemContainer = itemContainer,
+                            onMicrophoneClick =
+                                if (voiceSearchEnabled) {
+                                    launchVoiceSearch
+                                } else {
+                                    { navigator.navigate(Screen.Recognition) }
+                                },
+                            focusRequester = focusRequester,
+                            searchBarEndPadding = searchBarEndPadding,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+
+                        if (submitted && isResultsPage && AiWaveEngine.isPlaylistLikeQuery(query) && dismissedAiQuery != query) {
+                            Column(
+                                modifier =
+                                    Modifier
+                                        .align(Alignment.TopCenter)
+                                        .padding(top = 76.dp)
+                                        .fillMaxWidth(),
+                                horizontalAlignment = Alignment.End,
+                            ) {
+                                SearchAiPlaylistCard(
+                                    query = query,
+                                    aiWaveEngine = aiWaveEngine,
+                                    onPlaySongs = { songs, title ->
+                                        dismissKeyboardAndFocus()
+                                        playerConnection?.playQueue(songs, queueTitle = title, finite = true)
+                                    },
+                                    onEnqueueSongs = { songs ->
+                                        playerConnection?.addToQueue(songs)
+                                        Toast.makeText(context, "Добавлено в очередь (${songs.size})", Toast.LENGTH_SHORT).show()
+                                    },
+                                )
+                                TextButton(
+                                    onClick = { dismissedAiQuery = query },
+                                    modifier = Modifier.padding(end = 16.dp),
+                                ) {
+                                    Text("Показать обычный поиск")
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
