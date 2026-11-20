@@ -12,12 +12,19 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -60,6 +67,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -67,6 +75,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -74,11 +83,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -98,9 +108,14 @@ import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.components.images.AsyncImage
 import com.metrolist.shared.ui.icons.MetrolistIcons
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
 
 private val PurpleNeonPrimary = Color(0xFF9D4EDD)
 private val PurpleNeonGlow = Color(0xFF7B2CBF)
@@ -134,6 +149,8 @@ fun WaveHomeScreen(
     val isCurrentLiked = currentSong?.id?.let { it in likedIds } == true
 
     var bassEnergy by remember { mutableFloatStateOf(0f) }
+    var beatKick by remember { mutableFloatStateOf(0f) }
+    var spectrumBands by remember { mutableStateOf(FloatArray(18)) }
     var mascotPhrase by remember { mutableStateOf<String?>(null) }
     var showWaveSettingsSheet by remember { mutableStateOf(false) }
     var showEngineSettingsSheet by remember { mutableStateOf(false) }
@@ -144,20 +161,35 @@ fun WaveHomeScreen(
         if (!isPlaying) {
             while (isActive) {
                 bassEnergy = (bassEnergy * 0.84f).coerceAtLeast(0f)
-                if (bassEnergy < 0.01f) break
+                beatKick = (beatKick * 0.80f).coerceAtLeast(0f)
+                val decayed = FloatArray(18) { i -> (spectrumBands[i] * 0.82f).coerceAtLeast(0f) }
+                spectrumBands = decayed
+                if (bassEnergy < 0.01f && beatKick < 0.01f) break
                 delay(32L)
             }
             return@LaunchedEffect
         }
         com.metrolist.shared.equalizer.AudioSpectrumMeter.addConsumer()
+        var avgBass = 0.15f
         try {
             while (isActive) {
                 val levels = com.metrolist.shared.equalizer.AudioSpectrumMeter.levels()
-                val b0 = levels.getOrElse(0) { 0f }
-                val b1 = levels.getOrElse(1) { 0f }
-                val b2 = levels.getOrElse(2) { 0f }
-                val rawBass = ((b0 * 0.45f) + (b1 * 0.35f) + (b2 * 0.20f)).coerceIn(0f, 1f)
+                val nextBands =
+                    FloatArray(18) { i ->
+                        val raw = levels.getOrElse(i) { 0f }.coerceIn(0f, 1f)
+                        val prev = spectrumBands[i]
+                        if (raw > prev) raw else (prev * 0.72f + raw * 0.28f)
+                    }
+                spectrumBands = nextBands
+
+                val rawBass = ((nextBands[0] * 0.45f) + (nextBands[1] * 0.35f) + (nextBands[2] * 0.20f)).coerceIn(0f, 1f)
                 bassEnergy = if (rawBass > bassEnergy) rawBass else (bassEnergy * 0.78f + rawBass * 0.22f)
+
+                val delta = (rawBass - avgBass).coerceAtLeast(0f)
+                avgBass = avgBass * 0.90f + rawBass * 0.10f
+                val kickNow = (delta * 3.4f).coerceIn(0f, 1f)
+                beatKick = if (kickNow > beatKick) kickNow else (beatKick * 0.76f)
+
                 delay(32L)
             }
         } finally {
@@ -232,24 +264,12 @@ fun WaveHomeScreen(
                     SourceBadge(clientName = playbackResource?.clientName)
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "Лента",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = Color.White.copy(alpha = 0.65f),
-                        modifier =
-                            Modifier
-                                .clip(RoundedCornerShape(10.dp))
-                                .clickable(onClick = onSwitchToClassicHome)
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                IconButton(onClick = { showEngineSettingsSheet = true }) {
+                    Icon(
+                        imageVector = MetrolistIcons.Outlined.Settings,
+                        contentDescription = "Настройки движка",
+                        tint = Color.White.copy(alpha = 0.85f),
                     )
-                    IconButton(onClick = { showEngineSettingsSheet = true }) {
-                        Icon(
-                            imageVector = MetrolistIcons.Outlined.Settings,
-                            contentDescription = "Настройки движка",
-                            tint = Color.White.copy(alpha = 0.85f),
-                        )
-                    }
                 }
             }
 
@@ -265,18 +285,21 @@ fun WaveHomeScreen(
                         modifier = Modifier.weight(1f),
                         contentAlignment = Alignment.Center,
                     ) {
-                        MascotWithBassNeon(
+                        MascotStage(
                             mascotEnabled = cfg.mascotEnabled,
                             folderUri = cfg.mascotFolderUri,
+                            trackKey = currentSong?.id,
                             accentColor = accentColor,
                             bassEnergy = bassEnergy,
+                            beatKick = beatKick,
+                            spectrumBands = spectrumBands,
                             isPlaying = isPlaying,
-                            size = 220.dp,
+                            size = 250.dp,
                         )
                     }
 
                     Column(
-                        modifier = Modifier.weight(1.15f),
+                        modifier = Modifier.weight(1.1f),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center,
                     ) {
@@ -303,16 +326,19 @@ fun WaveHomeScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    MascotWithBassNeon(
+                    MascotStage(
                         mascotEnabled = cfg.mascotEnabled,
                         folderUri = cfg.mascotFolderUri,
+                        trackKey = currentSong?.id,
                         accentColor = accentColor,
                         bassEnergy = bassEnergy,
+                        beatKick = beatKick,
+                        spectrumBands = spectrumBands,
                         isPlaying = isPlaying,
-                        size = 216.dp,
+                        size = 252.dp,
                     )
 
-                    Spacer(modifier = Modifier.height(22.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
 
                     WaveControlsBlock(
                         currentSong = currentSong,
@@ -367,6 +393,10 @@ fun WaveHomeScreen(
                 yandexProvider = yandexProvider,
                 vkProvider = vkProvider,
                 geminiClient = geminiClient,
+                onOpenClassicHome = {
+                    showEngineSettingsSheet = false
+                    onSwitchToClassicHome()
+                },
             )
         }
     }
@@ -400,8 +430,8 @@ private fun WaveControlsBlock(
         shape = CircleShape,
         color = accentColor,
         contentColor = Color.White,
-        shadowElevation = 10.dp,
-        modifier = Modifier.size(72.dp).scale(buttonScale),
+        shadowElevation = 14.dp,
+        modifier = Modifier.size(74.dp).scale(buttonScale),
     ) {
         Box(contentAlignment = Alignment.Center) {
             if (isGenerating) {
@@ -425,8 +455,8 @@ private fun WaveControlsBlock(
     Surface(
         onClick = onOpenWaveSettings,
         shape = RoundedCornerShape(999.dp),
-        color = Color(0xFF1B1626),
-        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.42f)),
+        color = Color(0xFF161121),
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.40f)),
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -457,8 +487,8 @@ private fun WaveControlsBlock(
             Spacer(modifier = Modifier.height(18.dp))
             Surface(
                 shape = RoundedCornerShape(22.dp),
-                color = Color(0xFF15121E),
-                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
+                color = Color(0xFF14101D),
+                border = BorderStroke(1.dp, accentColor.copy(alpha = 0.22f)),
                 modifier = Modifier.fillMaxWidth().widthIn(max = 460.dp),
             ) {
                 Row(
@@ -469,7 +499,11 @@ private fun WaveControlsBlock(
                         url = song.thumbnail,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier.size(44.dp).clip(RoundedCornerShape(12.dp)),
+                        modifier =
+                            Modifier
+                                .size(44.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable(onClick = onOpenFullPlayer),
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Column(
@@ -517,7 +551,7 @@ private fun WaveControlsBlock(
         Text(
             text = statusOrPhrase,
             style = MaterialTheme.typography.bodySmall,
-            color = Color.White.copy(alpha = 0.65f),
+            color = Color.White.copy(alpha = 0.72f),
             textAlign = TextAlign.Center,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
@@ -530,38 +564,54 @@ private fun WaveControlsBlock(
         Text(
             text = "ИИ: $activeModel",
             style = MaterialTheme.typography.labelSmall,
-            color = PurpleNeonSoft.copy(alpha = 0.65f),
+            color = PurpleNeonSoft.copy(alpha = 0.60f),
         )
     }
 }
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-private fun MascotWithBassNeon(
+private fun MascotStage(
     mascotEnabled: Boolean,
     folderUri: String,
+    trackKey: String?,
     accentColor: Color,
     bassEnergy: Float,
+    beatKick: Float,
+    spectrumBands: FloatArray,
     isPlaying: Boolean,
     size: Dp,
 ) {
     val context = LocalContext.current
     val pulse = bassEnergy.coerceIn(0f, 1f)
-    val glowAlpha = (0.28f + pulse * 0.55f).coerceIn(0f, 0.9f)
-    val ringAlpha = (0.45f + pulse * 0.50f).coerceIn(0f, 1f)
-    val scaleFactor = 1f + (pulse * 0.06f)
+    val kick = beatKick.coerceIn(0f, 1f)
 
-    val videos =
-        remember(folderUri, mascotEnabled) {
-            if (!mascotEnabled || folderUri.isBlank()) emptyList()
-            else listVideoUrisInFolder(context, folderUri.toUri())
+    var videos by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var videoIndex by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(folderUri, mascotEnabled) {
+        videos =
+            if (!mascotEnabled || folderUri.isBlank()) {
+                emptyList()
+            } else {
+                withContext(Dispatchers.IO) {
+                    listVideoUrisInFolder(context, folderUri.toUri())
+                }
+            }
+        videoIndex = 0
+    }
+
+    LaunchedEffect(trackKey, videos.size) {
+        if (videos.size > 1 && trackKey != null) {
+            videoIndex = (videoIndex + 1) % videos.size
         }
-    var videoIndex by remember(videos) { mutableStateOf(0) }
+    }
 
     val exoPlayer =
         remember(videos) {
-            if (videos.isEmpty()) null
-            else {
+            if (videos.isEmpty()) {
+                null
+            } else {
                 ExoPlayer.Builder(context).build().apply {
                     volume = 0f
                     repeatMode = Player.REPEAT_MODE_ONE
@@ -576,7 +626,7 @@ private fun MascotWithBassNeon(
         onDispose { exoPlayer?.release() }
     }
 
-    LaunchedEffect(exoPlayer, isPlaying, videos) {
+    LaunchedEffect(exoPlayer, isPlaying, videoIndex, videos.size) {
         val player = exoPlayer ?: return@LaunchedEffect
         if (videos.isNotEmpty() && player.currentMediaItemIndex != videoIndex) {
             player.seekTo(videoIndex.coerceIn(0, videos.lastIndex), 0L)
@@ -584,49 +634,134 @@ private fun MascotWithBassNeon(
         player.playWhenReady = isPlaying
     }
 
+    val infiniteTransition = rememberInfiniteTransition(label = "neonWaveIdle")
+    val idleBreath by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec =
+            infiniteRepeatable(
+                animation = tween(durationMillis = 2800, easing = FastOutSlowInEasing),
+                repeatMode = RepeatMode.Reverse,
+            ),
+        label = "breath",
+    )
+    val phaseDeg by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec =
+            infiniteRepeatable(
+                animation = tween(durationMillis = 16000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart,
+            ),
+        label = "phase",
+    )
+
+    val secondaryColor = remember(accentColor) { lerp(accentColor, PurpleNeonSoft, 0.55f) }
+
     Box(
         contentAlignment = Alignment.Center,
         modifier =
             Modifier
-                .size(size + 44.dp)
-                .drawBehind {
-                    val center = Offset(this.size.width / 2f, this.size.height / 2f)
-                    val baseRadius = (size.toPx() * 0.52f) * (1f + pulse * 0.14f)
-                    drawCircle(
-                        brush =
-                            Brush.radialGradient(
-                                colors =
-                                    listOf(
-                                        accentColor.copy(alpha = glowAlpha),
-                                        accentColor.copy(alpha = glowAlpha * 0.35f),
-                                        Color.Transparent,
-                                    ),
-                                center = center,
-                                radius = baseRadius * 1.38f,
-                            ),
-                        radius = baseRadius * 1.38f,
-                        center = center,
-                    )
+                .size(size)
+                .clickable(enabled = videos.size > 1) {
+                    videoIndex = (videoIndex + 1) % videos.size
                 },
     ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier =
-                Modifier
-                    .size(size)
-                    .scale(scaleFactor)
-                    .clip(CircleShape)
-                    .background(Color(0xFF0D0A14))
-                    .border(
-                        width = (1.5f + pulse * 2.5f).dp,
-                        color = accentColor.copy(alpha = ringAlpha),
-                        shape = CircleShape,
-                    )
-                    .clickable(enabled = videos.size > 1) {
-                        videoIndex = (videoIndex + 1) % videos.size
-                    },
-        ) {
-            if (exoPlayer != null && videos.isNotEmpty()) {
+        // Реактивная плазма и 36-лучевой неоновый спектр вокруг центра
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val center = Offset(this.size.width / 2f, this.size.height / 2f)
+            val maxR = this.size.minDimension / 2f
+            val energy = if (isPlaying) pulse else idleBreath * 0.22f
+            val auraRadius = maxR * (0.76f + energy * 0.22f + kick * 0.10f)
+
+            drawCircle(
+                brush =
+                    Brush.radialGradient(
+                        colors =
+                            listOf(
+                                accentColor.copy(alpha = (0.36f + energy * 0.34f + kick * 0.16f).coerceIn(0f, 0.85f)),
+                                PurpleNeonGlow.copy(alpha = (0.16f + energy * 0.22f).coerceIn(0f, 0.55f)),
+                                Color.Transparent,
+                            ),
+                        center = center,
+                        radius = auraRadius,
+                    ),
+                radius = auraRadius,
+                center = center,
+            )
+
+            // Кольцо ударной волны при ударе бочки
+            if (kick > 0.08f) {
+                drawCircle(
+                    color = secondaryColor.copy(alpha = (kick * 0.55f).coerceIn(0f, 0.6f)),
+                    radius = maxR * (0.58f + kick * 0.26f),
+                    center = center,
+                    style = Stroke(width = (1.5f + kick * 2.5f).dp.toPx()),
+                )
+            }
+
+            // 36 неоновых штрихов спектра по кругу (зеркалируем 18 полос)
+            val barCount = 36
+            val innerR = maxR * (0.48f + energy * 0.05f)
+            val maxBarLen = maxR * 0.30f
+            for (i in 0 until barCount) {
+                val bandIdx = if (i < 18) i else (35 - i)
+                val level =
+                    if (isPlaying) {
+                        spectrumBands.getOrElse(bandIdx) { 0f }
+                    } else {
+                        val wave = sin(((phaseDeg + i * 20f) * PI / 180.0)).toFloat() * 0.5f + 0.5f
+                        0.08f + wave * 0.14f
+                    }
+                val angleRad = ((i * (360f / barCount) + phaseDeg * 0.25f) * PI / 180.0)
+                val cosA = cos(angleRad).toFloat()
+                val sinA = sin(angleRad).toFloat()
+                val barLen = (maxBarLen * (0.14f + level * 0.86f + kick * 0.12f)).coerceAtMost(maxBarLen * 1.15f)
+                val start = Offset(center.x + cosA * innerR, center.y + sinA * innerR)
+                val end = Offset(center.x + cosA * (innerR + barLen), center.y + sinA * (innerR + barLen))
+                val barColor = lerp(accentColor, secondaryColor, level.coerceIn(0f, 1f))
+                drawLine(
+                    color = barColor.copy(alpha = (0.38f + level * 0.60f).coerceIn(0f, 1f)),
+                    start = start,
+                    end = end,
+                    strokeWidth = 2.6.dp.toPx(),
+                    cap = StrokeCap.Round,
+                )
+            }
+
+            // Если нет видео — рисуем живое неоновое ядро вместо пустого круга
+            if (exoPlayer == null || videos.isEmpty()) {
+                val coreR = maxR * (0.34f + energy * 0.09f + kick * 0.05f)
+                drawCircle(
+                    brush =
+                        Brush.radialGradient(
+                            colors =
+                                listOf(
+                                    secondaryColor.copy(alpha = 0.85f),
+                                    accentColor.copy(alpha = 0.62f),
+                                    PurpleNeonGlow.copy(alpha = 0.18f),
+                                    Color.Transparent,
+                                ),
+                            center = center,
+                            radius = coreR,
+                        ),
+                    radius = coreR,
+                    center = center,
+                )
+            }
+        }
+
+        // Если выбрана папка с видео маскота — плавно вплавляем видео в чёрный фон без жёсткой рамки
+        if (exoPlayer != null && videos.isNotEmpty()) {
+            val videoBoxSize = size * 0.68f
+            Box(
+                modifier =
+                    Modifier
+                        .size(videoBoxSize)
+                        .scale(1f + pulse * 0.05f + kick * 0.04f)
+                        .clip(CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
                 AndroidView(
                     factory = { ctx ->
                         TextureView(ctx).apply {
@@ -638,20 +773,21 @@ private fun MascotWithBassNeon(
                     },
                     modifier = Modifier.fillMaxSize(),
                 )
-            } else {
-                Box(
-                    modifier =
-                        Modifier
-                            .size(size * 0.42f)
-                            .clip(CircleShape)
-                            .background(accentColor.copy(alpha = 0.22f + pulse * 0.35f)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        imageVector = MetrolistIcons.Outlined.AutoAwesome,
-                        contentDescription = null,
-                        tint = Color.White.copy(alpha = 0.9f),
-                        modifier = Modifier.size(34.dp),
+                // Мягкая чёрная виньетка по краю, чтобы видео растворялось в OLED-фоне
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val c = Offset(this.size.width / 2f, this.size.height / 2f)
+                    val r = this.size.minDimension / 2f
+                    drawCircle(
+                        brush =
+                            Brush.radialGradient(
+                                0.68f to Color.Transparent,
+                                0.90f to Color.Black.copy(alpha = 0.72f),
+                                1.0f to Color.Black,
+                                center = c,
+                                radius = r,
+                            ),
+                        radius = r,
+                        center = c,
                     )
                 }
             }
@@ -802,6 +938,7 @@ fun CustomEngineSettingsContent(
     yandexProvider: YandexMusicProvider,
     vkProvider: VkMusicProvider,
     geminiClient: GeminiClient,
+    onOpenClassicHome: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -876,7 +1013,7 @@ fun CustomEngineSettingsContent(
             onCheckedChange = { v -> configStore.update { it.copy(useWaveAsHome = v) } },
         )
         SettingSwitchRow(
-            title = "Показывать маскота с басовым неоном",
+            title = "Видео-маскот (без папки работает неоновый спектр)",
             checked = cfg.mascotEnabled,
             onCheckedChange = { v -> configStore.update { it.copy(mascotEnabled = v) } },
         )
@@ -893,25 +1030,15 @@ fun CustomEngineSettingsContent(
             }
         }
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Text(
-                text = "Треков в подборках ИИ: ${cfg.aiPlaylistSize}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color.White,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(15, 25, 35).forEach { size ->
-                    NeonFilterChip(
-                        selected = cfg.aiPlaylistSize == size,
-                        label = "$size",
-                        accentColor = PurpleNeonPrimary,
-                        onClick = { configStore.update { it.copy(aiPlaylistSize = size) } },
-                    )
-                }
+        FilterGroupTitle("Треков в подборках ИИ: ${cfg.aiPlaylistSize}")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(15, 20, 25, 35).forEach { size ->
+                NeonFilterChip(
+                    selected = cfg.aiPlaylistSize == size,
+                    label = "$size",
+                    accentColor = PurpleNeonPrimary,
+                    onClick = { configStore.update { it.copy(aiPlaylistSize = size) } },
+                )
             }
         }
 
@@ -920,10 +1047,15 @@ fun CustomEngineSettingsContent(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(
-                text = if (cfg.mascotFolderUri.isBlank()) "Выбрать папку с видео маскота" else "Сменить папку видео маскота",
+                text = if (cfg.mascotFolderUri.isBlank()) "Выбрать папку с видео маскота (.mp4)" else "Сменить папку видео маскота",
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+        }
+        if (cfg.mascotFolderUri.isNotBlank()) {
+            TextButton(onClick = { configStore.update { it.copy(mascotFolderUri = "") } }) {
+                Text("Сбросить папку и вернуть неоновый спектр", color = PurpleNeonSoft)
+            }
         }
 
         HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
@@ -976,8 +1108,10 @@ fun CustomEngineSettingsContent(
             onClick = {
                 persistInputs()
                 scope.launch {
-                    val ok = vkProvider.checkToken(vkInput.trim())
-                    statusMessage = if (ok) "Токен ВК работает" else "Токен ВК не прошёл проверку"
+                    vkProvider
+                        .checkTokenDetailed(vkInput.trim())
+                        .onSuccess { msg -> statusMessage = msg }
+                        .onFailure { err -> statusMessage = err.message ?: "Ошибка проверки ВК" }
                 }
             },
         ) {
@@ -1120,6 +1254,10 @@ fun CustomEngineSettingsContent(
                 style = MaterialTheme.typography.bodySmall,
                 color = PurpleNeonSoft,
             )
+        }
+
+        TextButton(onClick = onOpenClassicHome) {
+            Text("Открыть стандартную ленту YTM", color = Color.White.copy(alpha = 0.5f))
         }
 
         Spacer(modifier = Modifier.height(20.dp))
@@ -1296,8 +1434,9 @@ private fun rememberNeonAccentColor(
             NeonColorMode.CYAN -> Color(0xFF00E5FF)
             NeonColorMode.CRIMSON -> Color(0xFFFF2E63)
             NeonColorMode.AUTO -> {
-                if (artworkUrl.isNullOrBlank()) PurpleNeonPrimary
-                else {
+                if (artworkUrl.isNullOrBlank()) {
+                    PurpleNeonPrimary
+                } else {
                     val hash = artworkUrl.hashCode()
                     val hueShift = ((hash and 0xFF) / 255f)
                     lerp(PurpleNeonPrimary, PurpleNeonGlow, hueShift)
