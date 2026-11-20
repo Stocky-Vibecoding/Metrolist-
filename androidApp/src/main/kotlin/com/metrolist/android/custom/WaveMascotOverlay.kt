@@ -112,6 +112,8 @@ fun WaveHomeScreen(
     val waveStatus by aiWaveEngine.statusText.collectAsState()
     val activeModel by geminiClient.activeModel.collectAsState()
 
+    val phraseBank = remember(context, geminiClient) { MascotPhraseBank(context.applicationContext, geminiClient) }
+
     val currentSong by playerConnection?.currentSong?.collectAsState(initial = null) ?: remember { mutableStateOf(null) }
     val isPlaying by playerConnection?.isPlaying?.collectAsState(initial = false) ?: remember { mutableStateOf(false) }
     val playbackResource by playerConnection?.currentPlaybackResource?.collectAsState(initial = null) ?: remember { mutableStateOf(null) }
@@ -122,6 +124,7 @@ fun WaveHomeScreen(
     var bassEnergy by remember { mutableFloatStateOf(0f) }
     var beatKick by remember { mutableFloatStateOf(0f) }
     var mascotPhrase by remember { mutableStateOf<String?>(null) }
+    var lastPhraseSongId by remember { mutableStateOf<String?>(null) }
     var showWaveSettingsSheet by remember { mutableStateOf(false) }
     var showEngineSettingsSheet by remember { mutableStateOf(false) }
 
@@ -160,13 +163,30 @@ fun WaveHomeScreen(
     }
 
     LaunchedEffect(currentSong?.id, isPlaying) {
-        val song = currentSong ?: return@LaunchedEffect
-        if (!isPlaying || cfg.geminiApiKey.isBlank()) return@LaunchedEffect
+        val song = currentSong
+        if (song == null) {
+            mascotPhrase = null
+            lastPhraseSongId = null
+            return@LaunchedEffect
+        }
+        if (song.id != lastPhraseSongId) {
+            mascotPhrase = null
+            lastPhraseSongId = song.id
+        } else if (mascotPhrase != null) {
+            return@LaunchedEffect
+        }
+        if (!isPlaying) return@LaunchedEffect
         delay(1_200L)
         if (currentSong?.id == song.id) {
-            aiWaveEngine.generateMascotPhrase(song)?.let { phrase ->
-                mascotPhrase = phrase
-            }
+            val artist = song.artists.joinToString(", ") { it.name }.trim()
+            mascotPhrase =
+                phraseBank.nextPhraseForTrack(
+                    artist = artist,
+                    title = song.title,
+                    moodKey = cfg.waveMood.name,
+                    moodLabel = cfg.waveMood.label,
+                    hasGeminiKey = cfg.geminiApiKey.isNotBlank(),
+                )
         }
     }
 
@@ -199,6 +219,7 @@ fun WaveHomeScreen(
     }
 
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val filterSummary = formatWaveFilterSummary(cfg)
 
     BoxWithConstraints(
         modifier =
@@ -264,7 +285,7 @@ fun WaveHomeScreen(
                         verticalArrangement = Arrangement.Center,
                     ) {
                         WaveFilterPillButton(
-                            label = cfg.waveFilterSummary(),
+                            label = filterSummary,
                             onClick = { showWaveSettingsSheet = true },
                         )
 
@@ -297,7 +318,7 @@ fun WaveHomeScreen(
                     Spacer(modifier = Modifier.height(18.dp))
 
                     WaveFilterPillButton(
-                        label = cfg.waveFilterSummary(),
+                        label = filterSummary,
                         onClick = { showWaveSettingsSheet = true },
                     )
 
@@ -346,6 +367,16 @@ fun WaveHomeScreen(
             )
         }
     }
+}
+
+private fun formatWaveFilterSummary(cfg: CustomAppConfig): String {
+    val parts =
+        buildList {
+            if (cfg.waveMood != WaveMood.entries.first()) add(cfg.waveMood.label)
+            if (cfg.waveCharacter != WaveCharacter.entries.first()) add(cfg.waveCharacter.label)
+            if (cfg.waveLanguage != WaveLanguage.entries.first()) add(cfg.waveLanguage.label)
+        }
+    return if (parts.isEmpty()) "Настроить волну" else parts.joinToString(" · ")
 }
 
 @Composable
@@ -755,9 +786,9 @@ fun CustomEngineSettingsContent(
             onCheckedChange = { v -> configStore.update { it.copy(useWaveAsHome = v) } },
         )
 
-        FilterGroupTitle("Треков в подборках ИИ: ${cfg.aiPlaylistSize}")
+        FilterGroupTitle("Треков в ИИ-плейлисте: ${cfg.aiPlaylistSize}")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf(15, 20, 25, 35).forEach { size ->
+            listOf(10, 25, 50, 100).forEach { size ->
                 FilterChip(
                     selected = cfg.aiPlaylistSize == size,
                     onClick = { configStore.update { it.copy(aiPlaylistSize = size) } },
