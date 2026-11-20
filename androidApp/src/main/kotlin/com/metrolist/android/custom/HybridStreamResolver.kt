@@ -10,7 +10,95 @@ import com.metrolist.shared.playback.PlaybackFailureCategory
 import com.metrolist.shared.youtube.playback.PlaybackNetworkState
 import com.metrolist.shared.youtube.playback.PlaybackResource
 import com.metrolist.shared.youtube.playback.StreamResolver
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ConcurrentHashMap
+
+data class ResolverLogEntry(
+    val timestampMs: Long,
+    val trackTitle: String,
+    val qualityBadge: String,
+    val detail: String,
+)
+
+object ResolverDiagnostics {
+    private val _logs = MutableStateFlow<List<ResolverLogEntry>>(emptyList())
+    val logs: StateFlow<List<ResolverLogEntry>> = _logs.asStateFlow()
+
+    private val qualityByVideo = ConcurrentHashMap<String, String>()
+    private val coverByVideo = ConcurrentHashMap<String, String>()
+
+    fun record(
+        videoId: String,
+        artist: String,
+        title: String,
+        qualityBadge: String,
+        detail: String,
+        hdCoverUrl: String? = null,
+    ) {
+        qualityByVideo[videoId] = qualityBadge
+        if (!hdCoverUrl.isNullOrBlank()) {
+            coverByVideo[videoId] = hdCoverUrl
+        }
+        val label = if (artist.isNotBlank()) "$artist — $title" else title
+        val entry =
+            ResolverLogEntry(
+                timestampMs = System.currentTimeMillis(),
+                trackTitle = label,
+                qualityBadge = qualityBadge,
+                detail = detail,
+            )
+        _logs.value = (listOf(entry) + _logs.value).take(40)
+    }
+
+    fun hdCoverFor(videoId: String?): String? =
+        videoId?.let { coverByVideo[it] }
+
+    fun qualityLabelFor(
+        videoId: String?,
+        clientName: String?,
+        bitrate: Int?,
+        mimeType: String?,
+    ): String? {
+        if (!videoId.isNullOrBlank()) {
+            qualityByVideo[videoId]?.let { cached ->
+                if (clientName == "yandex" && cached.startsWith("Я.Музыка")) return cached
+                if (clientName == "vk" && cached.startsWith("VK")) return cached
+                if (clientName != "yandex" && clientName != "vk" && cached.startsWith("YTM")) return cached
+            }
+        }
+        return formatQualityBadge(clientName = clientName, bitrate = bitrate, mimeType = mimeType)
+    }
+
+    fun formatQualityBadge(
+        clientName: String?,
+        bitrate: Int?,
+        mimeType: String?,
+        isHls: Boolean = false,
+    ): String? {
+        if (clientName.isNullOrBlank()) return null
+        val kbps = bitrate?.takeIf { it > 0 }?.let { if (it > 1_000) it / 1_000 else it }
+        return when (clientName) {
+            "yandex" -> if (kbps != null) "Я.Музыка • $kbps" else "Я.Музыка • 320"
+            "vk" -> if (isHls || mimeType?.contains("mpegURL", ignoreCase = true) == true) "VK • HLS" else "VK • MP3"
+            else -> {
+                val codec =
+                    when {
+                        mimeType?.contains("opus", ignoreCase = true) == true -> "OPUS"
+                        mimeType?.contains("webm", ignoreCase = true) == true -> "OPUS"
+                        mimeType?.contains("mp4", ignoreCase = true) == true -> "AAC"
+                        else -> null
+                    }
+                if (codec != null) "YTM • $codec" else "YTM"
+            }
+        }
+    }
+
+    fun clearLogs() {
+        _logs.value = emptyList()
+    }
+}
 
 class HybridStreamResolver(
     private val delegate: StreamResolver,
@@ -28,7 +116,9 @@ class HybridStreamResolver(
         sourceSong: SongItem?,
     ): PlaybackResource {
         tryResolveCustom(videoId, sourceSong)?.let { return it }
-        return delegate.resolve(videoId, hints, audioQuality, sourceSong)
+        val fallback = delegate.resolve(videoId, hints, audioQuality, sourceSong)
+        recordYtmFallback(videoId, sourceSong, fallback)
+        return fallback
     }
 
     override suspend fun refresh(
@@ -38,7 +128,9 @@ class HybridStreamResolver(
         sourceSong: SongItem?,
     ): PlaybackResource {
         tryResolveCustom(videoId, sourceSong)?.let { return it }
-        return delegate.refresh(videoId, hints, audioQuality, sourceSong)
+        val fallback = delegate.refresh(videoId, hints, audioQuality, sourceSong)
+        recordYtmFallback(videoId, sourceSong, fallback)
+        return fallback
     }
 
     override suspend fun resolveRemote(
@@ -50,7 +142,9 @@ class HybridStreamResolver(
         excludedProfiles: Set<String>,
     ): PlaybackResource {
         tryResolveCustom(videoId, sourceSong, excludedProfiles)?.let { return it }
-        return delegate.resolveRemote(videoId, hints, audioQuality, sourceSong, refresh, excludedProfiles)
+        val fallback = delegate.resolveRemote(videoId, hints, audioQuality, sourceSong, refresh, excludedProfiles)
+        recordYtmFallback(videoId, sourceSong, fallback)
+        return fallback
     }
 
     private suspend fun tryResolveCustom(
@@ -73,6 +167,18 @@ class HybridStreamResolver(
                 .trim()
         val title = (song.canonicalTitle ?: song.title).trim()
 
+        val manualPref = configStore.getTrackSourceOverride(videoId = videoId, artist = artist, title = title)
+        if (manualPref == TrackSourcePreference.YTM) {
+            ResolverDiagnostics.record(
+                videoId = videoId,
+                artist = artist,
+                title = title,
+                qualityBadge = "YTM",
+                detail = "ручной выбор",
+            )
+            return null
+        }
+
         val reference =
             deezerClient.lookup(
                 artist = artist,
@@ -81,11 +187,30 @@ class HybridStreamResolver(
                 fallbackExplicit = song.isExplicit || song.explicitness == true,
             )
 
-        val order =
-            if (reference.isExplicit && cfg.preferVkForExplicit && cfg.vkToken.isNotBlank()) {
-                listOf("vk", "yandex")
+        val aiCensored =
+            if (manualPref == TrackSourcePreference.AUTO &&
+                !reference.isExplicit &&
+                cfg.aiCensorshipCheckEnabled &&
+                cfg.preferVkForExplicit &&
+                cfg.vkToken.isNotBlank() &&
+                shouldEvaluateCensorship(artist, title)
+            ) {
+                evaluateCensorshipWithCache(artist, title)
             } else {
-                listOf("yandex", "vk")
+                false
+            }
+
+        val (order, reason) =
+            when {
+                manualPref == TrackSourcePreference.YANDEX -> listOf("yandex") to "ручной выбор"
+                manualPref == TrackSourcePreference.VK -> listOf("vk") to "ручной выбор"
+                videoId.startsWith("vk_") -> listOf("vk", "yandex") to "каталог VK"
+                videoId.startsWith("ym_") -> listOf("yandex", "vk") to "каталог Яндекса"
+                (reference.isExplicit || aiCensored) && cfg.preferVkForExplicit && cfg.vkToken.isNotBlank() -> {
+                    val tag = if (aiCensored) "ИИ-антицензура" else "Explicit → VK"
+                    listOf("vk", "yandex") to tag
+                }
+                else -> listOf("yandex", "vk") to "автокаскад"
             }
 
         for (provider in order) {
@@ -96,6 +221,23 @@ class HybridStreamResolver(
                     "vk" -> vkProvider.resolve(reference)
                     else -> null
                 } ?: continue
+
+            val badge =
+                ResolverDiagnostics.formatQualityBadge(
+                    clientName = resolved.clientName,
+                    bitrate = resolved.bitrate,
+                    mimeType = resolved.mimeType,
+                    isHls = resolved.isHls,
+                ) ?: resolved.clientName
+
+            ResolverDiagnostics.record(
+                videoId = videoId,
+                artist = artist,
+                title = title,
+                qualityBadge = badge,
+                detail = reason,
+                hdCoverUrl = reference.coverXlUrl,
+            )
 
             return PlaybackResource(
                 videoId = videoId,
@@ -114,6 +256,50 @@ class HybridStreamResolver(
         }
 
         return null
+    }
+
+    private fun shouldEvaluateCensorship(
+        artist: String,
+        title: String,
+    ): Boolean {
+        val combined = "$artist $title"
+        return combined.any { ch -> ch in '\u0400'..'\u04FF' }
+    }
+
+    private suspend fun evaluateCensorshipWithCache(
+        artist: String,
+        title: String,
+    ): Boolean {
+        configStore.getCachedCensorship(artist, title)?.let { return it }
+        val client = GeminiClient.sharedInstance ?: return false
+        val verdict = client.checkCensorshipRisk(artist, title) ?: return false
+        configStore.putCachedCensorship(artist, title, verdict)
+        return verdict
+    }
+
+    private fun recordYtmFallback(
+        videoId: String,
+        song: SongItem?,
+        resource: PlaybackResource,
+    ) {
+        if (song == null) return
+        val artist = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
+        val title = (song.canonicalTitle ?: song.title).trim()
+        val badge =
+            ResolverDiagnostics.formatQualityBadge(
+                clientName = resource.clientName.ifBlank { "ytm" },
+                bitrate = resource.bitrate,
+                mimeType = resource.mimeType,
+            ) ?: "YTM"
+        val manual = configStore.getTrackSourceOverride(videoId, artist, title)
+        val detail = if (manual == TrackSourcePreference.YTM) "ручной выбор" else "фолбэк YTM"
+        ResolverDiagnostics.record(
+            videoId = videoId,
+            artist = artist,
+            title = title,
+            qualityBadge = badge,
+            detail = detail,
+        )
     }
 
     override suspend fun prewarm() {
@@ -154,7 +340,7 @@ class HybridStreamResolver(
         category: PlaybackFailureCategory,
     ) {
         if (clientName == "yandex" || clientName == "vk") {
-            Log.w(TAG, "Custom stream failed ($clientName, code=$responseCode) for$videoId, falling back")
+            Log.w(TAG, "Custom stream failed ($clientName, code=$responseCode) for $videoId, falling back")
             failedProvidersByVideo.getOrPut(videoId) { ConcurrentHashMap.newKeySet() }.add(clientName)
             return
         }
