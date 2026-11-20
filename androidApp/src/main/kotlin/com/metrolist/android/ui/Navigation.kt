@@ -5,7 +5,6 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteDefaults
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteType
@@ -82,6 +81,7 @@ val Screen.labelRes: StringResource?
 val Screen.icon: ImageVector?
     get() =
         when (this) {
+            Screen.EasterEgg -> MetrolistIcons.Outlined.AutoAwesome
             Screen.Home -> MetrolistIcons.Outlined.Home
             Screen.Library -> MetrolistIcons.Outlined.LibraryMusic
             Screen.Search -> MetrolistIcons.Outlined.Search
@@ -95,10 +95,10 @@ val Screen.icon: ImageVector?
 val Screen.iconFilled: ImageVector?
     get() =
         when (this) {
+            Screen.EasterEgg -> MetrolistIcons.Outlined.AutoAwesome
             Screen.Home -> MetrolistIcons.Filled.Home
             Screen.Library -> MetrolistIcons.Filled.LibraryMusic
             Screen.Search -> MetrolistIcons.Filled.Search
-            Screen.EasterEgg -> MetrolistIcons.Filled.QuestionMark
             Screen.Settings -> MetrolistIcons.Filled.Settings
             Screen.History -> MetrolistIcons.Filled.History
             Screen.Statistics -> MetrolistIcons.Filled.SsidChart
@@ -129,7 +129,7 @@ fun MetrolistNavigationScaffold(
     val useFloatingNavigation = floatingNavigation && !useDesktopUi && !isTv
     val screens =
         if (useDesktopUi) {
-            (visibleSidebarScreens(Settings.shared.sidebarNavItems) + Screen.Search + Screen.Settings).distinct()
+            (listOf(Screen.EasterEgg) + visibleSidebarScreens(Settings.shared.sidebarNavItems) + Screen.Search + Screen.Settings).distinct()
         } else if (useFloatingNavigation) {
             floatingNavigationItems()
         } else {
@@ -141,7 +141,12 @@ fun MetrolistNavigationScaffold(
             .takeIf { it in screens } ?: screens.first()
     val items =
         screens.mapNotNull { screen ->
-            val label = screen.labelRes?.let { stringResource(it) } ?: return@mapNotNull null
+            val label =
+                if (screen == Screen.EasterEgg) {
+                    "Волна"
+                } else {
+                    screen.labelRes?.let { stringResource(it) } ?: return@mapNotNull null
+                }
             val icon = screen.icon ?: screen.iconFilled ?: return@mapNotNull null
             AdaptiveNavigationItem(
                 key = screen,
@@ -252,18 +257,18 @@ fun MetrolistNavigationScaffold(
 
 private fun floatingNavigationItems(): List<Screen> =
     buildList {
+        add(Screen.EasterEgg)
         if (Settings.shared.showBottomNavHome) add(Screen.Home)
         if (Settings.shared.showBottomNavLibrary) add(Screen.Library)
         if (Settings.shared.showBottomNavSearch) add(Screen.Search)
-        if (isEmpty()) add(Screen.EasterEgg)
     }
 
 private fun visibleNavigationItems(): List<Screen> =
     buildList {
+        add(Screen.EasterEgg)
         if (Settings.shared.showBottomNavHome) add(Screen.Home)
         if (Settings.shared.showBottomNavSearch) add(Screen.Search)
         if (Settings.shared.showBottomNavLibrary) add(Screen.Library)
-        if (isEmpty()) add(Screen.EasterEgg)
     }
 
 private fun Modifier.navigationLongPress(
