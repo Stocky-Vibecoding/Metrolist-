@@ -178,7 +178,6 @@ class GeminiClient(
         val available = DEFAULT_MODELS.filterNot { it in unavailableModels }
         val ready = available.filter { (cooldownUntilMs[it] ?: 0L) <= now }
         if (ready.isNotEmpty()) return ready
-        // If all models are on cooldown, try the one whose cooldown expires soonest.
         return available.sortedBy { cooldownUntilMs[it] ?: 0L }.ifEmpty { DEFAULT_MODELS }
     }
 
@@ -206,9 +205,7 @@ class GeminiClient(
                     .put("parts", JSONArray().put(JSONObject().put("text", prompt))),
             ),
         )
-        val genConfig =
-            JSONObject()
-                .put("temperature", temperature)
+        val genConfig = JSONObject().put("temperature", temperature)
         if (expectJson) {
             genConfig.put("responseMimeType", "application/json")
         }
@@ -269,7 +266,7 @@ class GeminiClient(
 
     companion object {
         private const val TAG = "GeminiClient"
-        private const val API_BASE = "[https://generativelanguage.googleapis.com/v1beta](https://generativelanguage.googleapis.com/v1beta)"
+        private const val API_BASE = "https:" + "//[generativelanguage.googleapis.com/v1beta](https://generativelanguage.googleapis.com/v1beta)"
         private const val COOLDOWN_SHORT_MS = 2 * 60 * 1_000L
         private const val COOLDOWN_LONG_MS = 15 * 60 * 1_000L
 
