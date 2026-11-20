@@ -91,6 +91,7 @@ data class TrackReference(
     val durationSec: Long?,
     val isExplicit: Boolean,
     val fromDeezer: Boolean,
+    val coverXlUrl: String? = null,
 )
 
 private data class DeezerCandidate(
@@ -98,6 +99,7 @@ private data class DeezerCandidate(
     val artist: String,
     val duration: Long,
     val explicit: Boolean,
+    val coverXl: String?,
 )
 
 class DeezerReferenceClient {
@@ -111,7 +113,7 @@ class DeezerReferenceClient {
     ): TrackReference {
         val cleanArtist = TrackMatcher.cleanSearchTerm(artist)
         val cleanTitle = TrackMatcher.cleanSearchTerm(title)
-        val cacheKey = "${cleanArtist.lowercase()}|${cleanTitle.lowercase()}"
+        val cacheKey = "${cleanArtist.lowercase()}\vert{}${cleanTitle.lowercase()}"
         cache[cacheKey]?.let { return it }
 
         val fallback =
@@ -121,6 +123,7 @@ class DeezerReferenceClient {
                 durationSec = fallbackDurationSec?.takeIf { it > 0L },
                 isExplicit = fallbackExplicit,
                 fromDeezer = false,
+                coverXlUrl = null,
             )
 
         if (cleanTitle.isBlank()) return fallback
@@ -128,7 +131,7 @@ class DeezerReferenceClient {
         val fetched =
             runCatching {
                 val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
-                val url = "https://api.deezer.com/search/track?q=${CustomHttp.urlEncode(query)}&limit=6"
+                val url = "$API_BASE/search/track?q=${CustomHttp.urlEncode(query)}&limit=6"
                 val response = CustomHttp.get(url, timeoutMs = 3_000)
                 if (!response.isSuccess) return@runCatching null
                 val data = JSONObject(response.body).optJSONArray("data") ?: return@runCatching null
@@ -136,19 +139,24 @@ class DeezerReferenceClient {
                     buildList {
                         for (i in 0 until data.length()) {
                             val item = data.optJSONObject(i) ?: continue
+                            val albumObj = item.optJSONObject("album")
+                            val cover =
+                                albumObj?.optString("cover_xl")?.takeIf { it.isNotBlank() }
+                                    ?: albumObj?.optString("cover_big")?.takeIf { it.isNotBlank() }
                             add(
                                 DeezerCandidate(
                                     title = item.optString("title"),
                                     artist = item.optJSONObject("artist")?.optString("name").orEmpty(),
                                     duration = item.optLong("duration", 0L),
                                     explicit = item.optBoolean("explicit_lyrics", false),
+                                    coverXl = cover,
                                 ),
                             )
                         }
                     }
                 pickBestDeezerMatch(candidates, cleanArtist, cleanTitle, fallbackDurationSec)
             }.onFailure { error ->
-                Log.d(TAG, "Deezer lookup skipped for $cleanArtist - $cleanTitle: ${error.message}")
+                Log.d(TAG, "Deezer lookup skipped for $cleanArtist - $cleanTitle:${error.message}")
             }.getOrNull()
 
         val resolved =
@@ -159,6 +167,7 @@ class DeezerReferenceClient {
                     durationSec = fetched.duration.takeIf { it > 0L } ?: fallback.durationSec,
                     isExplicit = fetched.explicit || fallbackExplicit,
                     fromDeezer = true,
+                    coverXlUrl = fetched.coverXl,
                 )
             } else {
                 fallback
@@ -198,6 +207,7 @@ class DeezerReferenceClient {
 
     companion object {
         private const val TAG = "DeezerRef"
+        private const val API_BASE = "https:" + "//api.deezer.com"
     }
 }
 
