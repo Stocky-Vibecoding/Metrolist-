@@ -84,13 +84,13 @@ class VkMusicProvider(
                         val err = root.optJSONObject("error")
                         val code = err?.optInt("error_code", -1) ?: -1
                         val msg = err?.optString("error_msg").orEmpty()
-                        Result.failure(IllegalStateException("VK #$code: $msg"))
+                        Result.failure<String>(IllegalStateException("VK #$code: $msg"))
                     } else if (root.has("response")) {
                         activeProfile = profile
                         val who = accountName?.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
                         Result.success("ВК аудио работает (${profile.label}$who)")
                     } else {
-                        Result.failure(IllegalStateException("Пустой ответ от VK"))
+                        Result.failure<String>(IllegalStateException("Пустой ответ от VK"))
                     }
                 }.getOrElse { err ->
                     Result.failure(err)
@@ -134,8 +134,8 @@ class VkMusicProvider(
     ): List<VkAudioCandidate> {
         val profilesToTry = (listOf(activeProfile) + CLIENT_PROFILES).distinct()
         for (profile in profilesToTry) {
-            val result =
-                runCatching {
+            val result: List<VkAudioCandidate>? =
+                runCatching<List<VkAudioCandidate>?> {
                     val url =
                         "${apiBaseUrl()}/audio.search" +
                             "?q=${CustomHttp.urlEncode(query)}" +
@@ -159,8 +159,9 @@ class VkMusicProvider(
                         return@runCatching null
                     }
                     activeProfile = profile
-                    val items = root.optJSONObject("response")?.optJSONArray("items") ?: return@runCatching emptyList()
-                    buildList {
+                    val items = root.optJSONObject("response")?.optJSONArray("items")
+                        ?: return@runCatching emptyList<VkAudioCandidate>()
+                    buildList<VkAudioCandidate> {
                         for (i in 0 until items.length()) {
                             val item = items.optJSONObject(i) ?: continue
                             val streamUrl = item.optString("url").trim()
