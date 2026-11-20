@@ -38,6 +38,10 @@ class AiWaveEngine(
     private val _statusText = MutableStateFlow<String?>(null)
     val statusText: StateFlow<String?> = _statusText.asStateFlow()
 
+    init {
+        sharedInstance = this
+    }
+
     fun recordSessionSkip(song: SongItem) {
         val artist = song.artists.joinToString(", ") { it.name }.trim()
         val key = CustomConfigStore.buildTrackKey(artist, song.title)
@@ -124,7 +128,6 @@ class AiWaveEngine(
         val allSuggestions = mutableListOf<AiTrackSuggestion>()
         val seenKeys = HashSet<String>()
 
-        // Для 50+ треков запрашиваем двумя пачками, чтобы JSON не обрезался на середине
         val batchSizes =
             if (targetCount > 50) {
                 listOf(50, targetCount - 50)
@@ -360,6 +363,10 @@ class AiWaveEngine(
     companion object {
         private const val TAG = "AiWaveEngine"
         private const val SESSION_SKIP_COOLDOWN_MS = 3 * 60 * 60 * 1_000L
+
+        @Volatile
+        var sharedInstance: AiWaveEngine? = null
+            private set
 
         fun isPlaylistLikeQuery(rawQuery: String): Boolean {
             val q = rawQuery.trim().lowercase()
