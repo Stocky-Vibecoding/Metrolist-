@@ -14,23 +14,62 @@ private data class VkAudioCandidate(
 class VkMusicProvider(
     private val configStore: CustomConfigStore,
 ) {
+    @Volatile
+    private var activeUserAgent: String = KATE_USER_AGENT
+
     suspend fun checkToken(
         token: String = configStore.current.vkToken,
-    ): Boolean {
-        val cleanToken = token.trim()
-        if (cleanToken.isBlank()) return false
-        return runCatching {
-            val url =
-                "$API_BASE/audio.search?q=test&count=1&access_token=${CustomHttp.urlEncode(cleanToken)}&v=$API_VERSION"
-            val response = CustomHttp.get(url, headers = vkHeaders(), timeoutMs = 6_000)
-            if (!response.isSuccess) return@runCatching false
-            val root = JSONObject(response.body)
-            !root.has("error") && root.has("response")
-        }.getOrDefault(false)
+    ): Boolean = checkTokenDetailed(token).isSuccess
+
+    suspend fun checkTokenDetailed(
+        token: String = configStore.current.vkToken,
+    ): Result<String> {
+        val cleanToken = sanitizeToken(token)
+        if (cleanToken.isBlank()) {
+            return Result.failure(IllegalStateException("Токен ВК не указан"))
+        }
+
+        val candidatesUa = listOf(KATE_USER_AGENT, VK_ANDROID_USER_AGENT)
+        var lastError = "Неизвестная ошибка ВК"
+
+        for (ua in candidatesUa) {
+            val attempt =
+                runCatching {
+                    val url =
+                        "$API_BASE/audio.search" +
+                            "?q=test&count=1" +
+                            "&access_token=${CustomHttp.urlEncode(cleanToken)}" +
+                            "&v=$API_VERSION"
+                    val response = CustomHttp.get(url, headers = mapOf("User-Agent" to ua), timeoutMs = 8_000)
+                    if (!response.isSuccess) {
+                        return@runCatching Result.failure<String>(IllegalStateException("VK HTTP ${response.code}"))
+                    }
+                    val root = JSONObject(response.body)
+                    if (root.has("error")) {
+                        val err = root.optJSONObject("error")
+                        val code = err?.optInt("error_code", -1) ?: -1
+                        val msg = err?.optString("error_msg").orEmpty()
+                        Result.failure(IllegalStateException("VK #$code:$msg"))
+                    } else if (root.has("response")) {
+                        activeUserAgent = ua
+                        val label = if (ua == KATE_USER_AGENT) "Kate" else "VK Android"
+                        Result.success("Токен ВК работает ($label)")
+                    } else {
+                        Result.failure(IllegalStateException("Пустой ответ от VK API"))
+                    }
+                }.getOrElse { err ->
+                    Result.failure(err)
+                }
+
+            if (attempt.isSuccess) return attempt
+            lastError = attempt.exceptionOrNull()?.message ?: lastError
+        }
+
+        return Result.failure(IllegalStateException(lastError))
     }
 
     suspend fun resolve(reference: TrackReference): ResolvedCustomStream? {
-        val token = configStore.current.vkToken.trim()
+        val token = sanitizeToken(configStore.current.vkToken)
         if (token.isBlank()) return null
 
         val query = listOf(reference.artist, reference.title).filter { it.isNotBlank() }.joinToString(" ")
@@ -40,7 +79,7 @@ class VkMusicProvider(
         val best = pickBestMatch(candidates, reference) ?: return null
 
         val isHls = best.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)
-        Log.d(TAG, "Resolved via VK (${if (isHls) "HLS" else "MP3"}): ${best.artist} - ${best.title}")
+        Log.d(TAG, "Resolved via VK (${if (isHls) "HLS" else "MP3"}): ${best.artist} -${best.title}")
 
         return ResolvedCustomStream(
             url = best.url,
@@ -128,16 +167,29 @@ class VkMusicProvider(
             }.maxByOrNull { it.second }
             ?.first
 
+    private fun sanitizeToken(raw: String): String {
+        val trimmed = raw.trim()
+        val afterParam =
+            if (trimmed.contains("access_token=")) {
+                trimmed.substringAfter("access_token=").substringBefore("&")
+            } else {
+                trimmed
+            }
+        return afterParam.trim()
+    }
+
     private fun vkHeaders(): Map<String, String> =
         mapOf(
-            "User-Agent" to KATE_USER_AGENT,
+            "User-Agent" to activeUserAgent,
         )
 
     companion object {
         private const val TAG = "VkProvider"
-        private const val API_BASE = "https://api.vk.com/method"
+        private const val API_BASE = "https:" + "//api.vk.com/method"
         private const val API_VERSION = "5.131"
         private const val KATE_USER_AGENT =
             "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)"
+        private const val VK_ANDROID_USER_AGENT =
+            "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)"
     }
 }
