@@ -24,6 +24,10 @@ class GeminiClient(
     private val _activeModel = MutableStateFlow<String?>(null)
     val activeModel: StateFlow<String?> = _activeModel.asStateFlow()
 
+    init {
+        sharedInstance = this
+    }
+
     suspend fun generateTrackList(
         prompt: String,
         count: Int,
@@ -43,6 +47,38 @@ class GeminiClient(
                 check(list.isNotEmpty()) { "Gemini вернул пустой список треков" }
             }
         }
+    }
+
+    suspend fun checkCensorshipRisk(
+        artist: String,
+        title: String,
+    ): Boolean? {
+        val cfg = configStore.current
+        if (cfg.geminiApiKey.isBlank()) return null
+
+        val systemInstruction =
+            "Отвечай СТРОГО валидным JSON без markdown: {\"censored\":true} или {\"censored\":false}."
+
+        val prompt =
+            "Оцени, подвержен ли трек \"$artist — $title\" цензуре, вырезанию строк, запикиванию или изъятию " +
+                "на российских стримингах (Яндекс.Музыка) из-за ненормативной лексики, упоминаний веществ или ограничений РФ. " +
+                "Если высокий риск цензуры на Яндексе — верни censored: true, иначе false."
+
+        val raw =
+            generateText(
+                prompt = prompt,
+                systemInstruction = systemInstruction,
+                expectJson = true,
+                temperature = 0.0,
+            ).getOrNull() ?: return null
+
+        return runCatching {
+            val cleaned = stripCodeFences(raw)
+            val start = cleaned.indexOf('{')
+            val end = cleaned.lastIndexOf('}')
+            if (start < 0 || end <= start) return@runCatching null
+            JSONObject(cleaned.substring(start, end + 1)).optBoolean("censored", false)
+        }.getOrNull()
     }
 
     suspend fun generateMascotLine(
@@ -265,16 +301,18 @@ class GeminiClient(
             JSONObject(body).optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
         }.getOrNull()
 
-    private fun parseTrackSuggestions(raw: String): List<AiTrackSuggestion> {
+    private fun stripCodeFences(raw: String): String {
         val fence = "`".repeat(3)
-        val cleaned =
-            raw
-                .trim()
-                .removePrefix(fence + "json")
-                .removePrefix(fence)
-                .removeSuffix(fence)
-                .trim()
+        return raw
+            .trim()
+            .removePrefix(fence + "json")
+            .removePrefix(fence)
+            .removeSuffix(fence)
+            .trim()
+    }
 
+    private fun parseTrackSuggestions(raw: String): List<AiTrackSuggestion> {
+        val cleaned = stripCodeFences(raw)
         val start = cleaned.indexOf('[')
         val end = cleaned.lastIndexOf(']')
         if (start < 0 || end <= start) return emptyList()
@@ -296,15 +334,7 @@ class GeminiClient(
     }
 
     private fun parseStringArray(raw: String): List<String> {
-        val fence = "`".repeat(3)
-        val cleaned =
-            raw
-                .trim()
-                .removePrefix(fence + "json")
-                .removePrefix(fence)
-                .removeSuffix(fence)
-                .trim()
-
+        val cleaned = stripCodeFences(raw)
         val start = cleaned.indexOf('[')
         val end = cleaned.lastIndexOf(']')
         if (start < 0 || end <= start) return emptyList()
@@ -327,6 +357,10 @@ class GeminiClient(
         private const val TAG = "GeminiClient"
         private const val COOLDOWN_SHORT_MS = 2 * 60 * 1_000L
         private const val COOLDOWN_LONG_MS = 15 * 60 * 1_000L
+
+        @Volatile
+        var sharedInstance: GeminiClient? = null
+            private set
 
         private fun apiBaseUrl(): String {
             val host = listOf("generativelanguage", "googleapis", "com").joinToString(".")
@@ -361,7 +395,6 @@ class MascotPhraseBank(
     ): String? {
         val trackKey = "${artist.trim().lowercase()}::${title.trim().lowercase()}"
 
-        // 1. Сначала смотрим кэш конкретного трека (0 запросов к API)
         loadTrackCache().optString(trackKey).takeIf { it.isNotBlank() }?.let { cached ->
             lastShownLine = cached
             tracksSinceMoodLine = 0
@@ -371,7 +404,6 @@ class MascotPhraseBank(
         val now = System.currentTimeMillis()
         val lastTrackAiMs = prefs.getLong(KEY_LAST_TRACK_AI_MS, 0L)
 
-        // 2. Раз в ~8 минут позволяем ИИ написать персональную фразу под трек и сохраняем её навсегда
         if (hasGeminiKey && now - lastTrackAiMs >= TRACK_AI_COOLDOWN_MS) {
             prefs.edit().putLong(KEY_LAST_TRACK_AI_MS, now).apply()
             val generated = geminiClient.generateMascotLine(artist = artist, title = title, moodHint = moodLabel)
@@ -383,7 +415,6 @@ class MascotPhraseBank(
             }
         }
 
-        // 3. Для остальных треков — показываем фразу из локального пула примерно через трек
         tracksSinceMoodLine += 1
         if (tracksSinceMoodLine < 2) {
             return null
