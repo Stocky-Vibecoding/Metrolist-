@@ -31,6 +31,9 @@ class VkMusicProvider(
     @Volatile
     private var activeProfile: VkClientProfile = CLIENT_PROFILES.first()
 
+    @Volatile
+    private var floodCooldownUntilMs: Long = 0L
+
     suspend fun checkToken(
         token: String = configStore.current.vkToken,
     ): Boolean = checkTokenDetailed(token).isSuccess
@@ -43,86 +46,35 @@ class VkMusicProvider(
             return Result.failure(IllegalStateException("Токен ВК не указан"))
         }
 
-        // Шаг 1: проверяем сам токен
-        var accountName: String? = null
-        val userCheck =
-            runCatching<Result<String?>> {
-                val userUrl =
-                    "${apiBaseUrl()}/users.get" +
-                        "?access_token=${CustomHttp.urlEncode(cleanToken)}" +
-                        "&v=5.131"
-                val resp = CustomHttp.get(userUrl, headers = mapOf("User-Agent" to activeProfile.userAgent), timeoutMs = 8_000)
-                if (!resp.isSuccess) {
-                    return@runCatching Result.failure<String?>(IllegalStateException("VK HTTP ${resp.code}"))
-                }
-                val root = JSONObject(resp.body)
-                if (root.has("error")) {
-                    val err = root.optJSONObject("error")
-                    val code = err?.optInt("error_code", -1) ?: -1
-                    val msg = err?.optString("error_msg").orEmpty()
-                    val readable =
-                        when (code) {
-                            9 -> "VK #9: Флуд-контроль — подожди 1-2 минуты и проверь снова"
-                            5 -> "Токен истёк или отозван (VK #5)"
-                            else -> "VK #$code: $msg"
-                        }
-                    return@runCatching Result.failure<String?>(IllegalStateException(readable))
-                }
-                val first = root.optJSONArray("response")?.optJSONObject(0)
-                val fullName =
-                    first?.let {
-                        listOf(it.optString("first_name"), it.optString("last_name"))
-                            .filter { part -> part.isNotBlank() }
-                            .joinToString(" ")
-                    }
-                Result.success(fullName)
-            }.getOrElse { Result.failure(it) }
-
-        if (userCheck.isFailure) {
-            return Result.failure(userCheck.exceptionOrNull() ?: IllegalStateException("Ошибка подключения к ВК"))
-        }
-        accountName = userCheck.getOrNull()
-
-        // Шаг 2: аккуратно проверяем рабочий метод поиска с паузами, чтобы не словить Flood control
+        // Проверяем напрямую поиск аудио без лишнего users.get, чтобы не провоцировать #9
         val notes = mutableListOf<String>()
-        for (profile in CLIENT_PROFILES) {
-            delay(450L)
+        for ((index, profile) in CLIENT_PROFILES.withIndex()) {
+            if (index > 0) delay(700L)
             val attempt = testSearchProfile(cleanToken, profile)
             if (attempt.isSuccess) {
                 activeProfile = profile
-                val who = accountName?.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
-                return Result.success("ВК аудио работает (${profile.label}/${profile.endpoint.label}$who)")
+                floodCooldownUntilMs = 0L
+                val count = attempt.getOrDefault(0)
+                return Result.success("ВК аудио работает (${profile.label}/${profile.endpoint.label}, треков: $count)")
             }
             val errMsg = attempt.exceptionOrNull()?.message.orEmpty()
             if (errMsg.contains("#9")) {
-                return Result.failure(IllegalStateException("VK #9: Флуд-контроль — подожди 1-2 минуты и повтори"))
+                floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
+                return Result.failure(
+                    IllegalStateException("VK #9: Флуд-контроль (часто из-за VPN). Выключи VPN для ВК или подожди 3 мин"),
+                )
+            }
+            if (errMsg.contains("#5")) {
+                return Result.failure(IllegalStateException("Токен ВК истёк или невалиден (#5) — обнови через Kate Mobile"))
             }
             notes.add("${profile.label}/${profile.endpoint.label}: $errMsg")
         }
 
-        // Шаг 3: проверяем audio.get, чтобы понять, открыт ли вообще доступ к аудио у этого токена
-        delay(450L)
-        val audioGetNote =
-            runCatching<String> {
-                val url =
-                    "${apiBaseUrl()}/audio.get" +
-                        "?count=1&access_token=${CustomHttp.urlEncode(cleanToken)}&v=5.95"
-                val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to KATE_UA), timeoutMs = 8_000)
-                val root = JSONObject(resp.body)
-                if (root.has("error")) {
-                    val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
-                    "audio.get=#$code"
-                } else {
-                    "audio.get=OK"
-                }
-            }.getOrDefault("audio.get=err")
-
-        val who = accountName?.takeIf { it.isNotBlank() }?.let { "Аккаунт $it найден, но поиск закрыт" } ?: "Поиск аудио закрыт"
-        val details = (notes.take(2) + audioGetNote).joinToString("; ")
-        return Result.failure(IllegalStateException("$who ($details)"))
+        return Result.failure(IllegalStateException("ВК аудио недоступно (${notes.joinToString("; ")})"))
     }
 
     suspend fun resolve(reference: TrackReference): ResolvedCustomStream? {
+        if (System.currentTimeMillis() < floodCooldownUntilMs) return null
         val token = sanitizeToken(configStore.current.vkToken)
         if (token.isBlank()) return null
 
@@ -149,23 +101,32 @@ class VkMusicProvider(
     private suspend fun testSearchProfile(
         token: String,
         profile: VkClientProfile,
-    ): Result<Unit> =
-        runCatching<Result<Unit>> {
-            val url = buildSearchUrl(token = token, query = "test", count = 3, profile = profile)
+    ): Result<Int> =
+        runCatching<Result<Int>> {
+            val url = buildSearchUrl(token = token, query = "Кино Группа крови", count = 3, profile = profile)
             val response = CustomHttp.get(url, headers = mapOf("User-Agent" to profile.userAgent), timeoutMs = 8_000)
             if (!response.isSuccess) {
-                return@runCatching Result.failure<Unit>(IllegalStateException("HTTP ${response.code}"))
+                return@runCatching Result.failure<Int>(IllegalStateException("HTTP ${response.code}"))
             }
             val root = JSONObject(response.body)
             if (root.has("error")) {
                 val err = root.optJSONObject("error")
                 val code = err?.optInt("error_code", -1) ?: -1
                 val msg = err?.optString("error_msg").orEmpty()
-                Result.failure<Unit>(IllegalStateException("#$code $msg"))
-            } else if (root.has("response")) {
-                Result.success(Unit)
+                Result.failure<Int>(IllegalStateException("#$code $msg"))
             } else {
-                Result.failure<Unit>(IllegalStateException("пустой ответ"))
+                val respObj = root.optJSONObject("response")
+                val arr =
+                    when (profile.endpoint) {
+                        VkSearchEndpoint.CATALOG -> respObj?.optJSONArray("audios") ?: respObj?.optJSONArray("items")
+                        VkSearchEndpoint.LEGACY -> respObj?.optJSONArray("items") ?: respObj?.optJSONArray("audios")
+                    }
+                val parsed = parseAudioArray(arr)
+                if (respObj != null) {
+                    Result.success(parsed.size)
+                } else {
+                    Result.failure<Int>(IllegalStateException("пустой ответ"))
+                }
             }
         }.getOrElse { Result.failure(it) }
 
@@ -175,6 +136,7 @@ class VkMusicProvider(
     ): List<VkAudioCandidate> {
         val profilesToTry = (listOf(activeProfile) + CLIENT_PROFILES).distinct()
         for (profile in profilesToTry) {
+            if (System.currentTimeMillis() < floodCooldownUntilMs) return emptyList()
             val result: List<VkAudioCandidate>? =
                 runCatching<List<VkAudioCandidate>?> {
                     val url = buildSearchUrl(token = token, query = query, count = 15, profile = profile)
@@ -189,6 +151,10 @@ class VkMusicProvider(
                     if (root.has("error")) {
                         val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
                         Log.w(TAG, "VK ${profile.label}/${profile.endpoint.label} error #$code")
+                        if (code == 9) {
+                            floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
+                            return@runCatching emptyList<VkAudioCandidate>()
+                        }
                         return@runCatching null
                     }
                     activeProfile = profile
@@ -299,6 +265,7 @@ class VkMusicProvider(
 
     companion object {
         private const val TAG = "VkProvider"
+        private const val FLOOD_COOLDOWN_MS = 3 * 60 * 1_000L
 
         private const val KATE_UA =
             "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
