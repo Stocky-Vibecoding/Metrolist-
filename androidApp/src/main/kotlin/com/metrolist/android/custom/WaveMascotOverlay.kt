@@ -6,6 +6,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -87,13 +89,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.metrolist.android.playback.PlayerConnection
+import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
+import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.components.images.AsyncImage
 import com.metrolist.shared.ui.icons.MetrolistIcons
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun WaveHomeScreen(
@@ -281,8 +287,14 @@ fun WaveHomeScreen(
                     activeModel = activeModel,
                     onToggleLike = { song ->
                         val willLike = !isCurrentLiked
+                        val artist = song.artists.joinToString(", ") { it.name }.trim()
                         SongLikeState.toggleLike(song)
-                        if (willLike) aiWaveEngine.recordLike(song)
+                        if (willLike) {
+                            configStore.likeTrack(artist = artist, title = song.title, songId = song.id)
+                            aiWaveEngine.recordLike(song)
+                        } else {
+                            configStore.removeLikedTrackBackup(songId = song.id, artist = artist, title = song.title)
+                        }
                     },
                     onDislikeClick = { song ->
                         aiWaveEngine.recordDislike(song)
@@ -834,20 +846,22 @@ fun CustomEngineSettingsContent(
     val yandexPlus by configStore.yandexPlusStatus.collectAsState()
     val activeModel by geminiClient.activeModel.collectAsState()
     val resolverLogs by ResolverDiagnostics.logs.collectAsState()
+    val likedIds by SongLikeState.likedSongIdsForDisplay.collectAsState(initial = SongLikeState.likedSongIds)
 
+    var localNameInput by remember(cfg.localAccountName) { mutableStateOf(cfg.localAccountName) }
     var yandexInput by remember(cfg.yandexToken) { mutableStateOf(cfg.yandexToken) }
     var vkInput by remember(cfg.vkToken) { mutableStateOf(cfg.vkToken) }
     var lfmKeyInput by remember(cfg.lastFmApiKey) { mutableStateOf(cfg.lastFmApiKey) }
     var lfmSecretInput by remember(cfg.lastFmSecret) { mutableStateOf(cfg.lastFmSecret) }
     var lfmUserInput by remember(cfg.lastFmUsername) { mutableStateOf(cfg.lastFmUsername) }
     var geminiKeyInput by remember(cfg.geminiApiKey) { mutableStateOf(cfg.geminiApiKey) }
-    var jsonBackupInput by remember { mutableStateOf("") }
     var statusMessage by remember { mutableStateOf<String?>(null) }
     var showLogs by remember { mutableStateOf(false) }
 
     fun persistInputs() {
         configStore.update {
             it.copy(
+                localAccountName = localNameInput.trim().ifBlank { "Локальный профиль" },
                 yandexToken = yandexInput.trim(),
                 vkToken = vkInput.trim(),
                 lastFmApiKey = lfmKeyInput.trim(),
@@ -857,6 +871,87 @@ fun CustomEngineSettingsContent(
             )
         }
     }
+
+    val exportFileLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            persistInputs()
+            val payload = configStore.exportToJson(extraLikedIds = SongLikeState.likedSongIds)
+            val saved =
+                runCatching {
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(payload.toByteArray(Charsets.UTF_8))
+                    } ?: error("Не удалось открыть файл для записи")
+                }
+            statusMessage =
+                saved.fold(
+                    onSuccess = { "Бэкап сохранён в файл (лайков: ${maxOf(cfg.likedTracksBackup.size, likedIds.size)})" },
+                    onFailure = { err -> "Ошибка сохранения файла: ${err.message}" },
+                )
+        }
+
+    val importFileLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                val readResult =
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                                ?: error("Не удалось прочитать файл")
+                        }
+                    }
+                val raw =
+                    readResult.getOrElse { err ->
+                        statusMessage = "Ошибка чтения файла: ${err.message}"
+                        return@launch
+                    }
+                configStore
+                    .importFromJson(raw)
+                    .onSuccess { imported ->
+                        localNameInput = imported.localAccountName
+                        yandexInput = imported.yandexToken
+                        vkInput = imported.vkToken
+                        lfmKeyInput = imported.lastFmApiKey
+                        lfmSecretInput = imported.lastFmSecret
+                        lfmUserInput = imported.lastFmUsername
+                        geminiKeyInput = imported.geminiApiKey
+
+                        val toRestore = imported.likedTracksBackup.filter { it.title.isNotBlank() && it.id !in SongLikeState.likedSongIds }
+                        if (toRestore.isEmpty()) {
+                            statusMessage = "Бэкап загружен (профиль: ${imported.localAccountName})"
+                        } else {
+                            statusMessage = "Бэкап загружен, восстанавливаю лайки (${toRestore.size})…"
+                            val restoredCount =
+                                withContext(Dispatchers.IO) {
+                                    var ok = 0
+                                    for (entry in toRestore) {
+                                        val found =
+                                            runCatching {
+                                                val q = listOf(entry.artist, entry.title).filter { it.isNotBlank() }.joinToString(" ")
+                                                val page =
+                                                    GlobalYouTubeRepository.instance.searchFiltered(
+                                                        query = q,
+                                                        filter = SearchFilter.SONG,
+                                                        allowOfflineFallback = false,
+                                                    )
+                                                val songs = page.items.filterIsInstance<SongItem>()
+                                                songs.firstOrNull { entry.id.isNotBlank() && it.id == entry.id } ?: songs.firstOrNull()
+                                            }.getOrNull()
+                                        if (found != null && found.id !in SongLikeState.likedSongIds) {
+                                            SongLikeState.toggleLike(found)
+                                            ok += 1
+                                        }
+                                    }
+                                    ok
+                                }
+                            statusMessage = "Бэкап загружен: профиль «${imported.localAccountName}», восстановлено лайков: $restoredCount"
+                        }
+                    }.onFailure { err ->
+                        statusMessage = "Ошибка JSON: ${err.message}"
+                    }
+            }
+        }
 
     Column(
         modifier =
@@ -872,6 +967,22 @@ fun CustomEngineSettingsContent(
             fontWeight = FontWeight.SemiBold,
         )
 
+        FilterGroupTitle("Локальная учётка (без входа в YouTube)")
+        OutlinedTextField(
+            value = localNameInput,
+            onValueChange = { localNameInput = it },
+            label = { Text("Имя локального профиля") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        SettingSwitchRow(
+            title = "Локальный режим без аккаунта YouTube",
+            checked = cfg.useLocalAccountOnly,
+            onCheckedChange = { v -> configStore.update { it.copy(useLocalAccountOnly = v) } },
+        )
+
+        HorizontalDivider()
+
         SettingSwitchRow(
             title = "Гибридный резолвер (Яндекс / ВК / YTM)",
             checked = cfg.hybridResolverEnabled,
@@ -883,7 +994,7 @@ fun CustomEngineSettingsContent(
             onCheckedChange = { v -> configStore.update { it.copy(preferVkForExplicit = v) } },
         )
         SettingSwitchRow(
-            title = "ИИ-антицензура (проверка треков РФ через Gemini)",
+            title = "ИИ-антицензура через Gemini (расходует лимит API)",
             checked = cfg.aiCensorshipCheckEnabled,
             onCheckedChange = { v -> configStore.update { it.copy(aiCensorshipCheckEnabled = v) } },
         )
@@ -1006,7 +1117,7 @@ fun CustomEngineSettingsContent(
                 FilterChip(
                     selected = cfg.geminiModelMode == modelName,
                     onClick = { configStore.update { it.copy(geminiModelMode = modelName) } },
-                    label = { Text(modelName.removePrefix("gemini-"), maxLines = 1) },
+                    label = { Text(modelName.removePrefix("gemini-").removePrefix("gemma-"), maxLines = 1) },
                 )
             }
         }
@@ -1021,10 +1132,11 @@ fun CustomEngineSettingsContent(
         OutlinedButton(
             onClick = {
                 persistInputs()
+                statusMessage = "Проверяю Gemini и список моделей…"
                 scope.launch {
                     geminiClient
                         .testConnection(geminiKeyInput.trim())
-                        .onSuccess { used -> statusMessage = "Gemini OK (модель: $used)" }
+                        .onSuccess { used -> statusMessage = "Gemini OK: $used" }
                         .onFailure { err -> statusMessage = err.message ?: "Ошибка Gemini" }
                 }
             },
@@ -1035,20 +1147,21 @@ fun CustomEngineSettingsContent(
         Button(
             onClick = {
                 persistInputs()
-                statusMessage = "Ключи и настройки сохранены"
+                statusMessage = "Настройки и профиль сохранены"
             },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("Сохранить ключи")
+            Text("Сохранить настройки")
         }
 
         HorizontalDivider()
 
         val mutedCount = cfg.artistReputation.values.count { it.isAutoMuted }
         val overridesCount = cfg.trackSourceOverrides.keys.count { !it.startsWith("id::") }
+        val savedLikesCount = maxOf(cfg.likedTracksBackup.size, likedIds.size)
         FilterGroupTitle("Память волны и источников")
         Text(
-            text = "Дизлайков: ${cfg.dislikedTracks.size} • Скрытых артистов: $mutedCount • Запомненных источников: $overridesCount",
+            text = "Лайков: $savedLikesCount • Дизлайков: ${cfg.dislikedTracks.size} • Скрытых артистов: $mutedCount • Источников: $overridesCount",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -1120,13 +1233,29 @@ fun CustomEngineSettingsContent(
 
         HorizontalDivider()
 
-        FilterGroupTitle("JSON-бэкап ключей, фильтров и памяти")
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FilterGroupTitle("Бэкап в файл .json (учётка, ключи, лайки, дизлайки)")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = {
+                    persistInputs()
+                    exportFileLauncher.launch("metrolist_backup.json")
+                },
+            ) {
+                Icon(MetrolistIcons.Outlined.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Сохранить .json")
+            }
+            OutlinedButton(
+                onClick = {
+                    importFileLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                },
+            ) {
+                Text("Загрузить .json")
+            }
             OutlinedButton(
                 onClick = {
                     persistInputs()
-                    val exported = configStore.exportToJson()
-                    jsonBackupInput = exported
+                    val exported = configStore.exportToJson(extraLikedIds = SongLikeState.likedSongIds)
                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     cm.setPrimaryClip(ClipData.newPlainText("metrolist_custom_json", exported))
                     statusMessage = "JSON скопирован в буфер"
@@ -1134,39 +1263,9 @@ fun CustomEngineSettingsContent(
             ) {
                 Icon(MetrolistIcons.Outlined.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("Экспорт JSON")
-            }
-            OutlinedButton(
-                onClick = {
-                    configStore
-                        .importFromJson(jsonBackupInput)
-                        .onSuccess { imported ->
-                            yandexInput = imported.yandexToken
-                            vkInput = imported.vkToken
-                            lfmKeyInput = imported.lastFmApiKey
-                            lfmSecretInput = imported.lastFmSecret
-                            lfmUserInput = imported.lastFmUsername
-                            geminiKeyInput = imported.geminiApiKey
-                            statusMessage = "JSON импортирован"
-                        }.onFailure { err ->
-                            statusMessage = "Ошибка JSON: ${err.message}"
-                        }
-                },
-            ) {
-                Icon(MetrolistIcons.Outlined.Download, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Импорт JSON")
+                Text("В буфер")
             }
         }
-
-        OutlinedTextField(
-            value = jsonBackupInput,
-            onValueChange = { jsonBackupInput = it },
-            label = { Text("JSON конфиг (вставь сюда для импорта или нажми Экспорт)") },
-            minLines = 3,
-            maxLines = 6,
-            modifier = Modifier.fillMaxWidth(),
-        )
 
         if (!statusMessage.isNullOrBlank()) {
             Text(
