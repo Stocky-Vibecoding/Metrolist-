@@ -73,6 +73,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.DropdownMenuItem
@@ -85,6 +86,7 @@ import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ToggleButton
 import androidx.compose.material3.ToggleButtonDefaults
 import androidx.compose.runtime.Composable
@@ -195,6 +197,7 @@ import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.ui.LocalIsInPipMode
 import com.metrolist.shared.ui.LocalIsTv
 import com.metrolist.shared.ui.LocalPlayerImmersiveMode
+import com.metrolist.shared.ui.components.AlertDialog
 import com.metrolist.shared.ui.components.BlurredArtworkBackground
 import com.metrolist.shared.ui.components.BottomSheet
 import com.metrolist.shared.ui.components.BottomSheetState
@@ -248,6 +251,13 @@ import kotlin.math.abs
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
+
+object CustomPlayerMenuBridge {
+    var currentSourceLabel by mutableStateOf<String?>(null)
+    var currentSourceOverride by mutableStateOf("AUTO")
+    var onStartWaveForSong: ((String) -> Unit)? = null
+    var onSelectSourceForSong: ((String, String) -> Unit)? = null
+}
 
 @Composable
 internal fun Modifier.artworkSwipe(
@@ -581,6 +591,7 @@ fun PlayerScreen(
             )
 
     var showPlayerMenu by remember { mutableStateOf(false) }
+    var showSourcePickerDialog by remember { mutableStateOf(false) }
     var showSongDetails by remember { mutableStateOf(false) }
     var showSleepTimerDialog by remember { mutableStateOf(false) }
     var showLyricsMenu by remember { mutableStateOf(false) }
@@ -966,6 +977,40 @@ fun PlayerScreen(
                 } else {
                     emptyList()
                 }
+            val customPlayerMenuActions =
+                if (!isListenTogetherGuest && currentSong != null) {
+                    buildList {
+                        if (CustomPlayerMenuBridge.onStartWaveForSong != null) {
+                            add(
+                                PlayerMenuAction(
+                                    icon = MetrolistIcons.Outlined.AutoAwesome,
+                                    title = "Моя волна по треку",
+                                    description = "Собрать ИИ-волну от этого трека",
+                                    onClick = {
+                                        showPlayerMenu = false
+                                        CustomPlayerMenuBridge.onStartWaveForSong?.invoke(currentSong.id)
+                                    },
+                                ),
+                            )
+                        }
+                        if (CustomPlayerMenuBridge.onSelectSourceForSong != null) {
+                            add(
+                                PlayerMenuAction(
+                                    icon = MetrolistIcons.Outlined.Tune,
+                                    title = "Сменить источник",
+                                    description = CustomPlayerMenuBridge.currentSourceLabel ?: "Авто / Я.Музыка / VK / YTM",
+                                    onClick = {
+                                        showPlayerMenu = false
+                                        showSourcePickerDialog = true
+                                    },
+                                ),
+                            )
+                        }
+                    }
+                } else {
+                    emptyList()
+                }
+            val playerMenuExtraActions = landscapeMenuActions + customPlayerMenuActions
             val queuePanelWidth = minOf(480.dp, screenWidth / 2)
             val queuePanelSlidePx = with(LocalDensity.current) { queuePanelWidth.toPx() } / 2f
             val queueSlideDirection = if (LocalLayoutDirection.current == LayoutDirection.Rtl) -1f else 1f
@@ -2545,8 +2590,95 @@ fun PlayerScreen(
                                 showPlayerMenu = false
                                 showSongDetails = true
                             },
-                            extraActions = landscapeMenuActions,
+                            extraActions = playerMenuExtraActions,
                         )
+                    }
+
+                    PopupVisibility(visible = showSourcePickerDialog && currentSong != null) {
+                        val activeSong = currentSong
+                        if (activeSong != null) {
+                            val selectedOverride = CustomPlayerMenuBridge.currentSourceOverride
+                            val sourceOptions =
+                                listOf(
+                                    "AUTO" to "Авто",
+                                    "YANDEX" to "Я.Музыка",
+                                    "VK" to "VK",
+                                    "YTM" to "YTM",
+                                )
+                            AlertDialog(
+                                onDismissRequest = { showSourcePickerDialog = false },
+                                title = { Text("Источник для этого трека") },
+                                text = {
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Text(
+                                            text = activeSong.title,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        sourceOptions.forEach { (prefKey, label) ->
+                                            val isSelected = selectedOverride == prefKey
+                                            Surface(
+                                                onClick = {
+                                                    showSourcePickerDialog = false
+                                                    CustomPlayerMenuBridge.onSelectSourceForSong?.invoke(activeSong.id, prefKey)
+                                                },
+                                                shape = RoundedCornerShape(14.dp),
+                                                color =
+                                                    if (isSelected) {
+                                                        MaterialTheme.colorScheme.primaryContainer
+                                                    } else {
+                                                        MaterialTheme.colorScheme.surfaceContainerHigh
+                                                    },
+                                                contentColor =
+                                                    if (isSelected) {
+                                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                                    } else {
+                                                        MaterialTheme.colorScheme.onSurface
+                                                    },
+                                                modifier = Modifier.fillMaxWidth(),
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                ) {
+                                                    Text(
+                                                        text = label,
+                                                        style = MaterialTheme.typography.bodyLarge,
+                                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                                    )
+                                                    if (isSelected) {
+                                                        Text(
+                                                            text = "выбрано",
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = MaterialTheme.colorScheme.primary,
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Text(
+                                            text = "Повторный выбор VK пробует другую версию трека (помогает обойти цензуру).",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                },
+                                confirmButton = {
+                                    TextButton(
+                                        onClick = { showSourcePickerDialog = false },
+                                        shapes = ButtonDefaults.shapes(),
+                                    ) {
+                                        Text("Закрыть")
+                                    }
+                                },
+                            )
+                        }
                     }
 
                     PopupVisibility(visible = showSongDetails) {
