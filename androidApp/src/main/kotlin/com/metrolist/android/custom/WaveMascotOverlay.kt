@@ -227,7 +227,7 @@ private fun pickFallbackMascotPhrase(
                     "Ловлю ритм — дальше будет не хуже.",
                     "Кайфовое звучание, оставляем в потоке.",
                     "Вот за такое я и люблю твою волну.",
-                    "Настроенa на твой вкус — слушаем!",
+                    "Настроена на твой вкус — слушаем!",
                     "Прямо в настроение попало.",
                     "Классный переход, держим этот вайб.",
                 )
@@ -1153,7 +1153,7 @@ private fun AnimatedWaveMascotStage(
             contentAlignment = Alignment.BottomCenter,
             modifier = Modifier.height(54.dp),
         ) {
-            AnimatedVisibility(
+            androidx.compose.animation.AnimatedVisibility(
                 visible = !speechBubbleText.isNullOrBlank(),
                 enter = fadeIn(tween(260)) + scaleIn(initialScale = 0.9f, animationSpec = tween(260)),
                 exit = fadeOut(tween(180)) + scaleOut(targetScale = 0.94f, animationSpec = tween(180)),
@@ -1556,9 +1556,10 @@ private fun WaveBottomStatusAndPlayer(
                     }
                     IconButton(onClick = onPreviousClick, modifier = Modifier.size(38.dp)) {
                         Icon(
-                            imageVector = MetrolistIcons.Filled.SkipPrevious,
+                            imageVector = MetrolistIcons.Filled.SkipNext,
                             contentDescription = "Предыдущий",
                             tint = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.graphicsLayer { scaleX = -1f },
                         )
                     }
                     IconButton(onClick = onNextClick, modifier = Modifier.size(38.dp)) {
