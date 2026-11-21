@@ -1007,6 +1007,48 @@ class HybridStreamResolver(
         fun isCachingEnabled(): Boolean =
             activeInstance?.configStore?.current?.cacheWaveAndDownloadLikes != false
 
+        fun getTrackSourceOverrideName(song: SongItem?): String {
+            if (song == null) return TrackSourcePreference.AUTO.name
+            val inst = activeInstance ?: return TrackSourcePreference.AUTO.name
+            val artist = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
+            val title = (song.canonicalTitle ?: song.title).trim()
+            return inst.configStore.getTrackSourceOverride(song.id, artist, title).name
+        }
+
+        fun selectTrackSourceFromMenu(
+            song: SongItem,
+            prefName: String,
+            activeClientName: String?,
+        ): String {
+            val pref = TrackSourcePreference.entries.firstOrNull { it.name == prefName } ?: TrackSourcePreference.AUTO
+            val inst = activeInstance ?: return "Переключаю на ${pref.label}"
+            val artist = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
+            val title = (song.canonicalTitle ?: song.title).trim()
+            val currentOverride = inst.configStore.getTrackSourceOverride(song.id, artist, title)
+            val alreadyOnVk =
+                pref == TrackSourcePreference.VK &&
+                    (currentOverride == TrackSourcePreference.VK || activeClientName == "vk")
+
+            if (alreadyOnVk) {
+                cycleVkVariant(song.id, artist, title)
+            } else {
+                resetVkVariant(song.id)
+                invalidateTrack(song.id, artist, title)
+            }
+
+            if (pref == TrackSourcePreference.VK && activeClientName == "yandex") {
+                LocalCensorshipAdvisor.rememberCensoredArtist(artist)
+            }
+
+            inst.configStore.setTrackSourceOverride(
+                videoId = song.id,
+                artist = artist,
+                title = title,
+                preference = pref,
+            )
+            return if (alreadyOnVk) "Пробую другую версию из VK…" else "Переключаю на ${pref.label}"
+        }
+
         fun invalidateTrack(
             videoId: String,
             artist: String = "",
