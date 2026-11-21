@@ -49,10 +49,11 @@ data class ExternalCatalogTrack(
             externalId.ifBlank {
                 "${source}_${TrackMatcher.normalize(artist)}_${TrackMatcher.normalize(title)}".take(64)
             }
+        val effectiveCover = coverUrl?.takeIf { it.isNotBlank() } ?: CustomMascotAssets.fallbackCoverUri
         return SongItem(
             id = safeId,
             title = title,
-            thumbnail = coverUrl,
+            thumbnail = effectiveCover,
             artists = parsedArtists,
             album = null,
             duration = durationSec,
@@ -117,7 +118,7 @@ class CustomCatalogProvider(
                     add(
                         HomeShelf(
                             key = "custom_vk_popular",
-                            title = "Популярное в VK",
+                            title = "Для тебя в VK",
                             items = vkSongs,
                             style = HomeShelfStyle.SONG_GRID,
                             headerAction = HomeShelfHeaderAction.PLAY_ALL,
@@ -342,19 +343,38 @@ class CustomCatalogProvider(
         withContext(Dispatchers.IO) {
             val token = sanitizeVkToken(configStore.current.vkToken)
             if (token.isBlank()) return@withContext emptyList()
-            runCatching {
-                val url =
-                    "${vkApiBase()}/audio.getPopular" +
-                        "?count=${limit.coerceIn(1, 50)}" +
-                        "&access_token=${CustomHttp.urlEncode(token)}" +
-                        "&v=5.95"
-                val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to KATE_UA), timeoutMs = 10_000)
-                if (!resp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
-                val root = JSONObject(resp.body)
-                if (root.has("error")) return@runCatching emptyList<ExternalCatalogTrack>()
-                val arr = root.optJSONArray("response") ?: return@runCatching emptyList<ExternalCatalogTrack>()
-                parseVkAudioArray(arr)
-            }.getOrDefault(emptyList())
+            val encodedToken = CustomHttp.urlEncode(token)
+            val safeLimit = limit.coerceIn(1, 50)
+            val attempts =
+                listOf(
+                    "${vkApiBase()}/audio.getRecommendations?count=$safeLimit&shuffle=1&access_token=$encodedToken&v=5.131" to KATE_UA,
+                    "${vkApiBase()}/catalog.getAudio?need_blocks=1&access_token=$encodedToken&v=5.131" to KATE_UA,
+                    "${vkApiBase()}/audio.getRecommendations?count=$safeLimit&shuffle=1&access_token=$encodedToken&v=5.95" to KATE_UA,
+                    "${vkApiBase()}/audio.getPopular?count=$safeLimit&access_token=$encodedToken&v=5.95" to KATE_UA,
+                    "${vkApiBase()}/audio.get?count=$safeLimit&offset=0&access_token=$encodedToken&v=5.131" to KATE_UA,
+                    "${vkApiBase()}/catalog.getAudio?need_blocks=1&access_token=$encodedToken&v=5.131" to VK_ANDROID_UA,
+                )
+
+            for ((url, ua) in attempts) {
+                val found =
+                    runCatching<List<ExternalCatalogTrack>> {
+                        val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to ua), timeoutMs = 10_000)
+                        if (!resp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
+                        val root = JSONObject(resp.body)
+                        if (root.has("error")) return@runCatching emptyList<ExternalCatalogTrack>()
+                        val respObj = root.optJSONObject("response")
+                        val arr =
+                            respObj?.optJSONArray("items")
+                                ?: respObj?.optJSONArray("audios")
+                                ?: root.optJSONArray("response")
+                        parseVkAudioArray(arr).take(safeLimit)
+                    }.getOrDefault(emptyList())
+
+                if (found.isNotEmpty()) {
+                    return@withContext found
+                }
+            }
+            emptyList()
         }
 
     private suspend fun syncFetchedTracks(
@@ -394,17 +414,18 @@ class CustomCatalogProvider(
         var processed = 0
         val resolvedBackups = mutableListOf<LikedTrackBackup>()
 
-        for (batch in targetTracks.chunked(4)) {
+        for (batch in targetTracks.chunked(5)) {
             val matchedSongs =
                 coroutineScope {
                     batch.map { ext ->
                         async(Dispatchers.IO) {
-                            matchExternalToSongItem(ext)
+                            // Если трека нет на YouTube — добавляем его напрямую как ym_/vk_, чтобы импортировались все 100%
+                            matchExternalToSongItem(ext) ?: ext.toSongItem()
                         }
                     }.awaitAll()
                 }
 
-            val newlyMatched = matchedSongs.filterNotNull().filter { it.id !in existingLikedIds }
+            val newlyMatched = matchedSongs.filter { it.id.isNotBlank() && it.id !in existingLikedIds }
             if (newlyMatched.isNotEmpty()) {
                 withContext(Dispatchers.Main) {
                     newlyMatched.forEach { song ->
@@ -455,21 +476,30 @@ class CustomCatalogProvider(
             val candidates = page.items.filterIsInstance<SongItem>().filter { !it.isUnavailable && it.id.isNotBlank() }
             if (candidates.isEmpty()) return null
 
-            candidates
-                .mapNotNull { song ->
-                    val art = song.artists.joinToString(", ") { it.name }.trim()
-                    val score =
-                        TrackMatcher.matchScore(
-                            targetArtist = ext.artist,
-                            targetTitle = ext.title,
-                            targetDurationSec = ext.durationSec,
-                            candidateArtist = art,
-                            candidateTitle = song.title,
-                            candidateDurationSec = song.duration,
-                        )
-                    if (score >= 52) song to score else null
-                }.maxByOrNull { it.second }
-                ?.first
+            val best =
+                candidates
+                    .mapNotNull { song ->
+                        val art = song.artists.joinToString(", ") { it.name }.trim()
+                        val score =
+                            TrackMatcher.matchScore(
+                                targetArtist = ext.artist,
+                                targetTitle = ext.title,
+                                targetDurationSec = ext.durationSec,
+                                candidateArtist = art,
+                                candidateTitle = song.title,
+                                candidateDurationSec = song.duration,
+                            )
+                        if (score >= 52) song to score else null
+                    }.maxByOrNull { it.second }
+                    ?.first
+                    ?: return null
+
+            if (best.thumbnail.isNullOrBlank()) {
+                val cover = ext.coverUrl?.takeIf { it.isNotBlank() } ?: CustomMascotAssets.fallbackCoverUri
+                if (!cover.isNullOrBlank()) best.copy(thumbnail = cover) else best
+            } else {
+                best
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (err: Exception) {
@@ -731,6 +761,8 @@ class CustomCatalogProvider(
         private const val YANDEX_UA = "Yandex-Music-API"
         private const val KATE_UA =
             "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
+        private const val VK_ANDROID_UA =
+            "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)"
         private const val HOME_SHELVES_TTL_MS = 20 * 60 * 1_000L
 
         private val homeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
