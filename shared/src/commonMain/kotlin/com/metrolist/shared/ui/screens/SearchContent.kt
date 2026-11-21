@@ -980,6 +980,12 @@ private fun SearchResultsList(
         enabled = hasSearched && !isSearching && hasVisibleItems,
     )
 
+    val availableFilters =
+        SearchFilter.entries.toList().filterAvailableSearchFilters(
+            hideVideoSongs = Settings.shared.hideVideoSongs,
+            hidePodcasts = Settings.shared.hidePodcasts,
+        )
+
     val summaries = searchSummary?.summaries.orEmpty()
     val filteredItems = filteredResults?.items.orEmpty()
     val showingFilteredResults = selectedFilter != null && filteredResults != null
@@ -1017,11 +1023,7 @@ private fun SearchResultsList(
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
                 Box(Modifier.widthIn(max = 1400.dp).fillMaxWidth()) {
                     ChipShelf(
-                        options =
-                            SearchFilter.entries.toList().filterAvailableSearchFilters(
-                                hideVideoSongs = Settings.shared.hideVideoSongs,
-                                hidePodcasts = Settings.shared.hidePodcasts,
-                            ),
+                        options = availableFilters,
                         selectedOption = selectedFilter,
                         onSelectionChange = onFilterSelected,
                         label = { filter ->
@@ -1136,6 +1138,7 @@ private fun SearchResultsList(
             summaries.forEachIndexed { index, summary ->
                 if (summary.items.isNotEmpty()) {
                     val sectionTitle = searchSectionTitle(summary, text)
+                    val sectionFilter = inferSearchFilter(summary)?.takeIf { it in availableFilters }
                     item(key = "section_${index}_${summary.title}") {
                         Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
                             Box(Modifier.widthIn(max = 1400.dp).fillMaxWidth()) {
@@ -1158,6 +1161,7 @@ private fun SearchResultsList(
                                         onAlbumPlay = onAlbumPlay,
                                         isTopResults = summary.isTopResult,
                                         isWide = isWide,
+                                        onSeeAll = sectionFilter?.let { filter -> { onFilterSelected(filter) } },
                                     )
                                 }
                             }
@@ -1253,116 +1257,132 @@ private fun TopResultCard(
                                 .height(IntrinsicSize.Min)
                                 .padding(8.dp),
                     ) {
-                        Row(
+                        Column(
                             modifier =
                                 Modifier
-                                    .weight(0.45f)
+                                    .weight(0.47f)
                                     .fillMaxHeight()
                                     .clip(RoundedCornerShape(uiEnhanced(6.dp, 12.dp)))
                                     .clickable {
                                         CollectionPreviews.record(mainItem)
                                         onItemClick(mainItem)
-                                    }.padding(24.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+                                    }.padding(16.dp),
+                            verticalArrangement = Arrangement.Center,
                         ) {
-                            Box(
-                                modifier =
-                                    Modifier
-                                        .size(if (isWide) 140.dp else 100.dp)
-                                        .clip(artistArtworkShape(mainItem.id))
-                                        .background(MaterialTheme.colorScheme.secondaryContainer),
-                                contentAlignment = Alignment.Center,
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                if (mainItem.thumbnail != null) {
-                                    AsyncImage(
-                                        url = mainItem.thumbnail,
-                                        modifier = Modifier.fillMaxSize(),
-                                        contentScale = ContentScale.Crop,
+                                Box(
+                                    modifier =
+                                        Modifier
+                                            .size(if (isWide) 112.dp else 84.dp)
+                                            .clip(artistArtworkShape(mainItem.id))
+                                            .background(MaterialTheme.colorScheme.secondaryContainer),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    if (mainItem.thumbnail != null) {
+                                        AsyncImage(
+                                            url = mainItem.thumbnail,
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentScale = ContentScale.Crop,
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.width(16.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = mainItem.displayTitle,
+                                        style = if (isWide) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.headlineSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text =
+                                            listOfNotNull(
+                                                text.artist,
+                                                mainItem.monthlyListeners?.let {
+                                                    monthlyAudienceText(it, text.monthlyAudienceShort)
+                                                } ?: mainItem.subscribers,
+                                            ).joinToString(" • "),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
                                     )
                                 }
                             }
-                            Spacer(Modifier.width(if (isWide) 24.dp else 16.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = mainItem.displayTitle,
-                                    style = if (isWide) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.headlineSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                Text(
-                                    text =
-                                        listOfNotNull(
-                                            text.artist,
-                                            mainItem.monthlyListeners?.let {
-                                                monthlyAudienceText(it, text.monthlyAudienceShort)
-                                            } ?: mainItem.subscribers,
-                                        ).joinToString(" • "),
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                Spacer(Modifier.height(24.dp))
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    Surface(
-                                        onClick = { onShuffleClick(mainItem) },
-                                        modifier =
-                                            Modifier
-                                                .weight(1f)
-                                                .height(48.dp),
-                                        shape = CircleShape,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                            Spacer(Modifier.height(16.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Surface(
+                                    onClick = { onShuffleClick(mainItem) },
+                                    modifier =
+                                        Modifier
+                                            .weight(1.2f)
+                                            .height(44.dp),
+                                    shape = CircleShape,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxSize().padding(horizontal = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center,
                                     ) {
-                                        Row(
-                                            modifier = Modifier.fillMaxSize(),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.Center,
-                                        ) {
-                                            Icon(
-                                                MetrolistIcons.Rounded.Shuffle,
-                                                contentDescription = null,
-                                                modifier = Modifier.size(20.dp),
-                                            )
-                                            Spacer(Modifier.width(8.dp))
-                                            Text(
-                                                text.shuffle,
-                                                style = MaterialTheme.typography.labelLarge,
-                                                fontWeight = FontWeight.Bold,
-                                            )
-                                        }
+                                        Icon(
+                                            MetrolistIcons.Rounded.Shuffle,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            text.shuffle,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
                                     }
-                                    Surface(
-                                        onClick = { onMixClick(mainItem) },
-                                        modifier =
-                                            Modifier
-                                                .weight(1f)
-                                                .height(48.dp),
-                                        shape = CircleShape,
-                                        color = MaterialTheme.colorScheme.surfaceVariant,
-                                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        border =
-                                            androidx.compose.foundation.BorderStroke(
-                                                1.dp,
-                                                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
-                                            ),
+                                }
+                                Surface(
+                                    onClick = { onMixClick(mainItem) },
+                                    modifier =
+                                        Modifier
+                                            .weight(0.85f)
+                                            .height(44.dp),
+                                    shape = CircleShape,
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    border =
+                                        androidx.compose.foundation.BorderStroke(
+                                            1.dp,
+                                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                                        ),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxSize().padding(horizontal = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center,
                                     ) {
-                                        Row(
-                                            modifier = Modifier.fillMaxSize(),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.Center,
-                                        ) {
-                                            Icon(
-                                                MetrolistIcons.Outlined.Sensors,
-                                                contentDescription = null,
-                                                modifier = Modifier.size(20.dp),
-                                            )
-                                            Spacer(Modifier.width(8.dp))
-                                            Text(
-                                                text.mix,
-                                                style = MaterialTheme.typography.labelLarge,
-                                                fontWeight = FontWeight.Bold,
-                                            )
-                                        }
+                                        Icon(
+                                            MetrolistIcons.Outlined.Sensors,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            text.mix,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
                                     }
                                 }
                             }
@@ -1374,7 +1394,7 @@ private fun TopResultCard(
                         Column(
                             modifier =
                                 Modifier
-                                    .weight(0.55f)
+                                    .weight(0.53f)
                                     .fillMaxHeight()
                                     .padding(8.dp),
                             verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -1623,6 +1643,8 @@ private fun TopResultCard(
                                                         text.play,
                                                         style = MaterialTheme.typography.labelLarge,
                                                         fontWeight = FontWeight.Bold,
+                                                        maxLines = 1,
+                                                        softWrap = false,
                                                     )
                                                 }
                                             }
@@ -1655,6 +1677,8 @@ private fun TopResultCard(
                                                         saveLabel,
                                                         style = MaterialTheme.typography.labelLarge,
                                                         fontWeight = FontWeight.Bold,
+                                                        maxLines = 1,
+                                                        softWrap = false,
                                                     )
                                                 }
                                             }
@@ -1692,7 +1716,13 @@ private fun TopResultCard(
                                         ) {
                                             Icon(MetrolistIcons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
                                             Spacer(Modifier.width(8.dp))
-                                            Text(text.play, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                                            Text(
+                                                text.play,
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = FontWeight.Bold,
+                                                maxLines = 1,
+                                                softWrap = false,
+                                            )
                                         }
                                     }
                                     Surface(
@@ -1715,7 +1745,13 @@ private fun TopResultCard(
                                         ) {
                                             Icon(MetrolistIcons.AutoMirrored.Outlined.PlaylistAdd, null, modifier = Modifier.size(18.dp))
                                             Spacer(Modifier.width(8.dp))
-                                            Text(saveLabel, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                                            Text(
+                                                saveLabel,
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = FontWeight.Bold,
+                                                maxLines = 1,
+                                                softWrap = false,
+                                            )
                                         }
                                     }
                                 }
@@ -1885,13 +1921,14 @@ private fun SearchResultGroup(
     isTopResults: Boolean = false,
     isWide: Boolean = false,
     onAlbumPlay: ((AlbumItem) -> Unit)? = null,
+    onSeeAll: (() -> Unit)? = null,
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         if (!title.isNullOrBlank()) {
-            SectionHeader(title = title, isWide = isWide)
+            SectionHeader(title = title, isWide = isWide, onSeeAll = onSeeAll)
         }
 
         if (!isTopResults && title != null && items.isVideoShelf()) {
@@ -2091,6 +2128,7 @@ private fun SectionHeader(
     title: String,
     modifier: Modifier = Modifier,
     isWide: Boolean = false,
+    onSeeAll: (() -> Unit)? = null,
 ) {
     val titleStyle = MaterialTheme.typography.headlineMediumEmphasized
     val rowHeight = 64.dp
@@ -2100,15 +2138,58 @@ private fun SectionHeader(
             modifier
                 .fillMaxWidth()
                 .heightIn(min = rowHeight)
-                .padding(start = 16.dp, end = 16.dp, top = 8.dp),
+                .then(if (onSeeAll != null) Modifier.clickable(onClick = onSeeAll) else Modifier)
+                .padding(start = 16.dp, end = 8.dp, top = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text(
             text = title,
             style = titleStyle,
             color = MaterialTheme.colorScheme.primary,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
         )
+        if (onSeeAll != null) {
+            TextButton(
+                onClick = onSeeAll,
+                shapes = ButtonDefaults.shapes(),
+            ) {
+                Text(
+                    text = "Показать все",
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                    softWrap = false,
+                )
+            }
+        }
+    }
+}
+
+private fun inferSearchFilter(summary: SearchSummary): SearchFilter? {
+    if (summary.isTopResult) return null
+    val t = summary.title.trim().lowercase()
+    return when {
+        t == "songs" || t.startsWith("композиц") || t.startsWith("трек") || t.startsWith("песн") -> SearchFilter.SONG
+        t == "videos" || t.startsWith("видео") -> SearchFilter.VIDEO
+        t == "albums" || t.startsWith("альбом") -> SearchFilter.ALBUM
+        t == "artists" || t == "verified artists" || t.startsWith("исполнител") || t.startsWith("артист") -> SearchFilter.ARTIST
+        t.contains("featured") || t.contains("избранн") -> SearchFilter.FEATURED_PLAYLIST
+        t.contains("playlist") || t.contains("плейлист") -> SearchFilter.COMMUNITY_PLAYLIST
+        t.contains("podcast") || t.contains("подкаст") -> SearchFilter.PODCAST
+        t.contains("episode") || t.contains("выпуск") || t.contains("эпизод") -> SearchFilter.EPISODE
+        else ->
+            when {
+                summary.items.isVideoShelf() -> SearchFilter.VIDEO
+                summary.items.firstOrNull() is SongItem -> SearchFilter.SONG
+                summary.items.firstOrNull() is AlbumItem -> SearchFilter.ALBUM
+                summary.items.firstOrNull() is ArtistItem -> SearchFilter.ARTIST
+                summary.items.firstOrNull() is PlaylistItem -> SearchFilter.COMMUNITY_PLAYLIST
+                summary.items.firstOrNull() is PodcastItem -> SearchFilter.PODCAST
+                summary.items.firstOrNull() is EpisodeItem -> SearchFilter.EPISODE
+                else -> null
+            }
     }
 }
 
