@@ -4,11 +4,33 @@ import android.content.Context
 import com.metrolist.shared.api.lastfm.LastFM
 import com.metrolist.shared.ui.components.LocalProfileBridge
 import com.metrolist.shared.ui.screens.CustomHomeShelvesBridge
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+
+object CustomMascotAssets {
+    @Volatile
+    var drawableResId: Int = 0
+        private set
+
+    @Volatile
+    var fallbackCoverUri: String? = null
+        private set
+
+    fun init(appContext: Context) {
+        val pkg = appContext.packageName
+        val id = appContext.resources.getIdentifier("mascot_girl", "drawable", pkg)
+        drawableResId = id
+        fallbackCoverUri = if (id != 0) "android.resource://$pkg/$id" else null
+    }
+}
 
 enum class YandexPlusStatus {
     UNKNOWN,
@@ -123,6 +145,7 @@ data class CustomAppConfig(
     val dislikedTracks: Set<String> = emptySet(),
     val artistReputation: Map<String, ArtistReputation> = emptyMap(),
     val likedTracksBackup: List<LikedTrackBackup> = emptyList(),
+    val lastWaveTracks: List<LikedTrackBackup> = emptyList(),
 ) {
     fun waveFilterSummary(): String {
         val parts =
@@ -146,6 +169,8 @@ class CustomConfigStore(
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val censorshipPrefs = appContext.getSharedPreferences(CENSORSHIP_PREFS_NAME, Context.MODE_PRIVATE)
+    private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val persistChannel = Channel<CustomAppConfig>(Channel.CONFLATED)
 
     private val _config = MutableStateFlow(loadInitial())
     val config: StateFlow<CustomAppConfig> = _config.asStateFlow()
@@ -160,6 +185,7 @@ class CustomConfigStore(
         get() = _config.value
 
     init {
+        CustomMascotAssets.init(appContext)
         CustomMediaCacheManager.init(appContext)
         CustomCatalogProvider.bindHomeShelvesBridge(this)
         syncLocalProfileBridge(_config.value)
@@ -167,6 +193,14 @@ class CustomConfigStore(
             update { it.copy(localAccountName = newName.trim().ifBlank { "Локальный профиль" }) }
         }
         applyRuntimeIntegrations(_config.value)
+
+        persistScope.launch {
+            for (snapshot in persistChannel) {
+                runCatching {
+                    prefs.edit().putString(KEY_CONFIG_JSON, toJson(snapshot).toString()).apply()
+                }
+            }
+        }
     }
 
     fun update(transform: (CustomAppConfig) -> CustomAppConfig) {
@@ -181,6 +215,13 @@ class CustomConfigStore(
 
     fun setYandexPlusStatus(status: YandexPlusStatus) {
         _yandexPlusStatus.value = status
+    }
+
+    fun saveLastWaveTracks(tracks: List<LikedTrackBackup>) {
+        if (tracks.isEmpty()) return
+        val cleaned = tracks.filter { it.title.isNotBlank() }.take(40)
+        if (cleaned.isEmpty()) return
+        update { it.copy(lastWaveTracks = cleaned) }
     }
 
     fun getTrackSourceOverride(
@@ -389,8 +430,8 @@ class CustomConfigStore(
         yandexTokenChanged: Boolean,
         vkTokenChanged: Boolean,
     ) {
-        prefs.edit().putString(KEY_CONFIG_JSON, toJson(updated).toString()).apply()
         _config.value = updated
+        persistChannel.trySend(updated)
         syncLocalProfileBridge(updated)
         if (yandexTokenChanged) {
             _yandexPlusStatus.value =
@@ -418,7 +459,7 @@ class CustomConfigStore(
         extraLikedIds: Set<String> = emptySet(),
     ): JSONObject =
         JSONObject().apply {
-            put("schemaVersion", 4)
+            put("schemaVersion", 5)
             put("localAccountName", cfg.localAccountName)
             put("useLocalAccountOnly", cfg.useLocalAccountOnly)
             put("hybridResolverEnabled", cfg.hybridResolverEnabled)
@@ -483,6 +524,17 @@ class CustomConfigStore(
                 }
             }
             put("likedTracksBackup", likedArr)
+
+            val waveArr = JSONArray()
+            cfg.lastWaveTracks.forEach { item ->
+                waveArr.put(
+                    JSONObject()
+                        .put("id", item.id)
+                        .put("artist", item.artist)
+                        .put("title", item.title),
+                )
+            }
+            put("lastWaveTracks", waveArr)
         }
 
     private fun fromJson(obj: JSONObject): CustomAppConfig {
@@ -525,10 +577,10 @@ class CustomConfigStore(
                 }
             }
 
-        val likedBackup =
-            buildList<LikedTrackBackup> {
-                val arr = obj.optJSONArray("likedTracksBackup") ?: return@buildList
-                for (i in 0 until minOf(arr.length(), MAX_LIKED_BACKUP)) {
+        fun parseTrackList(arr: JSONArray?, limit: Int): List<LikedTrackBackup> {
+            if (arr == null) return emptyList()
+            return buildList {
+                for (i in 0 until minOf(arr.length(), limit)) {
                     val item = arr.optJSONObject(i) ?: continue
                     val id = item.optString("id").trim()
                     val artist = item.optString("artist").trim()
@@ -538,6 +590,10 @@ class CustomConfigStore(
                     }
                 }
             }
+        }
+
+        val likedBackup = parseTrackList(obj.optJSONArray("likedTracksBackup"), MAX_LIKED_BACKUP)
+        val lastWave = parseTrackList(obj.optJSONArray("lastWaveTracks"), 40)
 
         return CustomAppConfig(
             localAccountName = obj.optString("localAccountName", defaults.localAccountName).ifBlank { defaults.localAccountName },
@@ -566,6 +622,7 @@ class CustomConfigStore(
             dislikedTracks = disliked,
             artistReputation = repMap,
             likedTracksBackup = likedBackup,
+            lastWaveTracks = lastWave,
         )
     }
 
