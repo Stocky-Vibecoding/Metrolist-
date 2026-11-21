@@ -11,6 +11,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.media3.common.Player
 import com.metrolist.android.R
 import com.metrolist.android.custom.AiWaveEngine
+import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.android.deviceconnect.AndroidDeviceConnect
 import com.metrolist.android.deviceconnect.toDeviceConnectRepeatMode
@@ -44,6 +45,7 @@ import com.metrolist.shared.settings.BlockedContent
 import com.metrolist.shared.settings.MusicVideoQuality
 import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.state.GlobalYouTubeRepository
+import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.utils.normalizePlaybackTempo
 import com.metrolist.shared.youtube.playback.PlaybackResource
 import kotlinx.coroutines.CancellationException
@@ -581,6 +583,33 @@ class PlayerConnection(
             }.collect {}
         }
         scope.launch {
+            var previousLikedIds = SongLikeState.likedSongIds
+            SongLikeState.likedSongIdsForDisplay.collect { likedIds ->
+                val added = likedIds - previousLikedIds
+                val removed = previousLikedIds - likedIds
+                val isInitialBulkLoad = previousLikedIds.isEmpty() && added.size > 3
+                previousLikedIds = likedIds
+
+                if (!isInitialBulkLoad && added.isNotEmpty()) {
+                    val cachingEnabled = HybridStreamResolver.isCachingEnabled()
+                    for (songId in added) {
+                        val song =
+                            _currentSong.value?.takeIf { it.id == songId }
+                                ?: _queueSnapshot.value.displayedItems.firstOrNull { it.id == songId }
+                                ?: continue
+                        AiWaveEngine.sharedInstance?.recordLike(song)
+                        if (cachingEnabled) {
+                            val activeRes = _currentPlaybackResource.value?.takeIf { it.videoId == song.id }
+                            CustomMediaCacheManager.downloadLikedTrack(song, activeRes)
+                        }
+                    }
+                }
+                if (removed.isNotEmpty()) {
+                    removed.forEach { CustomMediaCacheManager.removeLikedDownload(it) }
+                }
+            }
+        }
+        scope.launch {
             service.castManager.devices.collect { _castDevices.value = it }
         }
         scope.launch {
@@ -642,9 +671,17 @@ class PlayerConnection(
             service.queueChips.collect { _queueChips.value = it }
         }
         scope.launch {
-            player.currentPlaybackResource.collect {
-                _currentPlaybackResource.value = it
+            player.currentPlaybackResource.collect { res ->
+                _currentPlaybackResource.value = res
                 updateProgress()
+                val activeSong = player.currentSong.value
+                if (res != null && activeSong != null && res.videoId == activeSong.id && HybridStreamResolver.isCachingEnabled()) {
+                    if (SongLikeState.isLiked(activeSong.id)) {
+                        CustomMediaCacheManager.downloadLikedTrack(activeSong, res)
+                    } else if (_queueTitle.value?.startsWith("Моя волна") == true) {
+                        CustomMediaCacheManager.cacheWaveTrack(activeSong, res)
+                    }
+                }
             }
         }
         scope.launch {
@@ -680,10 +717,14 @@ class PlayerConnection(
         val nextSong = snap.displayedItems.getOrNull(snap.currentIndex + 1) ?: return
         if (nextSong.id.isBlank() || nextSong.id == lastPreResolvedVideoId) return
         lastPreResolvedVideoId = nextSong.id
+        val isWave = _queueTitle.value?.startsWith("Моя волна") == true
         preResolveJob?.cancel()
         preResolveJob =
             scope.launch(Dispatchers.IO) {
                 runCatching { HybridStreamResolver.preResolve(nextSong) }
+                if (isWave && HybridStreamResolver.isCachingEnabled()) {
+                    CustomMediaCacheManager.cacheWaveTrack(nextSong, null)
+                }
             }
     }
 
@@ -721,14 +762,16 @@ class PlayerConnection(
         val song = items.getOrNull(currentIndex) ?: return
         val resumePosMs = currentPositionMs().coerceAtLeast(0L)
         val shouldPlay = service.player.wantsPlayback || _isPlaying.value
-        val title = _queueTitle.value
-        HybridStreamResolver.invalidateTrack(song.id)
+        val queueTitleNow = _queueTitle.value
+        val artist = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
+        val songTitle = (song.canonicalTitle ?: song.title).trim()
+        HybridStreamResolver.invalidateTrack(song.id, artist, songTitle)
         lastPreResolvedVideoId = null
         service.playQueue(
             items,
             currentIndex,
-            queueTitle = title,
-            finite = title?.startsWith("Моя волна") != true,
+            queueTitle = queueTitleNow,
+            finite = queueTitleNow?.startsWith("Моя волна") != true,
             shuffleModeEnabled = snapshot.isShuffled,
             startPositionMs = resumePosMs,
             startPlaying = shouldPlay,
@@ -758,6 +801,7 @@ class PlayerConnection(
             _bufferedProgress.value = 0f
         }
     }
+
     fun playSong(
         song: SongItem,
         url: String,
@@ -934,6 +978,7 @@ class PlayerConnection(
         playlistPage: PlaylistPage? = null,
         songsOnly: Boolean = false,
         startVideo: Boolean = false,
+        forceStartPlaying: Boolean = false,
     ) {
         if (songs.any { it.isUnavailable }) {
             val queue = MusicQueue().apply { setQueue(songs, startIndex) }
@@ -947,12 +992,23 @@ class PlayerConnection(
                     playlistPage,
                     songsOnly,
                     startVideo,
+                    forceStartPlaying,
                 )
             }
             return
         }
         if (deferUntilConnected {
-                playQueue(songs, startIndex, queueTitle, finite, shuffleModeEnabled, playlistPage, songsOnly, startVideo)
+                playQueue(
+                    songs,
+                    startIndex,
+                    queueTitle,
+                    finite,
+                    shuffleModeEnabled,
+                    playlistPage,
+                    songsOnly,
+                    startVideo,
+                    forceStartPlaying,
+                )
             }
         ) {
             return
@@ -983,6 +1039,7 @@ class PlayerConnection(
                                 shuffleModeEnabled,
                                 songsOnly = songsOnly,
                                 startVideo = startVideo,
+                                forceStartPlaying = forceStartPlaying,
                             )
                         }
                     } catch (e: CancellationException) {
@@ -1018,7 +1075,7 @@ class PlayerConnection(
             shuffleModeEnabled = shuffleModeEnabled,
             playlistPage = playlistPage,
             songsOnly = songsOnly,
-            startPlaying = localSongChangeStartsPlayback(),
+            startPlaying = if (forceStartPlaying) true else localSongChangeStartsPlayback(),
             startVideo = startVideo,
         )
     }
@@ -1595,6 +1652,7 @@ class PlayerConnection(
         if (targetSong != null) {
             AiWaveEngine.sharedInstance?.recordDislike(targetSong)
         }
+        CustomMediaCacheManager.removeLikedDownload(songId)
         if (currentSong.value?.id == songId) skipToNext(expectedSongId = songId)
     }
 
