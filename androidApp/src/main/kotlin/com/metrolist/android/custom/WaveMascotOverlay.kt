@@ -96,6 +96,8 @@ import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.components.images.AsyncImage
 import com.metrolist.shared.ui.icons.MetrolistIcons
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -119,12 +121,17 @@ fun WaveHomeScreen(
     val isGenerating by aiWaveEngine.isGeneratingWave.collectAsState()
     val waveStatus by aiWaveEngine.statusText.collectAsState()
     val activeModel by geminiClient.activeModel.collectAsState()
+    val diagnosticsRevision by ResolverDiagnostics.revision.collectAsState()
 
     val phraseBank = remember(context, geminiClient) { MascotPhraseBank(context.applicationContext, geminiClient) }
 
     val currentSong by playerConnection?.currentSong?.collectAsState(initial = null) ?: remember { mutableStateOf(null) }
     val isPlaying by playerConnection?.isPlaying?.collectAsState(initial = false) ?: remember { mutableStateOf(false) }
     val playbackResource by playerConnection?.currentPlaybackResource?.collectAsState(initial = null) ?: remember { mutableStateOf(null) }
+    val queueTitle by playerConnection?.queueTitle?.collectAsState(initial = null) ?: remember { mutableStateOf(null) }
+
+    val isPlayingWave = queueTitle?.startsWith("Моя волна") == true
+    val isOutsideWave = currentSong != null && !isPlayingWave
 
     val likedIds by SongLikeState.likedSongIdsForDisplay.collectAsState(initial = SongLikeState.likedSongIds)
     val isCurrentLiked = currentSong?.id?.let { it in likedIds } == true
@@ -199,42 +206,46 @@ fun WaveHomeScreen(
         }
     }
 
-    fun startOrToggleWave() {
-        if (currentSong != null && playerConnection != null) {
-            playerConnection.togglePlayPause()
-            return
-        }
+    fun launchFreshWave() {
         scope.launch {
             aiWaveEngine
                 .generateWaveSongs()
                 .onSuccess { songs ->
-                    playerConnection?.playQueue(songs, queueTitle = "Моя волна", finite = false)
+                    playerConnection?.playQueue(
+                        songs = songs,
+                        queueTitle = "Моя волна",
+                        finite = false,
+                        forceStartPlaying = true,
+                    )
                 }.onFailure { err ->
                     Toast.makeText(context, err.message ?: "Не удалось запустить волну", Toast.LENGTH_SHORT).show()
                 }
         }
     }
 
-    fun refreshWave() {
-        scope.launch {
-            aiWaveEngine
-                .generateWaveSongs()
-                .onSuccess { songs ->
-                    playerConnection?.playQueue(songs, queueTitle = "Моя волна", finite = false)
-                }.onFailure { err ->
-                    Toast.makeText(context, err.message ?: "Не удалось обновить волну", Toast.LENGTH_SHORT).show()
-                }
+    fun startOrToggleWave() {
+        if (currentSong != null && playerConnection != null) {
+            playerConnection.togglePlayPause()
+            return
         }
+        launchFreshWave()
     }
 
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val qualityBadge =
-        ResolverDiagnostics.qualityLabelFor(
-            videoId = currentSong?.id,
-            clientName = playbackResource?.clientName,
-            bitrate = playbackResource?.bitrate,
-            mimeType = playbackResource?.mimeType,
-        )
+        remember(diagnosticsRevision, currentSong?.id, playbackResource?.clientName, playbackResource?.bitrate, playbackResource?.mimeType) {
+            ResolverDiagnostics.qualityLabelFor(
+                videoId = currentSong?.id,
+                clientName = playbackResource?.clientName,
+                bitrate = playbackResource?.bitrate,
+                mimeType = playbackResource?.mimeType,
+            )
+        }
+
+    val activeContextLabel =
+        remember(queueTitle, currentSong?.title) {
+            queueTitle?.takeIf { it.isNotBlank() } ?: currentSong?.title.orEmpty()
+        }
 
     BoxWithConstraints(
         modifier =
@@ -277,7 +288,43 @@ fun WaveHomeScreen(
                 }
             }
 
+            // Плашка с крестиком сверху (как в Яндексе), если сейчас играет поиск / альбом / плейлист
+            AnimatedVisibility(
+                visible = isOutsideWave && activeContextLabel.isNotBlank(),
+                enter = fadeIn(),
+                exit = fadeOut(),
+            ) {
+                Box(
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ActiveExternalContextPill(
+                        label = activeContextLabel,
+                        onResetToWave = ::launchFreshWave,
+                    )
+                }
+            }
+
             Spacer(modifier = Modifier.height(8.dp))
+
+            val filterControlsBlock: @Composable () -> Unit = {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (isOutsideWave) {
+                        ReturnToWavePillButton(
+                            enabled = !isGenerating,
+                            onClick = ::launchFreshWave,
+                        )
+                    }
+                    WaveFilterPillButton(
+                        label = cfg.waveFilterSummary(),
+                        onClick = { showWaveSettingsSheet = true },
+                    )
+                }
+            }
 
             val playerBlock: @Composable () -> Unit = {
                 WaveBottomStatusAndPlayer(
@@ -292,8 +339,12 @@ fun WaveHomeScreen(
                         if (willLike) {
                             configStore.likeTrack(artist = artist, title = song.title, songId = song.id)
                             aiWaveEngine.recordLike(song)
+                            if (cfg.cacheWaveAndDownloadLikes) {
+                                CustomMediaCacheManager.downloadLikedTrack(song, playbackResource)
+                            }
                         } else {
                             configStore.removeLikedTrackBackup(songId = song.id, artist = artist, title = song.title)
+                            CustomMediaCacheManager.removeLikedDownload(song.id)
                         }
                     },
                     onDislikeClick = { song ->
@@ -334,10 +385,7 @@ fun WaveHomeScreen(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center,
                     ) {
-                        WaveFilterPillButton(
-                            label = cfg.waveFilterSummary(),
-                            onClick = { showWaveSettingsSheet = true },
-                        )
+                        filterControlsBlock()
                         playerBlock()
                     }
                 }
@@ -358,10 +406,7 @@ fun WaveHomeScreen(
 
                     Spacer(modifier = Modifier.height(18.dp))
 
-                    WaveFilterPillButton(
-                        label = cfg.waveFilterSummary(),
-                        onClick = { showWaveSettingsSheet = true },
-                    )
+                    filterControlsBlock()
 
                     playerBlock()
                 }
@@ -380,7 +425,7 @@ fun WaveHomeScreen(
                 onUpdate = { transform -> configStore.update(transform) },
                 onApplyAndWave = {
                     showWaveSettingsSheet = false
-                    refreshWave()
+                    launchFreshWave()
                 },
             )
         }
@@ -423,10 +468,10 @@ fun WaveHomeScreen(
                                     pref == TrackSourcePreference.VK &&
                                         (currentOverride == TrackSourcePreference.VK || playbackResource?.clientName == "vk")
                                 if (alreadyOnVk) {
-                                    HybridStreamResolver.cycleVkVariant(song.id)
+                                    HybridStreamResolver.cycleVkVariant(song.id, artist, song.title)
                                 } else {
                                     HybridStreamResolver.resetVkVariant(song.id)
-                                    HybridStreamResolver.invalidateTrack(song.id)
+                                    HybridStreamResolver.invalidateTrack(song.id, artist, song.title)
                                 }
                                 if (pref == TrackSourcePreference.VK && playbackResource?.clientName == "yandex") {
                                     LocalCensorshipAdvisor.rememberCensoredArtist(artist)
@@ -470,6 +515,96 @@ fun WaveHomeScreen(
                 yandexProvider = yandexProvider,
                 vkProvider = vkProvider,
                 geminiClient = geminiClient,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ActiveExternalContextPill(
+    label: String,
+    onResetToWave: () -> Unit,
+) {
+    Surface(
+        onClick = onResetToWave,
+        shape = RoundedCornerShape(999.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 14.dp, end = 8.dp, top = 6.dp, bottom = 6.dp).widthIn(max = 320.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+                modifier = Modifier.size(22.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    val crossColor = MaterialTheme.colorScheme.onPrimary
+                    Canvas(modifier = Modifier.size(10.dp)) {
+                        val strokePx = 1.8.dp.toPx()
+                        drawLine(
+                            color = crossColor,
+                            start = Offset(0f, 0f),
+                            end = Offset(size.width, size.height),
+                            strokeWidth = strokePx,
+                            cap = StrokeCap.Round,
+                        )
+                        drawLine(
+                            color = crossColor,
+                            start = Offset(size.width, 0f),
+                            end = Offset(0f, size.height),
+                            strokeWidth = strokePx,
+                            cap = StrokeCap.Round,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReturnToWavePillButton(
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(999.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                imageVector = MetrolistIcons.Outlined.AutoAwesome,
+                contentDescription = null,
+                modifier = Modifier.size(17.dp),
+            )
+            Text(
+                text = "Вернуться к волне",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
             )
         }
     }
@@ -802,6 +937,17 @@ private fun WaveFilterSheetContent(
             }
         }
 
+        FilterGroupTitle("Эпоха")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            WaveEra.entries.forEach { item ->
+                FilterChip(
+                    selected = config.waveEra == item,
+                    onClick = { onUpdate { it.copy(waveEra = item) } },
+                    label = { Text(item.label, maxLines = 1) },
+                )
+            }
+        }
+
         FilterGroupTitle("Язык")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             WaveLanguage.entries.forEach { item ->
@@ -855,12 +1001,11 @@ fun CustomEngineSettingsContent(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val cfg by configStore.config.collectAsState()
-    val yandexPlus by configStore.yandexPlusStatus.collectAsState()
     val activeModel by geminiClient.activeModel.collectAsState()
     val resolverLogs by ResolverDiagnostics.logs.collectAsState()
+    val cacheStats by CustomMediaCacheManager.stats.collectAsState()
     val likedIds by SongLikeState.likedSongIdsForDisplay.collectAsState(initial = SongLikeState.likedSongIds)
 
-    var localNameInput by remember(cfg.localAccountName) { mutableStateOf(cfg.localAccountName) }
     var yandexInput by remember(cfg.yandexToken) { mutableStateOf(cfg.yandexToken) }
     var vkInput by remember(cfg.vkToken) { mutableStateOf(cfg.vkToken) }
     var lfmKeyInput by remember(cfg.lastFmApiKey) { mutableStateOf(cfg.lastFmApiKey) }
@@ -868,12 +1013,12 @@ fun CustomEngineSettingsContent(
     var lfmUserInput by remember(cfg.lastFmUsername) { mutableStateOf(cfg.lastFmUsername) }
     var geminiKeyInput by remember(cfg.geminiApiKey) { mutableStateOf(cfg.geminiApiKey) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    var isCheckingApis by remember { mutableStateOf(false) }
     var showLogs by remember { mutableStateOf(false) }
 
     fun persistInputs() {
         configStore.update {
             it.copy(
-                localAccountName = localNameInput.trim().ifBlank { "Локальный профиль" },
                 yandexToken = yandexInput.trim(),
                 vkToken = vkInput.trim(),
                 lastFmApiKey = lfmKeyInput.trim(),
@@ -921,7 +1066,6 @@ fun CustomEngineSettingsContent(
                 configStore
                     .importFromJson(raw)
                     .onSuccess { imported ->
-                        localNameInput = imported.localAccountName
                         yandexInput = imported.yandexToken
                         vkInput = imported.vkToken
                         lfmKeyInput = imported.lastFmApiKey
@@ -931,7 +1075,7 @@ fun CustomEngineSettingsContent(
 
                         val toRestore = imported.likedTracksBackup.filter { it.title.isNotBlank() && it.id !in SongLikeState.likedSongIds }
                         if (toRestore.isEmpty()) {
-                            statusMessage = "Бэкап загружен (профиль: ${imported.localAccountName})"
+                            statusMessage = "Бэкап загружен"
                         } else {
                             statusMessage = "Бэкап загружен, восстанавливаю лайки (${toRestore.size})…"
                             val restoredCount =
@@ -952,12 +1096,15 @@ fun CustomEngineSettingsContent(
                                             }.getOrNull()
                                         if (found != null && found.id !in SongLikeState.likedSongIds) {
                                             SongLikeState.toggleLike(found)
+                                            if (imported.cacheWaveAndDownloadLikes) {
+                                                CustomMediaCacheManager.downloadLikedTrack(found)
+                                            }
                                             ok += 1
                                         }
                                     }
                                     ok
                                 }
-                            statusMessage = "Бэкап загружен: профиль «${imported.localAccountName}», восстановлено лайков: $restoredCount"
+                            statusMessage = "Бэкап загружен, восстановлено лайков: $restoredCount"
                         }
                     }.onFailure { err ->
                         statusMessage = "Ошибка JSON: ${err.message}"
@@ -979,22 +1126,6 @@ fun CustomEngineSettingsContent(
             fontWeight = FontWeight.SemiBold,
         )
 
-        FilterGroupTitle("Локальная учётка (без входа в YouTube)")
-        OutlinedTextField(
-            value = localNameInput,
-            onValueChange = { localNameInput = it },
-            label = { Text("Имя локального профиля") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        SettingSwitchRow(
-            title = "Локальный режим без аккаунта YouTube",
-            checked = cfg.useLocalAccountOnly,
-            onCheckedChange = { v -> configStore.update { it.copy(useLocalAccountOnly = v) } },
-        )
-
-        HorizontalDivider()
-
         SettingSwitchRow(
             title = "Гибридный резолвер (Яндекс / ВК / YTM)",
             checked = cfg.hybridResolverEnabled,
@@ -1004,6 +1135,11 @@ fun CustomEngineSettingsContent(
             title = "Антицензура (Explicit и РФ-рэп → VK, 0 запросов ИИ)",
             checked = cfg.preferVkForExplicit,
             onCheckedChange = { v -> configStore.update { it.copy(preferVkForExplicit = v) } },
+        )
+        SettingSwitchRow(
+            title = "Кэш волны (до 2 ГБ) и автоскачивание лайков",
+            checked = cfg.cacheWaveAndDownloadLikes,
+            onCheckedChange = { v -> configStore.update { it.copy(cacheWaveAndDownloadLikes = v) } },
         )
         SettingSwitchRow(
             title = "Открывать вкладку «Волна» при старте",
@@ -1031,36 +1167,6 @@ fun CustomEngineSettingsContent(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            OutlinedButton(
-                onClick = {
-                    persistInputs()
-                    scope.launch {
-                        val st = yandexProvider.checkPlusStatus(yandexInput.trim())
-                        statusMessage =
-                            when (st) {
-                                YandexPlusStatus.ACTIVE -> "Яндекс Плюс активен"
-                                YandexPlusStatus.NO_PLUS -> "Токен валиден, но Плюса нет — пойдёт на ВК/YTM"
-                                YandexPlusStatus.INVALID_TOKEN -> "Токен Яндекс.Музыки невалиден"
-                                YandexPlusStatus.NO_TOKEN -> "Токен Яндекса не указан"
-                                YandexPlusStatus.UNKNOWN -> "Не удалось проверить статус Яндекса"
-                            }
-                    }
-                },
-            ) {
-                Text("Проверить Плюс")
-            }
-            Text(
-                text = "Статус: ${yandexPlus.name}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
         OutlinedTextField(
             value = vkInput,
             onValueChange = { vkInput = it },
@@ -1068,21 +1174,6 @@ fun CustomEngineSettingsContent(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
-        OutlinedButton(
-            onClick = {
-                persistInputs()
-                statusMessage = "Проверяю ВК…"
-                scope.launch {
-                    vkProvider
-                        .checkTokenDetailed(vkInput.trim())
-                        .onSuccess { msg -> statusMessage = msg }
-                        .onFailure { err -> statusMessage = err.message ?: "Ошибка проверки ВК" }
-                }
-            },
-        ) {
-            Text("Проверить ВК")
-        }
-
         OutlinedTextField(
             value = lfmKeyInput,
             onValueChange = { lfmKeyInput = it },
@@ -1104,7 +1195,6 @@ fun CustomEngineSettingsContent(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
-
         OutlinedTextField(
             value = geminiKeyInput,
             onValueChange = { geminiKeyInput = it },
@@ -1130,35 +1220,128 @@ fun CustomEngineSettingsContent(
         }
         if (!activeModel.isNullOrBlank()) {
             Text(
-                text = "Последняя рабочая модель: $activeModel",
+                text = "Активная модель: $activeModel",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.primary,
             )
         }
 
-        OutlinedButton(
-            onClick = {
-                persistInputs()
-                statusMessage = "Проверяю Gemini и список моделей…"
-                scope.launch {
-                    geminiClient
-                        .testConnection(geminiKeyInput.trim())
-                        .onSuccess { used -> statusMessage = "Gemini OK: $used" }
-                        .onFailure { err -> statusMessage = err.message ?: "Ошибка Gemini" }
-                }
-            },
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Проверить Gemini")
+            OutlinedButton(
+                enabled = !isCheckingApis,
+                onClick = {
+                    persistInputs()
+                    isCheckingApis = true
+                    statusMessage = "Проверяю Яндекс, VK и Gemini…"
+                    scope.launch {
+                        val report =
+                            coroutineScope {
+                                val yandexTask =
+                                    async {
+                                        val token = yandexInput.trim()
+                                        if (token.isBlank()) {
+                                            "Я.Музыка: не указан"
+                                        } else {
+                                            when (yandexProvider.checkPlusStatus(token)) {
+                                                YandexPlusStatus.ACTIVE -> "Я.Музыка: OK (Плюс активен)"
+                                                YandexPlusStatus.NO_PLUS -> "Я.Музыка: нет Плюса (идёт на VK/YTM)"
+                                                YandexPlusStatus.INVALID_TOKEN -> "Я.Музыка: невалидный токен"
+                                                YandexPlusStatus.NO_TOKEN -> "Я.Музыка: не указан"
+                                                YandexPlusStatus.UNKNOWN -> "Я.Музыка: ошибка сети"
+                                            }
+                                        }
+                                    }
+                                val vkTask =
+                                    async {
+                                        val token = vkInput.trim()
+                                        if (token.isBlank()) {
+                                            "VK: не указан"
+                                        } else {
+                                            vkProvider.checkTokenDetailed(token).fold(
+                                                onSuccess = { "VK: $it" },
+                                                onFailure = { "VK: ${it.message ?: "ошибка"}" },
+                                            )
+                                        }
+                                    }
+                                val geminiTask =
+                                    async {
+                                        val key = geminiKeyInput.trim()
+                                        if (key.isBlank()) {
+                                            "Gemini: не указан"
+                                        } else {
+                                            geminiClient.testConnection(key).fold(
+                                                onSuccess = { "Gemini: OK ($it)" },
+                                                onFailure = { "Gemini: ${it.message ?: "ошибка"}" },
+                                            )
+                                        }
+                                    }
+                                listOf(yandexTask.await(), vkTask.await(), geminiTask.await()).joinToString("\n")
+                            }
+                        statusMessage = report
+                        isCheckingApis = false
+                    }
+                },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(if (isCheckingApis) "Проверяю…" else "Проверить все API")
+            }
+
+            Button(
+                onClick = {
+                    persistInputs()
+                    statusMessage = "Ключи и настройки сохранены"
+                },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Сохранить")
+            }
         }
 
-        Button(
-            onClick = {
-                persistInputs()
-                statusMessage = "Настройки и профиль сохранены"
-            },
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text("Сохранить настройки")
+        if (!statusMessage.isNullOrBlank()) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = statusMessage.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+        }
+
+        HorizontalDivider()
+
+        FilterGroupTitle("Кэш волны (лимит 2 ГБ) и скачанные лайки")
+        Text(
+            text =
+                "Кэш волны: ${CustomMediaCacheManager.formatSize(cacheStats.waveCacheBytes)} / 2 ГБ (${cacheStats.waveCacheCount} треков)\n" +
+                    "Скачанные лайки: ${CustomMediaCacheManager.formatSize(cacheStats.likedDownloadsBytes)} (${cacheStats.likedDownloadsCount} треков)",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            OutlinedButton(
+                onClick = {
+                    CustomMediaCacheManager.clearWaveCache()
+                    statusMessage = "Кэш волны очищен"
+                },
+            ) {
+                Text("Очистить кэш")
+            }
+            OutlinedButton(
+                onClick = {
+                    CustomMediaCacheManager.clearLikedDownloads()
+                    statusMessage = "Скачанные лайки очищены"
+                },
+            ) {
+                Text("Очистить скачанное")
+            }
         }
 
         HorizontalDivider()
@@ -1240,7 +1423,7 @@ fun CustomEngineSettingsContent(
 
         HorizontalDivider()
 
-        FilterGroupTitle("Бэкап в файл .json (учётка, ключи, лайки, дизлайки)")
+        FilterGroupTitle("Бэкап в файл .json (ключи, лайки, дизлайки, источники)")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = {
@@ -1272,14 +1455,6 @@ fun CustomEngineSettingsContent(
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("В буфер")
             }
-        }
-
-        if (!statusMessage.isNullOrBlank()) {
-            Text(
-                text = statusMessage.orEmpty(),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.primary,
-            )
         }
 
         Spacer(modifier = Modifier.height(20.dp))
