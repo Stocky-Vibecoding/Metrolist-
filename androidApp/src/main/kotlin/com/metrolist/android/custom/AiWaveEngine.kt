@@ -63,10 +63,10 @@ class AiWaveEngine(
 
         val freshPool =
             filterSongsByFeedback(
-                cfg.lastWaveTracks.mapNotNull { it.toStarterSongItem() } +
-                    CustomHomeShelvesBridge.shelves
-                        .flatMap { it.items }
-                        .filterIsInstance<SongItem>(),
+                CustomHomeShelvesBridge.shelves
+                    .flatMap { it.items }
+                    .filterIsInstance<SongItem>() +
+                    cfg.lastWaveTracks.mapNotNull { it.toStarterSongItem() },
             ).filter { it.id.isNotBlank() && it.id !in excludeIds }
                 .distinctBy { it.id }
                 .shuffled()
@@ -126,7 +126,8 @@ class AiWaveEngine(
 
     fun recordLike(song: SongItem) {
         val artist = song.artists.joinToString(", ") { it.name }.trim()
-        configStore.likeTrack(artist = artist, title = song.title, songId = song.id)
+        val realThumb = song.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri }
+        configStore.likeTrack(artist = artist, title = song.title, songId = song.id, thumbnail = realThumb)
         val key = CustomConfigStore.buildTrackKey(artist, song.title)
         sessionSkippedUntilMs.remove(key)
         sessionSkippedLabels.remove(key)
@@ -185,6 +186,7 @@ class AiWaveEngine(
                                     id = song.id,
                                     artist = song.artists.joinToString(", ") { it.name }.trim(),
                                     title = song.title,
+                                    thumbnail = song.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri },
                                 )
                             }
                         configStore.saveLastWaveTracks(savedWave)
@@ -379,14 +381,28 @@ class AiWaveEngine(
         return if (result.isNotEmpty()) result else songs.shuffled()
     }
 
+    private fun youtubeFallbackThumbnail(videoId: String): String? {
+        if (videoId.length != 11) return null
+        if (videoId.startsWith("ym_") || videoId.startsWith("vk_") || videoId.startsWith("local_")) return null
+        if (!videoId.all { it.isLetterOrDigit() || it == '-' || it == '_' }) return null
+        return "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+    }
+
     private fun withFallbackCover(song: SongItem): SongItem {
-        if (!song.thumbnail.isNullOrBlank()) return song
+        if (!song.thumbnail.isNullOrBlank() && song.thumbnail != CustomMascotAssets.fallbackCoverUri) return song
+        val realCover =
+            ResolverDiagnostics.hdCoverFor(song.id)
+                ?: youtubeFallbackThumbnail(song.id)
+        if (!realCover.isNullOrBlank()) return song.copy(thumbnail = realCover)
         val fallback = CustomMascotAssets.fallbackCoverUri ?: return song
         return song.copy(thumbnail = fallback)
     }
 
     private fun LikedTrackBackup.toStarterSongItem(): SongItem? {
         if (title.isBlank() || id.isBlank()) return null
+        SongLikeState.likedSongs
+            .firstOrNull { it.id == id && !it.thumbnail.isNullOrBlank() && it.thumbnail != CustomMascotAssets.fallbackCoverUri }
+            ?.let { return it }
         val parsedArtists =
             artist
                 .split(",", "&")
@@ -394,10 +410,15 @@ class AiWaveEngine(
                 .filter { it.isNotBlank() }
                 .map { ArtistTiny(id = null, name = it) }
                 .ifEmpty { listOf(ArtistTiny(id = null, name = "Неизвестный")) }
+        val resolvedThumbnail =
+            thumbnail?.takeIf { it.isNotBlank() && it != CustomMascotAssets.fallbackCoverUri }
+                ?: ResolverDiagnostics.hdCoverFor(id)
+                ?: youtubeFallbackThumbnail(id)
+                ?: CustomMascotAssets.fallbackCoverUri
         return SongItem(
             id = id,
             title = title,
-            thumbnail = CustomMascotAssets.fallbackCoverUri,
+            thumbnail = resolvedThumbnail,
             artists = parsedArtists,
             album = null,
         )
