@@ -2,10 +2,12 @@ package com.metrolist.android.custom
 
 import android.util.Log
 import com.metrolist.shared.api.lastfm.LastFM
+import com.metrolist.shared.model.ArtistTiny
 import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.GlobalYouTube
 import com.metrolist.shared.state.GlobalYouTubeRepository
+import com.metrolist.shared.ui.screens.CustomHomeShelvesBridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -40,6 +42,31 @@ class AiWaveEngine(
 
     init {
         sharedInstance = this
+    }
+
+    fun buildInstantStarterSongs(
+        excludeIds: Set<String> = emptySet(),
+        limit: Int = 15,
+    ): List<SongItem> {
+        val cfg = configStore.current
+        val pool = mutableListOf<SongItem>()
+
+        cfg.lastWaveTracks.forEach { backup ->
+            backup.toStarterSongItem()?.let(pool::add)
+        }
+        cfg.likedTracksBackup.shuffled().take(25).forEach { backup ->
+            backup.toStarterSongItem()?.let(pool::add)
+        }
+        CustomHomeShelvesBridge.shelves
+            .flatMap { it.items }
+            .filterIsInstance<SongItem>()
+            .forEach(pool::add)
+
+        return filterSongsByFeedback(pool)
+            .filter { it.id.isNotBlank() && it.id !in excludeIds }
+            .distinctBy { it.id }
+            .shuffled()
+            .take(limit)
     }
 
     fun recordSessionSkip(song: SongItem) {
@@ -85,10 +112,16 @@ class AiWaveEngine(
     suspend fun generateWaveSongs(
         seedSong: SongItem? = null,
         count: Int = configStore.current.aiPlaylistSize,
+        backgroundLabel: Boolean = false,
     ): Result<List<SongItem>> =
         waveMutex.withLock {
             _isGeneratingWave.value = true
-            _statusText.value = if (seedSong != null) "Собираю волну от «${seedSong.title}»…" else "Подбираю волну…"
+            _statusText.value =
+                when {
+                    seedSong != null -> "Собираю волну от «${seedSong.title}»…"
+                    backgroundLabel -> "Подбираю свежую волну в фоне…"
+                    else -> "Подбираю волну…"
+                }
             try {
                 val cfg = configStore.current
                 val tasteSummary = collectTasteSummary(cfg)
@@ -100,13 +133,22 @@ class AiWaveEngine(
                     .mapCatching { suggestions ->
                         val filtered = filterSuggestionsByFeedback(suggestions)
                         val resolved = resolveSuggestionsToSongs(filtered, maxResults = targetCount)
-                        val cleanResolved = filterSongsByFeedback(resolved)
+                        val cleanResolved = filterSongsByFeedback(resolved).map(::withFallbackCover)
                         check(cleanResolved.isNotEmpty()) { "Не удалось найти ни одного трека в каталоге" }
+                        val savedWave =
+                            cleanResolved.map { song ->
+                                LikedTrackBackup(
+                                    id = song.id,
+                                    artist = song.artists.joinToString(", ") { it.name }.trim(),
+                                    title = song.title,
+                                )
+                            }
+                        configStore.saveLastWaveTracks(savedWave)
                         cleanResolved
                     }.onSuccess {
                         _statusText.value = null
                     }.onFailure { err ->
-                        _statusText.value = err.message ?: "Ошибка генерации волны"
+                        _statusText.value = if (backgroundLabel) null else (err.message ?: "Ошибка генерации волны")
                     }
             } finally {
                 _isGeneratingWave.value = false
@@ -174,7 +216,7 @@ class AiWaveEngine(
 
         val filtered = filterSuggestionsByFeedback(allSuggestions, respectSessionSkips = false)
         val resolved = resolveSuggestionsToSongs(filtered, maxResults = targetCount)
-        val cleanResolved = filterSongsByFeedback(resolved, respectSessionSkips = false)
+        val cleanResolved = filterSongsByFeedback(resolved, respectSessionSkips = false).map(::withFallbackCover)
         if (cleanResolved.isEmpty()) {
             return Result.failure(IllegalStateException("Не удалось найти треки в каталоге"))
         }
@@ -194,6 +236,30 @@ class AiWaveEngine(
             artist = artist,
             title = song.title,
             moodHint = moodHint,
+        )
+    }
+
+    private fun withFallbackCover(song: SongItem): SongItem {
+        if (!song.thumbnail.isNullOrBlank()) return song
+        val fallback = CustomMascotAssets.fallbackCoverUri ?: return song
+        return song.copy(thumbnail = fallback)
+    }
+
+    private fun LikedTrackBackup.toStarterSongItem(): SongItem? {
+        if (title.isBlank() || id.isBlank()) return null
+        val parsedArtists =
+            artist
+                .split(",", "&")
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .map { ArtistTiny(id = null, name = it) }
+                .ifEmpty { listOf(ArtistTiny(id = null, name = "Неизвестный")) }
+        return SongItem(
+            id = id,
+            title = title,
+            thumbnail = CustomMascotAssets.fallbackCoverUri,
+            artists = parsedArtists,
+            album = null,
         )
     }
 
@@ -309,15 +375,15 @@ class AiWaveEngine(
                 }
             }
 
-            if (entries.size < 8 && cfg.likedTracksBackup.isNotEmpty()) {
-                cfg.likedTracksBackup.take(12).forEach { liked ->
+            if (entries.size < 14 && cfg.likedTracksBackup.isNotEmpty()) {
+                cfg.likedTracksBackup.shuffled().take(16).forEach { liked ->
                     if (liked.title.isNotBlank()) {
                         entries += if (liked.artist.isNotBlank()) "${liked.artist} - ${liked.title}" else liked.title
                     }
                 }
             }
 
-            entries.distinct().take(20).joinToString("; ")
+            entries.distinct().take(24).joinToString("; ")
         }
 
     private suspend fun resolveSuggestionsToSongs(
