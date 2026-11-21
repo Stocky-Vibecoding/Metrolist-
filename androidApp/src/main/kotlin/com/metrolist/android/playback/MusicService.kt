@@ -41,12 +41,12 @@ import androidx.media3.session.SessionResult
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
-import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.android.App
 import com.metrolist.android.MainActivity
 import com.metrolist.android.R
 import com.metrolist.android.cast.AndroidMdnsCastDiscovery
 import com.metrolist.android.constants.MediaSessionConstants
+import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.android.data.PlayHistoryRepository
 import com.metrolist.android.deviceconnect.AndroidDeviceConnect
 import com.metrolist.android.listentogether.AndroidListenTogetherManager
@@ -1705,7 +1705,8 @@ class MusicService :
         var urlRecoveryBudget: PlaybackRecoveryBudget? = null
         val started =
             withQueueLoading(isPlaybackLoading = true) {
-                val bypassCache = PlaybackNetworkStateStore.current.connected && HybridStreamResolver.shouldBypassAudioCache(sourceSong)
+                val bypassCache =
+                    PlaybackNetworkStateStore.current.connected && HybridStreamResolver.shouldBypassAudioCache(sourceSong)
                 val cachedAudio =
                     if (!wantVideo && !bypassCache && sourceSong.canSwitchToAudioTrack) {
                         audioCacheManager.getCachedPlaybackResource(sourceSong)
@@ -2714,7 +2715,7 @@ class MusicService :
         wantVideo: Boolean = song.isVideoSong,
     ): PlaybackFetchResult =
         withContext(Dispatchers.IO) {
-          val connected = PlaybackNetworkStateStore.current.connected
+            val connected = PlaybackNetworkStateStore.current.connected
             val bypassCache = connected && HybridStreamResolver.shouldBypassAudioCache(song)
             if (!bypassCache) {
                 cachedAudioResource(wantVideo && connected) { audioCacheManager.getCachedPlaybackResource(song) }
@@ -2762,9 +2763,11 @@ class MusicService :
             } catch (e: Exception) {
                 Timber.tag(MUSIC_VIDEO_TAG).w(e, "resource resolve failed videoId=%s wantVideo=%s", song.id, wantVideo)
                 if (wantVideo) {
-                    cachedAudioResource(wantVideo = true, videoResolutionFailed = true) {
-                        audioCacheManager.getCachedPlaybackResource(song)
-                    }?.let { return@withContext PlaybackFetchResult(resource = it) }
+                    if (!bypassCache) {
+                        cachedAudioResource(wantVideo = true, videoResolutionFailed = true) {
+                            audioCacheManager.getCachedPlaybackResource(song)
+                        }?.let { return@withContext PlaybackFetchResult(resource = it) }
+                    }
                     try {
                         Timber.tag(MUSIC_VIDEO_TAG).d("resource audio fallback start videoId=%s", song.id)
                         val audioResource =
