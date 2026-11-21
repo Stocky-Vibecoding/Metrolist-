@@ -46,6 +46,7 @@ import com.metrolist.android.MainActivity
 import com.metrolist.android.R
 import com.metrolist.android.cast.AndroidMdnsCastDiscovery
 import com.metrolist.android.constants.MediaSessionConstants
+import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.android.data.PlayHistoryRepository
 import com.metrolist.android.deviceconnect.AndroidDeviceConnect
@@ -1098,6 +1099,13 @@ class MusicService :
 
                     resource?.videoId == song.id -> {
                         PlaybackErrorReporter.setActivePlayback(song, resource)
+                        if (HybridStreamResolver.isCachingEnabled()) {
+                            if (SongLikeState.isLiked(song.id)) {
+                                CustomMediaCacheManager.downloadLikedTrack(song, resource)
+                            } else if (queueTitle.value?.startsWith("Моя волна") == true) {
+                                CustomMediaCacheManager.cacheWaveTrack(song, resource)
+                            }
+                        }
                     }
 
                     resource != null -> {
@@ -1251,6 +1259,7 @@ class MusicService :
         }
         if (isCorruptCachedAudioFailure(player.currentPlaybackResource.value, failure.cause)) {
             val removed = audioCacheManager.removeCorruptCache(videoId)
+            CustomMediaCacheManager.invalidateTrack(videoId)
             PlaybackEventLog.warn(
                 PlaybackEventKind.RECOVERY,
                 "Android cached audio could not be parsed.",
@@ -1657,7 +1666,9 @@ class MusicService :
             }
         }
         if (!PlaybackNetworkStateStore.current.connected && !request.song.isLocal &&
-            !request.song.id.startsWith("local_") && audioCacheManager.getCachedPlaybackResource(request.song, touch = false) == null
+            !request.song.id.startsWith("local_") &&
+            audioCacheManager.getCachedPlaybackResource(request.song, touch = false) == null &&
+            !CustomMediaCacheManager.hasLocalFile(request.song.id)
         ) {
             if (stagedShouldCommit == null) skipUnavailableOfflineSong(sessionId, request)
             return false
@@ -1707,8 +1718,9 @@ class MusicService :
             withQueueLoading(isPlaybackLoading = true) {
                 val bypassCache =
                     PlaybackNetworkStateStore.current.connected && HybridStreamResolver.shouldBypassAudioCache(sourceSong)
+                val hasCustomLocal = !bypassCache && CustomMediaCacheManager.hasLocalFile(sourceSong.id)
                 val cachedAudio =
-                    if (!wantVideo && !bypassCache && sourceSong.canSwitchToAudioTrack) {
+                    if (!wantVideo && !bypassCache && !hasCustomLocal && sourceSong.canSwitchToAudioTrack) {
                         audioCacheManager.getCachedPlaybackResource(sourceSong)
                     } else {
                         null
@@ -1719,7 +1731,7 @@ class MusicService :
                         positionMs = targetPosition,
                         wantVideo = wantVideo,
                         cachedAudio = cachedAudio,
-                        sourceIsDownloaded = cachedAudio != null && audioCacheManager.isDownloaded(sourceSong.id),
+                        sourceIsDownloaded = (cachedAudio != null && audioCacheManager.isDownloaded(sourceSong.id)) || hasCustomLocal,
                         allowCounterpartLookup =
                             canSwapToAudioCounterpart(
                                 videoPlaybackEnabled = Settings.shared.musicVideoPlaybackEnabled,
@@ -1964,7 +1976,8 @@ class MusicService :
             if (stagedShouldCommit != null) return false
             if (!PlaybackNetworkStateStore.current.connected) {
                 if (!playbackSong.isLocal && !playbackSong.id.startsWith("local_") &&
-                    audioCacheManager.getCachedPlaybackResource(playbackSong, touch = false) == null
+                    audioCacheManager.getCachedPlaybackResource(playbackSong, touch = false) == null &&
+                    !CustomMediaCacheManager.hasLocalFile(playbackSong.id)
                 ) {
                     skipUnavailableOfflineSong(sessionId, request)
                 } else {
@@ -2031,7 +2044,7 @@ class MusicService :
             } else {
                 audioCacheManager.cachedSongIds()
             }
-        return { it in ids }
+        return { it in ids || CustomMediaCacheManager.hasLocalFile(it) }
     }
 
     private suspend fun skipUnavailableOfflineSong(
@@ -2045,7 +2058,7 @@ class MusicService :
                 player.currentMediaItemIndex.value,
                 _repeatMode.value == Player.REPEAT_MODE_ALL,
             ) { song ->
-                song.isLocal || song.id.startsWith("local_") || song.id in available
+                song.isLocal || song.id.startsWith("local_") || song.id in available || CustomMediaCacheManager.hasLocalFile(song.id)
             }
         if (!isCurrentQueueRequest(sessionId, request)) return
         if (next != null && !AndroidListenTogetherManager.isGuestPlaybackLocked && !AndroidDeviceConnect.manager.remote.isActive) {
@@ -2259,7 +2272,14 @@ class MusicService :
 
     private fun toggleFavorite() {
         val song = player.currentSong.value ?: return
+        val willLike = !SongLikeState.isLiked(song.id)
         SongLikeState.toggleLike(song)
+        if (willLike && HybridStreamResolver.isCachingEnabled()) {
+            val activeRes = player.currentPlaybackResource.value?.takeIf { it.videoId == song.id }
+            CustomMediaCacheManager.downloadLikedTrack(song, activeRes)
+        } else if (!willLike) {
+            CustomMediaCacheManager.removeLikedDownload(song.id)
+        }
         updateWidgetsNow()
     }
 
@@ -2717,11 +2737,14 @@ class MusicService :
         withContext(Dispatchers.IO) {
             val connected = PlaybackNetworkStateStore.current.connected
             val bypassCache = connected && HybridStreamResolver.shouldBypassAudioCache(song)
-            if (!bypassCache) {
+            val hasCustomLocal = !bypassCache && CustomMediaCacheManager.hasLocalFile(song.id)
+            if (!bypassCache && !hasCustomLocal) {
                 cachedAudioResource(wantVideo && connected) { audioCacheManager.getCachedPlaybackResource(song) }
                     ?.let { return@withContext PlaybackFetchResult(resource = it) }
             }
-            if (!connected && !song.isLocal && !song.id.startsWith("local_")) return@withContext PlaybackFetchResult()
+            if (!connected && !hasCustomLocal && !song.isLocal && !song.id.startsWith("local_")) {
+                return@withContext PlaybackFetchResult()
+            }
             val hints = song.toAndroidContentHints(wantVideo = wantVideo)
             Timber.tag(MUSIC_VIDEO_TAG).d(
                 "resource resolve start videoId=%s wantVideo=%s songIsVideo=%s quality=%s maxVideoHeight=%s",
@@ -2763,7 +2786,7 @@ class MusicService :
             } catch (e: Exception) {
                 Timber.tag(MUSIC_VIDEO_TAG).w(e, "resource resolve failed videoId=%s wantVideo=%s", song.id, wantVideo)
                 if (wantVideo) {
-                    if (!bypassCache) {
+                    if (!bypassCache && !hasCustomLocal) {
                         cachedAudioResource(wantVideo = true, videoResolutionFailed = true) {
                             audioCacheManager.getCachedPlaybackResource(song)
                         }?.let { return@withContext PlaybackFetchResult(resource = it) }
