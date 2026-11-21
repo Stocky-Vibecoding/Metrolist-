@@ -21,14 +21,33 @@ object CustomMascotAssets {
         private set
 
     @Volatile
+    var sleepResId: Int = 0
+        private set
+
+    @Volatile
+    var awakeResId: Int = 0
+        private set
+
+    @Volatile
+    var vibeResId: Int = 0
+        private set
+
+    @Volatile
     var fallbackCoverUri: String? = null
         private set
 
+    val hasDedicatedSprites: Boolean
+        get() = sleepResId != 0 || awakeResId != 0
+
     fun init(appContext: Context) {
         val pkg = appContext.packageName
-        val id = appContext.resources.getIdentifier("mascot_girl", "drawable", pkg)
-        drawableResId = id
-        fallbackCoverUri = if (id != 0) "android.resource://$pkg/$id" else null
+        val res = appContext.resources
+        val girlId = res.getIdentifier("mascot_girl", "drawable", pkg)
+        drawableResId = girlId
+        sleepResId = res.getIdentifier("mascot_sleep", "drawable", pkg)
+        awakeResId = res.getIdentifier("mascot_awake", "drawable", pkg)
+        vibeResId = res.getIdentifier("mascot_vibe", "drawable", pkg)
+        fallbackCoverUri = if (girlId != 0) "android.resource://$pkg/$girlId" else null
     }
 }
 
