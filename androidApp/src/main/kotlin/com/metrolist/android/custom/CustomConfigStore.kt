@@ -267,7 +267,7 @@ class CustomConfigStore(
                     (listOf(entry) + cfg.likedTracksBackup.filterNot {
                         (entry.id.isNotBlank() && it.id == entry.id) ||
                             (it.artist.equals(entry.artist, ignoreCase = true) && it.title.equals(entry.title, ignoreCase = true))
-                    }).take(2000)
+                    }).take(MAX_LIKED_BACKUP)
                 } else {
                     cfg.likedTracksBackup
                 }
@@ -277,6 +277,34 @@ class CustomConfigStore(
                 likedTracksBackup = nextLiked,
             )
         }
+    }
+
+    fun mergeImportedLikes(entries: List<LikedTrackBackup>): Int {
+        if (entries.isEmpty()) return _config.value.likedTracksBackup.size
+        var finalCount = 0
+        update { cfg ->
+            val seenKeys = HashSet<String>()
+            val merged = ArrayList<LikedTrackBackup>(minOf(entries.size + cfg.likedTracksBackup.size, MAX_LIKED_BACKUP))
+
+            fun addIfUnique(item: LikedTrackBackup) {
+                if (merged.size >= MAX_LIKED_BACKUP) return
+                val cleanTitle = item.title.trim()
+                val cleanArtist = item.artist.trim()
+                val cleanId = item.id.trim()
+                if (cleanId.isBlank() && cleanTitle.isBlank()) return
+                val key =
+                    buildTrackKey(cleanArtist, cleanTitle).ifBlank { "id::$cleanId" }
+                if (seenKeys.add(key)) {
+                    merged.add(LikedTrackBackup(id = cleanId, artist = cleanArtist, title = cleanTitle))
+                }
+            }
+
+            entries.forEach(::addIfUnique)
+            cfg.likedTracksBackup.forEach(::addIfUnique)
+            finalCount = merged.size
+            cfg.copy(likedTracksBackup = merged)
+        }
+        return finalCount
     }
 
     fun removeLikedTrackBackup(
@@ -487,7 +515,7 @@ class CustomConfigStore(
         val likedBackup =
             buildList<LikedTrackBackup> {
                 val arr = obj.optJSONArray("likedTracksBackup") ?: return@buildList
-                for (i in 0 until arr.length()) {
+                for (i in 0 until minOf(arr.length(), MAX_LIKED_BACKUP)) {
                     val item = arr.optJSONObject(i) ?: continue
                     val id = item.optString("id").trim()
                     val artist = item.optString("artist").trim()
@@ -537,6 +565,7 @@ class CustomConfigStore(
         private const val PREFS_NAME = "stocky_custom_engine_prefs"
         private const val CENSORSHIP_PREFS_NAME = "stocky_censorship_cache_prefs"
         private const val KEY_CONFIG_JSON = "custom_config_v2"
+        private const val MAX_LIKED_BACKUP = 5_000
 
         fun buildTrackKey(
             artist: String,
