@@ -13,6 +13,7 @@ import com.metrolist.android.R
 import com.metrolist.android.custom.AiWaveEngine
 import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.android.custom.HybridStreamResolver
+import com.metrolist.android.custom.ResolverDiagnostics
 import com.metrolist.android.deviceconnect.AndroidDeviceConnect
 import com.metrolist.android.deviceconnect.toDeviceConnectRepeatMode
 import com.metrolist.android.listentogether.AndroidListenTogetherManager
@@ -46,6 +47,7 @@ import com.metrolist.shared.settings.MusicVideoQuality
 import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
+import com.metrolist.shared.ui.player.CustomPlayerMenuBridge
 import com.metrolist.shared.utils.normalizePlaybackTempo
 import com.metrolist.shared.youtube.playback.PlaybackResource
 import kotlinx.coroutines.CancellationException
@@ -471,6 +473,26 @@ class PlayerConnection(
         }
 
     init {
+        CustomPlayerMenuBridge.onStartWaveForSong = { songId ->
+            startWaveFromTrackId(songId)
+        }
+        CustomPlayerMenuBridge.onSelectSourceForSong = { songId, prefName ->
+            switchSourceFromMenu(songId, prefName)
+        }
+        scope.launch {
+            combine(_currentSong, _currentPlaybackResource, ResolverDiagnostics.revision) { song, res, _ ->
+                song to res
+            }.collect { (song, res) ->
+                CustomPlayerMenuBridge.currentSourceLabel =
+                    ResolverDiagnostics.qualityLabelFor(
+                        videoId = song?.id,
+                        clientName = res?.clientName,
+                        bitrate = res?.bitrate,
+                        mimeType = res?.mimeType,
+                    )
+                CustomPlayerMenuBridge.currentSourceOverride = HybridStreamResolver.getTrackSourceOverrideName(song)
+            }
+        }
         scope.launch {
             AndroidDeviceConnect.manager.state.collect { state ->
                 if (state.peers.any { it.state == DeviceConnectManager.PeerState.CONNECTED }) ensureConnected()
@@ -515,6 +537,55 @@ class PlayerConnection(
                 updateProgress()
                 _currentSong.value = song
             }
+    }
+
+    private fun startWaveFromTrackId(songId: String) {
+        val song =
+            _currentSong.value?.takeIf { it.id == songId }
+                ?: _queueSnapshot.value.displayedItems.firstOrNull { it.id == songId }
+                ?: return
+        val engine = AiWaveEngine.sharedInstance ?: run {
+            Toast.makeText(context, "Движок волны ещё не готов", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Toast.makeText(context, "Собираю волну от «${song.title}»…", Toast.LENGTH_SHORT).show()
+        scope.launch {
+            engine
+                .generateWaveSongs(seedSong = song)
+                .onSuccess { generated ->
+                    val queue = listOf(song) + generated.filterNot { it.id == song.id }
+                    playQueue(
+                        songs = queue,
+                        startIndex = if (queue.size > 1) 1 else 0,
+                        queueTitle = "Моя волна • ${song.title}",
+                        finite = false,
+                        forceStartPlaying = true,
+                    )
+                }.onFailure { err ->
+                    Toast.makeText(context, err.message ?: "Не удалось собрать волну", Toast.LENGTH_SHORT).show()
+                }
+        }
+    }
+
+    private fun switchSourceFromMenu(
+        songId: String,
+        prefName: String,
+    ) {
+        val song =
+            _currentSong.value?.takeIf { it.id == songId }
+                ?: _queueSnapshot.value.displayedItems.firstOrNull { it.id == songId }
+                ?: return
+        val toastMsg =
+            HybridStreamResolver.selectTrackSourceFromMenu(
+                song = song,
+                prefName = prefName,
+                activeClientName = _currentPlaybackResource.value?.clientName,
+            )
+        CustomPlayerMenuBridge.currentSourceOverride = HybridStreamResolver.getTrackSourceOverrideName(song)
+        Toast.makeText(context, toastMsg, Toast.LENGTH_SHORT).show()
+        if (_currentSong.value?.id == song.id) {
+            reloadCurrentSongForSourceSwitch()
+        }
     }
 
     private fun observeService(service: MusicService) {
