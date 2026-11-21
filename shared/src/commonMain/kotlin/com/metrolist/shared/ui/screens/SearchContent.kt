@@ -167,6 +167,20 @@ import com.valentinilk.shimmer.shimmer
 import kotlinx.coroutines.flow.distinctUntilChanged
 import org.jetbrains.compose.resources.stringResource
 
+object CustomSearchBridge {
+    var query by mutableStateOf("")
+    var yandexSongs by mutableStateOf<List<SongItem>>(emptyList())
+    var vkSongs by mutableStateOf<List<SongItem>>(emptyList())
+    var isLoading by mutableStateOf(false)
+    var onSearchRequested: ((String) -> Unit)? = null
+
+    fun requestSearch(rawQuery: String) {
+        val clean = rawQuery.trim()
+        if (clean.isBlank()) return
+        onSearchRequested?.invoke(clean)
+    }
+}
+
 data class SearchContentText(
     val search: String,
     val suggestions: String,
@@ -980,6 +994,19 @@ private fun SearchResultsList(
         enabled = hasSearched && !isSearching && hasVisibleItems,
     )
 
+    LaunchedEffect(uiState.query, hasSearched) {
+        if (hasSearched && uiState.query.isNotBlank()) {
+            CustomSearchBridge.requestSearch(uiState.query)
+        }
+    }
+
+    val cleanQuery = uiState.query.trim()
+    val customQueryMatches = cleanQuery.isNotBlank() && CustomSearchBridge.query.equals(cleanQuery, ignoreCase = true)
+    val yandexSearchSongs = if (customQueryMatches) CustomSearchBridge.yandexSongs else emptyList()
+    val vkSearchSongs = if (customQueryMatches) CustomSearchBridge.vkSongs else emptyList()
+    val showCustomSources = selectedFilter == null || selectedFilter == SearchFilter.SONG
+    val hasCustomResults = showCustomSources && (yandexSearchSongs.isNotEmpty() || vkSearchSongs.isNotEmpty())
+
     val availableFilters =
         SearchFilter.entries.toList().filterAvailableSearchFilters(
             hideVideoSongs = Settings.shared.hideVideoSongs,
@@ -991,7 +1018,7 @@ private fun SearchResultsList(
     val showingFilteredResults = selectedFilter != null && filteredResults != null
     val allResultsEmpty = summaries.all { it.items.isEmpty() }
     val showNoResults =
-        hasSearched && !isSearching && !uiState.searchFailed &&
+        hasSearched && !isSearching && !uiState.searchFailed && !hasCustomResults &&
             if (showingFilteredResults) filteredItems.isEmpty() && filteredResults.continuation == null else allResultsEmpty
 
     LaunchedEffect(selectedFilter, filteredResults?.continuation, filteredItems.size, isLoadingMore, uiState.loadMoreFailed) {
@@ -1058,7 +1085,7 @@ private fun SearchResultsList(
             return@DragScrollableColumn
         }
 
-        if (uiState.searchFailed) {
+        if (uiState.searchFailed && !hasCustomResults) {
             item(key = "search_failed") {
                 Column(Modifier.fillMaxWidth().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(stringResource(Res.string.search_online_failed))
@@ -1079,6 +1106,65 @@ private fun SearchResultsList(
         }
 
         if (showingFilteredResults) {
+            if (selectedFilter == SearchFilter.SONG && filteredItems.isEmpty() && hasCustomResults) {
+                if (vkSearchSongs.isNotEmpty()) {
+                    item(key = "custom_filtered_vk") {
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                            Box(Modifier.widthIn(max = 1400.dp).fillMaxWidth()) {
+                                SearchEnterMotion {
+                                    SearchResultGroup(
+                                        title = "VK Музыка",
+                                        items = vkSearchSongs,
+                                        onItemClick = onItemClick,
+                                        onVideoItemClick = onVideoItemClick,
+                                        onItemLongClick = onItemLongClick,
+                                        onSongSave = onSongSave,
+                                        currentSongId = currentSongId,
+                                        isPlaying = isPlaying,
+                                        text = text,
+                                        onArtistClick = onArtistClick,
+                                        onAlbumClick = onAlbumClick,
+                                        onShuffleClick = onShuffleClick,
+                                        onMixClick = onMixClick,
+                                        itemContainer = itemContainer,
+                                        onAlbumPlay = onAlbumPlay,
+                                        isWide = isWide,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                if (yandexSearchSongs.isNotEmpty()) {
+                    item(key = "custom_filtered_yandex") {
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                            Box(Modifier.widthIn(max = 1400.dp).fillMaxWidth()) {
+                                SearchEnterMotion {
+                                    SearchResultGroup(
+                                        title = "Яндекс.Музыка",
+                                        items = yandexSearchSongs,
+                                        onItemClick = onItemClick,
+                                        onVideoItemClick = onVideoItemClick,
+                                        onItemLongClick = onItemLongClick,
+                                        onSongSave = onSongSave,
+                                        currentSongId = currentSongId,
+                                        isPlaying = isPlaying,
+                                        text = text,
+                                        onArtistClick = onArtistClick,
+                                        onAlbumClick = onAlbumClick,
+                                        onShuffleClick = onShuffleClick,
+                                        onMixClick = onMixClick,
+                                        itemContainer = itemContainer,
+                                        onAlbumPlay = onAlbumPlay,
+                                        isWide = isWide,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             itemsIndexed(filteredItems, key = {
                 index,
                 item,
@@ -1170,6 +1256,70 @@ private fun SearchResultsList(
                     item(key = "section_gap_$index") {
                         Spacer(Modifier.height(24.dp))
                     }
+                }
+            }
+
+            if (vkSearchSongs.isNotEmpty()) {
+                item(key = "custom_section_vk") {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                        Box(Modifier.widthIn(max = 1400.dp).fillMaxWidth()) {
+                            SearchEnterMotion {
+                                SearchResultGroup(
+                                    title = "VK Музыка",
+                                    items = vkSearchSongs,
+                                    onItemClick = onItemClick,
+                                    onVideoItemClick = onVideoItemClick,
+                                    onItemLongClick = onItemLongClick,
+                                    onSongSave = onSongSave,
+                                    currentSongId = currentSongId,
+                                    isPlaying = isPlaying,
+                                    text = text,
+                                    onArtistClick = onArtistClick,
+                                    onAlbumClick = onAlbumClick,
+                                    onShuffleClick = onShuffleClick,
+                                    onMixClick = onMixClick,
+                                    itemContainer = itemContainer,
+                                    onAlbumPlay = onAlbumPlay,
+                                    isWide = isWide,
+                                )
+                            }
+                        }
+                    }
+                }
+                item(key = "custom_section_vk_gap") {
+                    Spacer(Modifier.height(24.dp))
+                }
+            }
+
+            if (yandexSearchSongs.isNotEmpty()) {
+                item(key = "custom_section_yandex") {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                        Box(Modifier.widthIn(max = 1400.dp).fillMaxWidth()) {
+                            SearchEnterMotion {
+                                SearchResultGroup(
+                                    title = "Яндекс.Музыка",
+                                    items = yandexSearchSongs,
+                                    onItemClick = onItemClick,
+                                    onVideoItemClick = onVideoItemClick,
+                                    onItemLongClick = onItemLongClick,
+                                    onSongSave = onSongSave,
+                                    currentSongId = currentSongId,
+                                    isPlaying = isPlaying,
+                                    text = text,
+                                    onArtistClick = onArtistClick,
+                                    onAlbumClick = onAlbumClick,
+                                    onShuffleClick = onShuffleClick,
+                                    onMixClick = onMixClick,
+                                    itemContainer = itemContainer,
+                                    onAlbumPlay = onAlbumPlay,
+                                    isWide = isWide,
+                                )
+                            }
+                        }
+                    }
+                }
+                item(key = "custom_section_yandex_gap") {
+                    Spacer(Modifier.height(24.dp))
                 }
             }
         }
