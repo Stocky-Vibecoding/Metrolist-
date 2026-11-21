@@ -58,6 +58,12 @@ object CustomMediaCacheManager {
     private val activeDownloads = ConcurrentHashMap.newKeySet<String>()
 
     @Volatile
+    var systemDownloadLikeHook: ((SongItem) -> Unit)? = null
+
+    @Volatile
+    var systemRemoveLikeHook: ((String) -> Unit)? = null
+
+    @Volatile
     private var waveCacheDir: File? = null
 
     @Volatile
@@ -135,8 +141,15 @@ object CustomMediaCacheManager {
         song: SongItem,
         resource: PlaybackResource? = null,
     ) {
-        val dir = likedDownloadsDir ?: return
         if (song.id.isBlank() || song.isLocal || song.isLive || song.isPodcast) return
+
+        // Отправляем прямо в системный раздел «Скачанные» Metrolist
+        systemDownloadLikeHook?.let { hook ->
+            hook(song)
+            return
+        }
+
+        val dir = likedDownloadsDir ?: return
         val safe = safeKey(song.id)
         val dstAudio = File(dir, "$safe.audio")
         if (dstAudio.exists() && dstAudio.length() > 16_384L) return
@@ -173,8 +186,9 @@ object CustomMediaCacheManager {
     }
 
     fun removeLikedDownload(videoId: String) {
-        val dir = likedDownloadsDir ?: return
         if (videoId.isBlank()) return
+        systemRemoveLikeHook?.invoke(videoId)
+        val dir = likedDownloadsDir ?: return
         val safe = safeKey(videoId)
         ioScope.launch {
             File(dir, "$safe.audio").delete()
@@ -616,7 +630,15 @@ class HybridStreamResolver(
         excludedProfiles: Set<String>,
     ): PlaybackResource {
         if (refresh) preResolvedCache.remove(videoId)
-        tryResolveCustom(videoId, sourceSong, excludedProfiles, allowPreResolvedCache = !refresh)?.let { return it }
+        val isDownload = videoId in activeSystemDownloads
+        tryResolveCustom(
+            videoId = videoId,
+            sourceSong = sourceSong,
+            excludedProfiles = excludedProfiles,
+            allowPreResolvedCache = !refresh && !isDownload,
+            allowLocalFileCache = !isDownload,
+            forSystemDownload = isDownload,
+        )?.let { return it }
         return resolveViaDelegate(videoId, sourceSong) { ytId, ytSong ->
             delegate.resolveRemote(ytId, hints, audioQuality, ytSong, refresh, excludedProfiles)
         }
@@ -764,6 +786,7 @@ class HybridStreamResolver(
         allowPreResolvedCache: Boolean = true,
         isPreResolve: Boolean = false,
         allowLocalFileCache: Boolean = true,
+        forSystemDownload: Boolean = false,
     ): PlaybackResource? {
         val song = sourceSong ?: return null
         if (song.isLocal || song.isUploaded || song.isPodcast || song.isLive) return null
@@ -775,7 +798,7 @@ class HybridStreamResolver(
                 .trim()
         val title = (song.canonicalTitle ?: song.title).trim()
 
-        if (allowLocalFileCache && !isPreResolve && "custom_cache" !in excludedProfiles) {
+        if (allowLocalFileCache && !isPreResolve && !forSystemDownload && "custom_cache" !in excludedProfiles) {
             CustomMediaCacheManager.getLocalPlaybackResource(videoId, song)?.let { (localRes, cacheTag) ->
                 val badge =
                     ResolverDiagnostics.formatQualityBadge(
@@ -801,7 +824,7 @@ class HybridStreamResolver(
         val failed = failedProvidersByVideo[videoId].orEmpty()
         val manualPref = configStore.getTrackSourceOverride(videoId = videoId, artist = artist, title = title)
         if (manualPref == TrackSourcePreference.YTM) {
-            if (!isPreResolve) {
+            if (!isPreResolve && !forSystemDownload) {
                 ResolverDiagnostics.record(
                     videoId = videoId,
                     artist = artist,
@@ -877,6 +900,11 @@ class HybridStreamResolver(
             }
             if (resolved == null) continue
 
+            // Системный загрузчик скачивает прямые аудиофайлы, HLS .m3u8 пропускаем дальше по каскаду
+            if (forSystemDownload && (resolved.isHls || resolved.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true))) {
+                continue
+            }
+
             val badge =
                 ResolverDiagnostics.formatQualityBadge(
                     clientName = resolved.clientName,
@@ -886,7 +914,12 @@ class HybridStreamResolver(
                     variantTag = variantTag,
                 ) ?: resolved.clientName
 
-            val fullDetail = if (isPreResolve) "$reason • пре-резолв" else reason
+            val fullDetail =
+                when {
+                    forSystemDownload -> "$reason • скачивание"
+                    isPreResolve -> "$reason • пре-резолв"
+                    else -> reason
+                }
             ResolverDiagnostics.record(
                 videoId = videoId,
                 artist = artist,
@@ -1014,6 +1047,16 @@ class HybridStreamResolver(
 
         @Volatile
         private var activeInstance: HybridStreamResolver? = null
+
+        private val activeSystemDownloads = ConcurrentHashMap.newKeySet<String>()
+
+        fun beginSystemDownload(videoId: String) {
+            if (videoId.isNotBlank()) activeSystemDownloads.add(videoId)
+        }
+
+        fun endSystemDownload(videoId: String) {
+            if (videoId.isNotBlank()) activeSystemDownloads.remove(videoId)
+        }
 
         fun isCachingEnabled(): Boolean =
             activeInstance?.configStore?.current?.cacheWaveAndDownloadLikes != false
