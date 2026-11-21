@@ -330,7 +330,6 @@ class AiWaveEngine(
             }
         }
 
-        // Если свежих треков мало, аккуратно добираем из недавних повторов в конец
         val orderedFresh = (fresh.shuffled() + recentRepeats.shuffled()).toMutableList()
 
         val maxFamiliar =
@@ -363,7 +362,6 @@ class AiWaveEngine(
             return null
         }
 
-        // Чередуем 3 новых + 1 знакомый, соблюдая лимит: до 2 треков одного артиста на каждые 10
         while (orderedFresh.isNotEmpty() || familiarPool.isNotEmpty()) {
             var addedAny = false
             repeat(3) {
@@ -546,7 +544,6 @@ class AiWaveEngine(
                 if (cleanArtist.isNotBlank()) bumpArtist(cleanArtist, artistWeight)
             }
 
-            // 1. Свежие лайки прямо из текущей библиотеки Metrolist (самый точный и свежий сигнал)
             val recentLocalLikes =
                 SongLikeState.likedSongs
                     .sortedByDescending { it.libraryAddedAt ?: 0L }
@@ -559,7 +556,6 @@ class AiWaveEngine(
                 if (art.isNotBlank()) bumpArtist(art, weight = 2)
             }
 
-            // 2. Последние треки из Last.fm (если подключён)
             if (cfg.lastFmUsername.isNotBlank() && LastFM.apiKeyConfigured()) {
                 runCatching {
                     val recent = LastFM.getRecentTracks(GlobalYouTube.client, cfg.lastFmUsername.trim(), limit = 10).getOrNull()
@@ -585,7 +581,6 @@ class AiWaveEngine(
                 }
             }
 
-            // 3. Недавняя история прослушиваний YouTube Music
             if (GlobalYouTubeRepository.instance.isYouTubeHistoryAvailable()) {
                 runCatching {
                     GlobalYouTubeRepository.instance.getHistory().take(12).forEach { entry ->
@@ -595,7 +590,6 @@ class AiWaveEngine(
                 }
             }
 
-            // 4. Свежие треки из импорта/бэкапа (голова списка — самые свежие)
             cfg.likedTracksBackup.take(15).forEach { liked ->
                 addCore(liked.artist, liked.title, artistWeight = 3)
             }
@@ -603,7 +597,6 @@ class AiWaveEngine(
                 if (liked.artist.isNotBlank()) bumpArtist(liked.artist, weight = 1)
             }
 
-            // Учитываем накопленную репутацию артистов
             cfg.artistReputation.forEach { (normArtist, rep) ->
                 if (!rep.isAutoMuted && !rep.isLowWeight && rep.likes > 0) {
                     val delta = (rep.likes * 3 - rep.dislikes * 2).coerceAtLeast(0)
@@ -620,7 +613,6 @@ class AiWaveEngine(
                     .take(12)
                     .mapNotNull { artistDisplayNames[it.key] }
 
-            // Небольшой срез из остальной медиатеки (чтобы волна не была слишком узкой)
             val extraContext =
                 cfg.likedTracksBackup
                     .drop(15)
@@ -688,14 +680,14 @@ class AiWaveEngine(
                         candidateDurationSec = song.duration,
                     )
 
-                // Отсекаем slowed / sped up / nightcore / clean / karaoke / cover, если их не было в запросе
-                val candLower = "${art} ${song.title}".lowercase()
+                val candLower = "$art ${song.title}".lowercase()
                 for (badTag in UNWANTED_VERSION_TAGS) {
                     if (candLower.contains(badTag) && !targetLower.contains(badTag)) {
                         score -= 40
                     }
                 }
-                if (song.duration != null && song.duration in 1..45) {
+                val durationSec = song.duration?.toLong()
+                if (durationSec != null && durationSec in 1L..45L) {
                     score -= 35
                 }
 
