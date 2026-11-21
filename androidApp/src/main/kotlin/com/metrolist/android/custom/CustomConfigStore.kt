@@ -33,11 +33,26 @@ object CustomMascotAssets {
         private set
 
     @Volatile
+    var sleepVideoResId: Int = 0
+        private set
+
+    @Volatile
+    var wakeVideoResId: Int = 0
+        private set
+
+    @Volatile
+    var awakeVideoResId: Int = 0
+        private set
+
+    @Volatile
     var fallbackCoverUri: String? = null
         private set
 
     val hasDedicatedSprites: Boolean
         get() = sleepResId != 0 || awakeResId != 0
+
+    val hasVideoMascot: Boolean
+        get() = sleepVideoResId != 0 || awakeVideoResId != 0 || wakeVideoResId != 0
 
     fun init(appContext: Context) {
         val pkg = appContext.packageName
@@ -47,6 +62,9 @@ object CustomMascotAssets {
         sleepResId = res.getIdentifier("mascot_sleep", "drawable", pkg)
         awakeResId = res.getIdentifier("mascot_awake", "drawable", pkg)
         vibeResId = res.getIdentifier("mascot_vibe", "drawable", pkg)
+        sleepVideoResId = res.getIdentifier("mascot_sleep", "raw", pkg)
+        wakeVideoResId = res.getIdentifier("mascot_wake", "raw", pkg)
+        awakeVideoResId = res.getIdentifier("mascot_awake", "raw", pkg)
         fallbackCoverUri = if (girlId != 0) "android.resource://$pkg/$girlId" else null
     }
 }
