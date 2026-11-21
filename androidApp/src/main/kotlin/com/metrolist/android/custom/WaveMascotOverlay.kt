@@ -68,6 +68,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -96,6 +97,7 @@ import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.components.images.AsyncImage
 import com.metrolist.shared.ui.icons.MetrolistIcons
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -288,7 +290,6 @@ fun WaveHomeScreen(
                 }
             }
 
-            // Плашка с крестиком сверху (как в Яндексе), если сейчас играет поиск / альбом / плейлист
             AnimatedVisibility(
                 visible = isOutsideWave && activeContextLabel.isNotBlank(),
                 enter = fadeIn(),
@@ -1005,6 +1006,7 @@ fun CustomEngineSettingsContent(
     val resolverLogs by ResolverDiagnostics.logs.collectAsState()
     val cacheStats by CustomMediaCacheManager.stats.collectAsState()
     val likedIds by SongLikeState.likedSongIdsForDisplay.collectAsState(initial = SongLikeState.likedSongIds)
+    val catalogProvider = remember(configStore) { CustomCatalogProvider(configStore) }
 
     var yandexInput by remember(cfg.yandexToken) { mutableStateOf(cfg.yandexToken) }
     var vkInput by remember(cfg.vkToken) { mutableStateOf(cfg.vkToken) }
@@ -1015,6 +1017,11 @@ fun CustomEngineSettingsContent(
     var statusMessage by remember { mutableStateOf<String?>(null) }
     var isCheckingApis by remember { mutableStateOf(false) }
     var showLogs by remember { mutableStateOf(false) }
+
+    var importSyncLimit by remember { mutableIntStateOf(100) }
+    var importProgressText by remember { mutableStateOf<String?>(null) }
+    var importJob by remember { mutableStateOf<Job?>(null) }
+    val isImporting = importJob?.isActive == true
 
     fun persistInputs() {
         configStore.update {
@@ -1073,7 +1080,10 @@ fun CustomEngineSettingsContent(
                         lfmUserInput = imported.lastFmUsername
                         geminiKeyInput = imported.geminiApiKey
 
-                        val toRestore = imported.likedTracksBackup.filter { it.title.isNotBlank() && it.id !in SongLikeState.likedSongIds }
+                        val toRestore =
+                            imported.likedTracksBackup
+                                .filter { it.title.isNotBlank() && it.id !in SongLikeState.likedSongIds }
+                                .take(200)
                         if (toRestore.isEmpty()) {
                             statusMessage = "Бэкап загружен"
                         } else {
@@ -1095,9 +1105,10 @@ fun CustomEngineSettingsContent(
                                                 songs.firstOrNull { entry.id.isNotBlank() && it.id == entry.id } ?: songs.firstOrNull()
                                             }.getOrNull()
                                         if (found != null && found.id !in SongLikeState.likedSongIds) {
-                                            SongLikeState.toggleLike(found)
-                                            if (imported.cacheWaveAndDownloadLikes) {
-                                                CustomMediaCacheManager.downloadLikedTrack(found)
+                                            withContext(Dispatchers.Main) {
+                                                if (found.id !in SongLikeState.likedSongIds) {
+                                                    SongLikeState.toggleLike(found)
+                                                }
                                             }
                                             ok += 1
                                         }
@@ -1308,6 +1319,94 @@ fun CustomEngineSettingsContent(
             ) {
                 Text(
                     text = statusMessage.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+        }
+
+        HorizontalDivider()
+
+        FilterGroupTitle("Импорт лайков из Яндекса и ВК")
+        Text(
+            text = "Все треки сразу попадут в память «Волны» и бэкап. Сколько сразу добавить в Библиотеку:",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(100 to "100", 300 to "300", 0 to "Все").forEach { (limit, label) ->
+                FilterChip(
+                    selected = importSyncLimit == limit,
+                    enabled = !isImporting,
+                    onClick = { importSyncLimit = limit },
+                    label = { Text(label, maxLines = 1) },
+                )
+            }
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                enabled = !isImporting,
+                onClick = {
+                    persistInputs()
+                    importProgressText = "Запускаю импорт из Я.Музыки…"
+                    importJob =
+                        scope.launch {
+                            catalogProvider
+                                .importYandexLikes(importSyncLimit) { prog ->
+                                    importProgressText = prog.message
+                                }.onSuccess { res ->
+                                    importProgressText =
+                                        "Готово (${res.sourceLabel}): загружено ${res.totalFetched}, в памяти волны ${res.savedForWave}, добавлено в Библиотеку ${res.addedToLibrary}"
+                                }.onFailure { err ->
+                                    importProgressText = "Ошибка импорта: ${err.message}"
+                                }
+                        }
+                },
+            ) {
+                Text("Импорт Я.Музыки")
+            }
+            OutlinedButton(
+                enabled = !isImporting,
+                onClick = {
+                    persistInputs()
+                    importProgressText = "Запускаю импорт из VK…"
+                    importJob =
+                        scope.launch {
+                            catalogProvider
+                                .importVkAudios(importSyncLimit) { prog ->
+                                    importProgressText = prog.message
+                                }.onSuccess { res ->
+                                    importProgressText =
+                                        "Готово (${res.sourceLabel}): загружено ${res.totalFetched}, в памяти волны ${res.savedForWave}, добавлено в Библиотеку ${res.addedToLibrary}"
+                                }.onFailure { err ->
+                                    importProgressText = "Ошибка импорта: ${err.message}"
+                                }
+                        }
+                },
+            ) {
+                Text("Импорт из VK")
+            }
+            if (isImporting) {
+                OutlinedButton(
+                    onClick = {
+                        importJob?.cancel()
+                        importJob = null
+                        importProgressText = "Импорт остановлен (уже найденные треки сохранены)"
+                    },
+                ) {
+                    Text("Стоп")
+                }
+            }
+        }
+        if (!importProgressText.isNullOrBlank()) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = importProgressText.orEmpty(),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(12.dp),
