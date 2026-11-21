@@ -51,6 +51,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -119,6 +120,16 @@ import com.metrolist.shared.utils.isDesktop
 import com.metrolist.shared.viewmodels.HomePaginationTrigger
 import com.metrolist.shared.viewmodels.HomeViewModel.HomeUiState
 import org.jetbrains.compose.resources.stringResource
+
+object CustomHomeShelvesBridge {
+    var shelves by mutableStateOf<List<HomeShelf>>(emptyList())
+    var isLoading by mutableStateOf(false)
+    var onRefreshRequested: ((Boolean) -> Unit)? = null
+
+    fun requestLoad(force: Boolean = false) {
+        onRefreshRequested?.invoke(force)
+    }
+}
 
 enum class HomeShelfStyle {
     CAROUSEL,
@@ -214,6 +225,15 @@ fun HomeContent(
     shelfCache: HomeShelfCache? = null,
     onPlaySongs: ((List<SongItem>) -> Unit)? = null,
 ) {
+    LaunchedEffect(Unit) {
+        CustomHomeShelvesBridge.requestLoad(force = false)
+    }
+    LaunchedEffect(uiState.isRefreshing) {
+        if (uiState.isRefreshing) {
+            CustomHomeShelvesBridge.requestLoad(force = true)
+        }
+    }
+
     val activeSongId =
         remember(currentSongId) {
             derivedStateOf { currentSongId.value.takeUnless { Settings.shared.uiEnhancements } }
@@ -222,8 +242,18 @@ fun HomeContent(
     val paginationScrollConnection = rememberHomePagination(uiState, listState, onLoadMore)
     BoxWithConstraints(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         val isWide = maxWidth > 840.dp
-        val effectiveShelves =
+        val baseShelves =
             shelves ?: (shelfCache ?: localShelfCache).build(uiState, text, maxWidth)
+        val customShelves =
+            if (uiState.selectedChip == null) CustomHomeShelvesBridge.shelves else emptyList()
+        val effectiveShelves =
+            if (customShelves.isEmpty()) {
+                baseShelves
+            } else if (baseShelves.firstOrNull()?.style == HomeShelfStyle.SPEED_DIAL) {
+                listOf(baseShelves.first()) + customShelves + baseShelves.drop(1)
+            } else {
+                customShelves + baseShelves
+            }
 
         DragScrollableColumn(
             state = listState,
