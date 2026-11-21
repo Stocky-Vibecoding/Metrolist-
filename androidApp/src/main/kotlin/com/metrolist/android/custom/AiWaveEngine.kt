@@ -62,7 +62,7 @@ class AiWaveEngine(
 
     fun recordLike(song: SongItem) {
         val artist = song.artists.joinToString(", ") { it.name }.trim()
-        configStore.likeTrack(artist = artist, title = song.title)
+        configStore.likeTrack(artist = artist, title = song.title, songId = song.id)
         val key = CustomConfigStore.buildTrackKey(artist, song.title)
         sessionSkippedUntilMs.remove(key)
         sessionSkippedLabels.remove(key)
@@ -187,6 +187,7 @@ class AiWaveEngine(
         val moodHint =
             listOfNotNull(
                 cfg.waveMood.takeIf { it != WaveMood.ANY }?.label,
+                cfg.waveEra.takeIf { it != WaveEra.ANY }?.label,
                 cfg.waveCharacter.takeIf { it != WaveCharacter.DEFAULT }?.label,
             ).joinToString(", ").takeIf { it.isNotBlank() }
         return geminiClient.generateMascotLine(
@@ -209,6 +210,7 @@ class AiWaveEngine(
             } else {
                 appendLine("Собери персональную музыкальную волну для пользователя.")
                 appendLine("Характер волны: ${cfg.waveCharacter.promptHint}.")
+                appendLine("Эпоха: ${cfg.waveEra.promptHint}.")
                 appendLine("Язык: ${cfg.waveLanguage.promptHint}.")
                 appendLine("Настроение: ${cfg.waveMood.promptHint}.")
             }
@@ -303,6 +305,14 @@ class AiWaveEngine(
                         val art = entry.song.artists.joinToString(", ") { it.name }.trim()
                         val title = entry.song.title.trim()
                         if (title.isNotBlank()) entries += if (art.isNotBlank()) "$art - $title" else title
+                    }
+                }
+            }
+
+            if (entries.size < 8 && cfg.likedTracksBackup.isNotEmpty()) {
+                cfg.likedTracksBackup.take(12).forEach { liked ->
+                    if (liked.title.isNotBlank()) {
+                        entries += if (liked.artist.isNotBlank()) "${liked.artist} - ${liked.title}" else liked.title
                     }
                 }
             }
