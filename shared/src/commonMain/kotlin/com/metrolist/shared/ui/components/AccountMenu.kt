@@ -31,6 +31,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.ripple
@@ -94,6 +95,12 @@ import kotlinx.coroutines.delay
 import org.jetbrains.compose.resources.stringResource
 import kotlin.time.Duration.Companion.milliseconds
 import androidx.compose.ui.window.Popup as PlatformPopup
+
+object LocalProfileBridge {
+    var localName by mutableStateOf("Локальный профиль")
+    var localModeEnabled by mutableStateOf(true)
+    var onUpdateLocalName: ((String) -> Unit)? = null
+}
 
 @Composable
 fun AccountMenu(
@@ -236,6 +243,10 @@ internal fun AccountMenuContent(
 ) {
     val colorScheme = MaterialTheme.colorScheme
     var showLogoutDialog by remember { mutableStateOf(false) }
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var draftLocalName by remember(LocalProfileBridge.localName) { mutableStateOf(LocalProfileBridge.localName) }
+
+    val useLocalProfile = !isSignedIn && LocalProfileBridge.localModeEnabled
     val showHistory = onNavigateToHistory != null
     val statisticsVisible = showStatistics && onNavigateToStatistics != null
 
@@ -246,47 +257,62 @@ internal fun AccountMenuContent(
         AccountMenuGroup(Modifier.expressiveEntrance(0)) {
             AccountMenuHero(
                 isSignedIn = isSignedIn,
-                accountName = accountName,
-                accountSubtitle = accountSubtitle,
+                useLocalProfile = useLocalProfile,
+                accountName = if (useLocalProfile) LocalProfileBridge.localName else accountName,
+                accountSubtitle = if (useLocalProfile) "Локальный профиль • нажми для имени" else accountSubtitle,
                 accountImageUrl = accountImageUrl,
                 onClick = {
-                    onDismiss(if (isSignedIn) onNavigateToSettings else onSignIn)
+                    if (useLocalProfile) {
+                        draftLocalName = LocalProfileBridge.localName
+                        showRenameDialog = true
+                    } else {
+                        onDismiss(if (isSignedIn) onNavigateToSettings else onSignIn)
+                    }
                 },
                 onAvatarClick = {
-                    onDismiss(if (isSignedIn) onSwitchChannel else onSignIn)
+                    if (useLocalProfile) {
+                        draftLocalName = LocalProfileBridge.localName
+                        showRenameDialog = true
+                    } else {
+                        onDismiss(if (isSignedIn) onSwitchChannel else onSignIn)
+                    }
                 },
                 onLogout = { showLogoutDialog = true },
                 isLoggingOut = isLoggingOut,
                 initialFocusRequester = initialFocusRequester,
                 focusModifier = focusModifier,
             )
-            val tokenInteraction = remember { MutableInteractionSource() }
-            val tokenPressed by tokenInteraction.collectIsPressedAsState()
-            val tokenShape = segmentedGroupShape(isFirst = false, isLast = true, pressed = tokenPressed)
+            val secondaryInteraction = remember { MutableInteractionSource() }
+            val secondaryPressed by secondaryInteraction.collectIsPressedAsState()
+            val secondaryShape = segmentedGroupShape(isFirst = false, isLast = true, pressed = secondaryPressed)
             Row(
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .heightIn(min = 48.dp)
-                        .then(focusModifier(tokenShape))
-                        .clip(tokenShape)
+                        .then(focusModifier(secondaryShape))
+                        .clip(secondaryShape)
                         .background(colorScheme.surfaceContainer)
-                        .clickable(interactionSource = tokenInteraction, indication = ripple(), role = Role.Button) {
-                            onDismiss(onTokenLogin)
+                        .clickable(interactionSource = secondaryInteraction, indication = ripple(), role = Role.Button) {
+                            onDismiss(if (useLocalProfile) onSignIn else onTokenLogin)
                         }.padding(horizontal = 16.dp, vertical = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
-                    MetrolistIcons.Outlined.Token,
+                    if (useLocalProfile) MetrolistIcons.Outlined.AccountCircle else MetrolistIcons.Outlined.Token,
                     contentDescription = null,
                     tint = colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(20.dp),
                 )
                 Text(
-                    stringResource(
-                        if (isSignedIn) Res.string.account_login_with_token_hint else Res.string.account_login_with_token,
-                    ),
+                    if (useLocalProfile) {
+                        "Войти в YouTube (необязательно)"
+                    } else {
+                        stringResource(
+                            if (isSignedIn) Res.string.account_login_with_token_hint else Res.string.account_login_with_token,
+                        )
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = colorScheme.onSurfaceVariant,
                 )
@@ -381,6 +407,40 @@ internal fun AccountMenuContent(
         }
     }
 
+    PopupVisibility(visible = showRenameDialog) {
+        AlertDialog(
+            onDismissRequest = { showRenameDialog = false },
+            title = { Text("Локальный профиль") },
+            text = {
+                OutlinedTextField(
+                    value = draftLocalName,
+                    onValueChange = { draftLocalName = it },
+                    label = { Text("Имя профиля") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val cleaned = draftLocalName.trim().ifBlank { "Локальный профиль" }
+                        LocalProfileBridge.localName = cleaned
+                        LocalProfileBridge.onUpdateLocalName?.invoke(cleaned)
+                        showRenameDialog = false
+                    },
+                    shapes = ButtonDefaults.shapes(),
+                ) {
+                    Text("Сохранить")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRenameDialog = false }, shapes = ButtonDefaults.shapes()) {
+                    Text(stringResource(Res.string.cancel))
+                }
+            },
+        )
+    }
+
     PopupVisibility(visible = showLogoutDialog) {
         AlertDialog(
             onDismissRequest = { showLogoutDialog = false },
@@ -450,6 +510,7 @@ private fun AccountMenuGroup(
 @Composable
 private fun AccountMenuHero(
     isSignedIn: Boolean,
+    useLocalProfile: Boolean,
     accountName: String?,
     accountSubtitle: String?,
     accountImageUrl: String?,
@@ -475,13 +536,19 @@ private fun AccountMenuHero(
         label = "accountHeroPress",
     )
     val title =
-        if (isSignedIn) {
-            accountName?.takeIf { it.isNotBlank() } ?: stringResource(Res.string.account_user_icon)
-        } else {
-            stringResource(Res.string.account_sign_in)
+        when {
+            isSignedIn || useLocalProfile ->
+                accountName?.takeIf { it.isNotBlank() } ?: stringResource(Res.string.account_user_icon)
+            else ->
+                stringResource(Res.string.account_sign_in)
         }
-    val subtitle = accountSubtitle?.takeIf { isSignedIn && it.isNotBlank() }
-    val avatarAction = stringResource(if (isSignedIn) Res.string.switch_youtube_channel else Res.string.account_sign_in)
+    val subtitle = accountSubtitle?.takeIf { (isSignedIn || useLocalProfile) && it.isNotBlank() }
+    val avatarAction =
+        if (useLocalProfile) {
+            "Изменить имя профиля"
+        } else {
+            stringResource(if (isSignedIn) Res.string.switch_youtube_channel else Res.string.account_sign_in)
+        }
     val avatarDescription = stringResource(Res.string.account_user_icon)
 
     Row(
