@@ -225,6 +225,7 @@ import com.metrolist.shared.ui.components.lyrics.LyricsContrastScrim
 import com.metrolist.shared.ui.components.lyrics.LyricsOffsetEditor
 import com.metrolist.shared.ui.components.playbackMarquee
 import com.metrolist.shared.ui.components.playerControlBlend
+import com.metrolist.shared.ui.components.playerInactiveControlContainerColor
 import com.metrolist.shared.ui.components.rememberBottomSheetState
 import com.metrolist.shared.ui.components.rememberTrackMarquee
 import com.metrolist.shared.ui.components.sheetBackContent
@@ -1321,7 +1322,10 @@ fun PlayerScreen(
                                     sleepTimerState = sleepTimerState,
                                     onShowSleepTimer = { showSleepTimerDialog = true },
                                     onShowLyricsMenu = { showLyricsMenu = true },
-                                    onOpenQueue = { queueSheetState.expandSoft() },
+                                    onOpenQueue = {
+                                        hapticManager.perform(HapticEvent.PRESS)
+                                        queueSheetState.expandSoft()
+                                    },
                                     onShowPlayerMenu = { showPlayerMenu = true },
                                     onIsLyricsVisibleChange = { visible -> viewModel.setLyricsVisible(visible) },
                                     onShareSong = { shareDisplayedSong() },
@@ -1368,7 +1372,10 @@ fun PlayerScreen(
                                     sleepTimerState = sleepTimerState,
                                     onShowSleepTimer = { showSleepTimerDialog = true },
                                     onShowLyricsMenu = { showLyricsMenu = true },
-                                    onOpenQueue = { queueSheetState.expandSoft() },
+                                    onOpenQueue = {
+                                        hapticManager.perform(HapticEvent.PRESS)
+                                        queueSheetState.expandSoft()
+                                    },
                                     onShowPlayerMenu = { showPlayerMenu = true },
                                     onIsLyricsVisibleChange = { visible -> viewModel.setLyricsVisible(visible) },
                                     onShareSong = { shareDisplayedSong() },
@@ -2119,12 +2126,12 @@ fun PlayerScreen(
                                                         shapes = IconButtonDefaults.shapes(shape = CircleShape),
                                                         colors =
                                                             IconButtonDefaults.filledIconButtonColors(
-                                                                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                                                                contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                                containerColor = playerInactiveControlContainerColor(),
+                                                                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
                                                             ),
                                                         modifier = Modifier.size(40.dp).playerControlBlend(),
                                                     ) {
-                                                        val tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                                        val tint = MaterialTheme.colorScheme.onSecondaryContainer
                                                         Canvas(modifier = Modifier.size(18.dp)) {
                                                             val strokePx = 1.8.dp.toPx()
                                                             val r = size.minDimension / 2f - strokePx
@@ -2424,7 +2431,10 @@ fun PlayerScreen(
                                             repeatMode = repeatMode,
                                             onToggleRepeat = viewModel::toggleRepeat,
                                             navigationBarBottomPadding = navigationBarBottomPadding,
-                                            onOpenQueue = { queueSheetState.expandSoft() },
+                                            onOpenQueue = {
+                                                hapticManager.perform(HapticEvent.PRESS)
+                                                queueSheetState.expandSoft()
+                                            },
                                             onShowPlayerMenu = { showPlayerMenu = true },
                                             isLyricsVisible = uiState.isLyricsVisible,
                                             onIsLyricsVisibleChange = { visible -> viewModel.setLyricsVisible(visible) },
