@@ -5,10 +5,12 @@ import android.net.Uri
 import android.util.Log
 import com.metrolist.innertubex.extraction.AudioQuality
 import com.metrolist.innertubex.extraction.ContentHints
+import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.model.isLive
 import com.metrolist.shared.model.isPodcast
 import com.metrolist.shared.playback.PlaybackFailureCategory
+import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.youtube.playback.PlaybackNetworkState
 import com.metrolist.shared.youtube.playback.PlaybackResource
 import com.metrolist.shared.youtube.playback.StreamResolver
@@ -142,7 +144,6 @@ object CustomMediaCacheManager {
 
         ioScope.launch {
             try {
-                // Если трек уже лежит в кэше волны — просто копируем его в скачанное мгновенно
                 val waveDir = waveCacheDir
                 if (waveDir != null) {
                     val cachedAudio = File(waveDir, "$safe.audio")
@@ -565,6 +566,7 @@ class HybridStreamResolver(
     private val vkVariantIndexByVideo = ConcurrentHashMap<String, Int>()
     private val bypassAudioCacheIds = ConcurrentHashMap.newKeySet<String>()
     private val bypassAudioCacheKeys = ConcurrentHashMap.newKeySet<String>()
+    private val externalToYouTubeId = ConcurrentHashMap<String, String>()
 
     init {
         activeInstance = this
@@ -577,9 +579,9 @@ class HybridStreamResolver(
         sourceSong: SongItem?,
     ): PlaybackResource {
         tryResolveCustom(videoId, sourceSong)?.let { return it }
-        val fallback = delegate.resolve(videoId, hints, audioQuality, sourceSong)
-        recordYtmFallback(videoId, sourceSong, fallback)
-        return fallback
+        return resolveViaDelegate(videoId, sourceSong) { ytId, ytSong ->
+            delegate.resolve(ytId, hints, audioQuality, ytSong)
+        }
     }
 
     override suspend fun refresh(
@@ -590,9 +592,9 @@ class HybridStreamResolver(
     ): PlaybackResource {
         preResolvedCache.remove(videoId)
         tryResolveCustom(videoId, sourceSong, allowPreResolvedCache = false)?.let { return it }
-        val fallback = delegate.refresh(videoId, hints, audioQuality, sourceSong)
-        recordYtmFallback(videoId, sourceSong, fallback)
-        return fallback
+        return resolveViaDelegate(videoId, sourceSong) { ytId, ytSong ->
+            delegate.refresh(ytId, hints, audioQuality, ytSong)
+        }
     }
 
     override suspend fun resolveRemote(
@@ -605,9 +607,77 @@ class HybridStreamResolver(
     ): PlaybackResource {
         if (refresh) preResolvedCache.remove(videoId)
         tryResolveCustom(videoId, sourceSong, excludedProfiles, allowPreResolvedCache = !refresh)?.let { return it }
-        val fallback = delegate.resolveRemote(videoId, hints, audioQuality, sourceSong, refresh, excludedProfiles)
-        recordYtmFallback(videoId, sourceSong, fallback)
-        return fallback
+        return resolveViaDelegate(videoId, sourceSong) { ytId, ytSong ->
+            delegate.resolveRemote(ytId, hints, audioQuality, ytSong, refresh, excludedProfiles)
+        }
+    }
+
+    private suspend fun resolveViaDelegate(
+        videoId: String,
+        sourceSong: SongItem?,
+        call: suspend (ytVideoId: String, ytSong: SongItem?) -> PlaybackResource,
+    ): PlaybackResource {
+        if (!isExternalCatalogId(videoId)) {
+            val fallback = call(videoId, sourceSong)
+            recordYtmFallback(videoId, sourceSong, fallback)
+            return fallback
+        }
+
+        val ytId =
+            resolveYouTubeFallbackId(videoId, sourceSong)
+                ?: throw IllegalStateException("Трек не найден в Я.Музыке, VK и YouTube")
+        val fallback = call(ytId, sourceSong?.copy(id = ytId))
+        val aligned = if (fallback.videoId == videoId) fallback else fallback.copy(videoId = videoId)
+        recordYtmFallback(videoId, sourceSong, aligned)
+        return aligned
+    }
+
+    private fun isExternalCatalogId(videoId: String): Boolean =
+        videoId.startsWith("ym_") || videoId.startsWith("vk_")
+
+    private suspend fun resolveYouTubeFallbackId(
+        externalId: String,
+        song: SongItem?,
+    ): String? {
+        externalToYouTubeId[externalId]?.let { return it }
+        if (song == null) return null
+        val artist = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
+        val title = (song.canonicalTitle ?: song.title).trim()
+        val query = listOf(artist, title).filter { it.isNotBlank() }.joinToString(" ").trim()
+        if (query.isBlank()) return null
+
+        val foundId =
+            runCatching {
+                val page =
+                    GlobalYouTubeRepository.instance.searchFiltered(
+                        query = query,
+                        filter = SearchFilter.SONG,
+                        allowOfflineFallback = false,
+                    )
+                val candidates = page.items.filterIsInstance<SongItem>().filter { !it.isUnavailable && it.id.isNotBlank() }
+                candidates
+                    .mapNotNull { cand ->
+                        val candArtist = cand.artists.joinToString(", ") { it.name }.trim()
+                        val score =
+                            TrackMatcher.matchScore(
+                                targetArtist = artist,
+                                targetTitle = title,
+                                targetDurationSec = song.duration,
+                                candidateArtist = candArtist,
+                                candidateTitle = cand.title,
+                                candidateDurationSec = cand.duration,
+                            )
+                        if (score >= 45) cand.id to score else null
+                    }.maxByOrNull { it.second }
+                    ?.first
+                    ?: candidates.firstOrNull()?.id
+            }.getOrNull()
+
+        if (!foundId.isNullOrBlank()) {
+            if (externalToYouTubeId.size > 400) externalToYouTubeId.clear()
+            externalToYouTubeId[externalId] = foundId
+        }
+        return foundId
     }
 
     private fun invalidateTrackInternal(
@@ -715,7 +785,7 @@ class HybridStreamResolver(
         }
 
         val cfg = configStore.current
-        if (!cfg.hybridResolverEnabled) return null
+        if (!cfg.hybridResolverEnabled && !isExternalCatalogId(videoId)) return null
         if (cfg.yandexToken.isBlank() && cfg.vkToken.isBlank()) return null
 
         val failed = failedProvidersByVideo[videoId].orEmpty()
@@ -763,12 +833,12 @@ class HybridStreamResolver(
             when {
                 manualPref == TrackSourcePreference.YANDEX -> listOf("yandex") to "ручной выбор"
                 manualPref == TrackSourcePreference.VK -> listOf("vk") to "ручной выбор"
-                videoId.startsWith("vk_") -> listOf("vk", "yandex") to "каталог VK"
-                videoId.startsWith("ym_") -> listOf("yandex", "vk") to "каталог Яндекса"
                 (reference.isExplicit || localCensored) && cfg.preferVkForExplicit && cfg.vkToken.isNotBlank() -> {
                     val tag = if (localCensored) "антицензура → VK" else "Explicit → VK"
                     listOf("vk", "yandex") to tag
                 }
+                videoId.startsWith("vk_") -> listOf("vk", "yandex") to "каталог VK"
+                videoId.startsWith("ym_") -> listOf("yandex", "vk") to "каталог Яндекса"
                 else -> listOf("yandex", "vk") to "автокаскад"
             }
 
@@ -865,7 +935,10 @@ class HybridStreamResolver(
 
     override suspend fun clearPlaybackFailures(videoId: String) {
         failedProvidersByVideo.remove(videoId)
-        delegate.clearPlaybackFailures(videoId)
+        val delegateId = externalToYouTubeId[videoId] ?: videoId
+        if (!isExternalCatalogId(delegateId)) {
+            delegate.clearPlaybackFailures(delegateId)
+        }
     }
 
     override suspend fun invalidateNetworkScope(state: PlaybackNetworkState) {
@@ -910,7 +983,10 @@ class HybridStreamResolver(
             failedProvidersByVideo.getOrPut(videoId) { ConcurrentHashMap.newKeySet() }.add(clientName)
             return
         }
-        delegate.reportPlaybackFailure(videoId, clientName, responseCode, profileId, hints, category)
+        val delegateId = externalToYouTubeId[videoId] ?: videoId
+        if (!isExternalCatalogId(delegateId)) {
+            delegate.reportPlaybackFailure(delegateId, clientName, responseCode, profileId, hints, category)
+        }
     }
 
     override suspend fun reportPlaybackSuccess(
