@@ -1260,13 +1260,13 @@ private fun TopResultCard(
                         Column(
                             modifier =
                                 Modifier
-                                    .weight(0.47f)
+                                    .weight(0.48f)
                                     .fillMaxHeight()
                                     .clip(RoundedCornerShape(uiEnhanced(6.dp, 12.dp)))
                                     .clickable {
                                         CollectionPreviews.record(mainItem)
                                         onItemClick(mainItem)
-                                    }.padding(16.dp),
+                                    }.padding(12.dp),
                             verticalArrangement = Arrangement.Center,
                         ) {
                             Row(
@@ -1276,7 +1276,7 @@ private fun TopResultCard(
                                 Box(
                                     modifier =
                                         Modifier
-                                            .size(if (isWide) 112.dp else 84.dp)
+                                            .size(if (isWide) 108.dp else 80.dp)
                                             .clip(artistArtworkShape(mainItem.id))
                                             .background(MaterialTheme.colorScheme.secondaryContainer),
                                     contentAlignment = Alignment.Center,
@@ -1289,7 +1289,7 @@ private fun TopResultCard(
                                         )
                                     }
                                 }
-                                Spacer(Modifier.width(16.dp))
+                                Spacer(Modifier.width(14.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
                                         text = mainItem.displayTitle,
@@ -1313,7 +1313,7 @@ private fun TopResultCard(
                                     )
                                 }
                             }
-                            Spacer(Modifier.height(16.dp))
+                            Spacer(Modifier.height(14.dp))
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1322,23 +1322,23 @@ private fun TopResultCard(
                                     onClick = { onShuffleClick(mainItem) },
                                     modifier =
                                         Modifier
-                                            .weight(1.2f)
-                                            .height(44.dp),
+                                            .weight(1.35f)
+                                            .height(42.dp),
                                     shape = CircleShape,
                                     color = MaterialTheme.colorScheme.primary,
                                     contentColor = MaterialTheme.colorScheme.onPrimary,
                                 ) {
                                     Row(
-                                        modifier = Modifier.fillMaxSize().padding(horizontal = 10.dp),
+                                        modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.Center,
                                     ) {
                                         Icon(
                                             MetrolistIcons.Rounded.Shuffle,
                                             contentDescription = null,
-                                            modifier = Modifier.size(18.dp),
+                                            modifier = Modifier.size(17.dp),
                                         )
-                                        Spacer(Modifier.width(6.dp))
+                                        Spacer(Modifier.width(5.dp))
                                         Text(
                                             text.shuffle,
                                             style = MaterialTheme.typography.labelLarge,
@@ -1354,7 +1354,7 @@ private fun TopResultCard(
                                     modifier =
                                         Modifier
                                             .weight(0.85f)
-                                            .height(44.dp),
+                                            .height(42.dp),
                                     shape = CircleShape,
                                     color = MaterialTheme.colorScheme.surfaceVariant,
                                     contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1365,16 +1365,16 @@ private fun TopResultCard(
                                         ),
                                 ) {
                                     Row(
-                                        modifier = Modifier.fillMaxSize().padding(horizontal = 10.dp),
+                                        modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.Center,
                                     ) {
                                         Icon(
                                             MetrolistIcons.Outlined.Sensors,
                                             contentDescription = null,
-                                            modifier = Modifier.size(18.dp),
+                                            modifier = Modifier.size(17.dp),
                                         )
-                                        Spacer(Modifier.width(6.dp))
+                                        Spacer(Modifier.width(5.dp))
                                         Text(
                                             text.mix,
                                             style = MaterialTheme.typography.labelLarge,
@@ -1394,7 +1394,7 @@ private fun TopResultCard(
                         Column(
                             modifier =
                                 Modifier
-                                    .weight(0.53f)
+                                    .weight(0.52f)
                                     .fillMaxHeight()
                                     .padding(8.dp),
                             verticalArrangement = Arrangement.spacedBy(2.dp),
