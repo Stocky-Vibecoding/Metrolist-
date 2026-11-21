@@ -1,16 +1,24 @@
 package com.metrolist.android.custom
 
 import android.util.Log
+import com.metrolist.shared.model.ArtistTiny
 import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
+import com.metrolist.shared.ui.screens.CustomHomeShelvesBridge
+import com.metrolist.shared.ui.screens.HomeShelf
+import com.metrolist.shared.ui.screens.HomeShelfHeaderAction
+import com.metrolist.shared.ui.screens.HomeShelfStyle
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -26,7 +34,30 @@ data class ExternalCatalogTrack(
     val durationSec: Long? = null,
     val coverUrl: String? = null,
     val isExplicit: Boolean = false,
-)
+) {
+    fun toSongItem(): SongItem {
+        val parsedArtists =
+            artist
+                .split(",", "&")
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .map { ArtistTiny(id = null, name = it) }
+                .ifEmpty { listOf(ArtistTiny(id = null, name = "Неизвестный")) }
+        val safeId =
+            externalId.ifBlank {
+                "${source}_${TrackMatcher.normalize(artist)}_${TrackMatcher.normalize(title)}".take(64)
+            }
+        return SongItem(
+            id = safeId,
+            title = title,
+            thumbnail = coverUrl,
+            artists = parsedArtists,
+            album = null,
+            duration = durationSec,
+            isExplicit = isExplicit,
+        )
+    }
+}
 
 data class LibraryImportProgress(
     val message: String,
@@ -45,6 +76,57 @@ data class LibraryImportSummary(
 class CustomCatalogProvider(
     private val configStore: CustomConfigStore,
 ) {
+    suspend fun loadHomeShelves(): List<HomeShelf> =
+        coroutineScope {
+            val chartTask = async { fetchYandexChart(24) }
+            val releasesTask = async { fetchYandexNewReleases(16) }
+            val vkPopularTask = async { fetchVkPopular(24) }
+
+            val chartSongs = chartTask.await().map { it.toSongItem() }.distinctBy { it.id }
+            val releaseSongs = releasesTask.await().map { it.toSongItem() }.distinctBy { it.id }
+            val vkSongs = vkPopularTask.await().map { it.toSongItem() }.distinctBy { it.id }
+
+            buildList {
+                if (chartSongs.isNotEmpty()) {
+                    add(
+                        HomeShelf(
+                            key = "custom_ym_chart_rf",
+                            title = "Чарт Я.Музыки • Топ РФ",
+                            items = chartSongs,
+                            style = HomeShelfStyle.SONG_GRID,
+                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                            rows = 4,
+                            compactRows = true,
+                        ),
+                    )
+                }
+                if (releaseSongs.isNotEmpty()) {
+                    add(
+                        HomeShelf(
+                            key = "custom_ym_new_releases",
+                            title = "Новые релизы • Я.Музыка",
+                            items = releaseSongs,
+                            style = HomeShelfStyle.CAROUSEL,
+                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                        ),
+                    )
+                }
+                if (vkSongs.isNotEmpty()) {
+                    add(
+                        HomeShelf(
+                            key = "custom_vk_popular",
+                            title = "Популярное в VK",
+                            items = vkSongs,
+                            style = HomeShelfStyle.SONG_GRID,
+                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                            rows = 4,
+                            compactRows = true,
+                        ),
+                    )
+                }
+            }
+        }
+
     suspend fun importYandexLikes(
         syncToLibraryLimit: Int,
         onProgress: (LibraryImportProgress) -> Unit,
@@ -312,7 +394,7 @@ class CustomCatalogProvider(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (err: Exception) {
-            Log.d(TAG, "Match failed for $query:${err.message}")
+            Log.d(TAG, "Match failed for $query: ${err.message}")
             null
         }
     }
@@ -419,7 +501,7 @@ class CustomCatalogProvider(
                         if (code == 5) {
                             error("Токен ВК истёк (#5)")
                         }
-                        lastErr = "VK #$code:$msg"
+                        lastErr = "VK #$code: $msg"
                         continue
                     }
 
@@ -570,6 +652,45 @@ class CustomCatalogProvider(
         private const val YANDEX_UA = "Yandex-Music-API"
         private const val KATE_UA =
             "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
+        private const val HOME_SHELVES_TTL_MS = 20 * 60 * 1_000L
+
+        private val homeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        @Volatile
+        private var lastLoadedAtMs: Long = 0L
+
+        @Volatile
+        private var isHomeLoading: Boolean = false
+
+        fun bindHomeShelvesBridge(configStore: CustomConfigStore) {
+            val provider = CustomCatalogProvider(configStore)
+            CustomHomeShelvesBridge.onRefreshRequested = { force ->
+                val now = System.currentTimeMillis()
+                val stale = CustomHomeShelvesBridge.shelves.isEmpty() || now - lastLoadedAtMs > HOME_SHELVES_TTL_MS
+                if ((force || stale) && !isHomeLoading) {
+                    isHomeLoading = true
+                    CustomHomeShelvesBridge.isLoading = true
+                    homeScope.launch {
+                        try {
+                            val loaded = provider.loadHomeShelves()
+                            if (loaded.isNotEmpty()) {
+                                withContext(Dispatchers.Main) {
+                                    CustomHomeShelvesBridge.shelves = loaded
+                                }
+                                lastLoadedAtMs = System.currentTimeMillis()
+                            }
+                        } catch (err: Exception) {
+                            Log.w(TAG, "Failed to load RF home shelves: ${err.message}")
+                        } finally {
+                            isHomeLoading = false
+                            withContext(Dispatchers.Main) {
+                                CustomHomeShelvesBridge.isLoading = false
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         private fun yandexApiBase(): String =
             "https://" + listOf("api", "music", "yandex", "net").joinToString(".")
