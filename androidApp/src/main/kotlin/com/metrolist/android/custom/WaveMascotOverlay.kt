@@ -11,17 +11,16 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -76,14 +75,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -138,47 +138,11 @@ fun WaveHomeScreen(
     val likedIds by SongLikeState.likedSongIdsForDisplay.collectAsState(initial = SongLikeState.likedSongIds)
     val isCurrentLiked = currentSong?.id?.let { it in likedIds } == true
 
-    var bassEnergy by remember { mutableFloatStateOf(0f) }
-    var beatKick by remember { mutableFloatStateOf(0f) }
     var mascotPhrase by remember { mutableStateOf<String?>(null) }
     var lastPhraseSongId by remember { mutableStateOf<String?>(null) }
     var showWaveSettingsSheet by remember { mutableStateOf(false) }
     var showEngineSettingsSheet by remember { mutableStateOf(false) }
     var showSourcePickerSheet by remember { mutableStateOf(false) }
-
-    LaunchedEffect(isPlaying) {
-        if (!isPlaying) {
-            while (isActive) {
-                bassEnergy = (bassEnergy * 0.85f).coerceAtLeast(0f)
-                beatKick = (beatKick * 0.80f).coerceAtLeast(0f)
-                if (bassEnergy < 0.01f && beatKick < 0.01f) break
-                delay(32L)
-            }
-            return@LaunchedEffect
-        }
-        com.metrolist.shared.equalizer.AudioSpectrumMeter.addConsumer()
-        var avgBass = 0.15f
-        try {
-            while (isActive) {
-                val levels = com.metrolist.shared.equalizer.AudioSpectrumMeter.levels()
-                val rawBass =
-                    (
-                        (levels.getOrElse(0) { 0f } * 0.45f) +
-                            (levels.getOrElse(1) { 0f } * 0.35f) +
-                            (levels.getOrElse(2) { 0f } * 0.20f)
-                    ).coerceIn(0f, 1f)
-                bassEnergy = if (rawBass > bassEnergy) rawBass else (bassEnergy * 0.78f + rawBass * 0.22f)
-
-                val delta = (rawBass - avgBass).coerceAtLeast(0f)
-                avgBass = avgBass * 0.90f + rawBass * 0.10f
-                val kickNow = (delta * 3.2f).coerceIn(0f, 1f)
-                beatKick = if (kickNow > beatKick) kickNow else (beatKick * 0.76f)
-                delay(32L)
-            }
-        } finally {
-            com.metrolist.shared.equalizer.AudioSpectrumMeter.removeConsumer()
-        }
-    }
 
     LaunchedEffect(currentSong?.id, isPlaying) {
         val song = currentSong
@@ -209,18 +173,39 @@ fun WaveHomeScreen(
     }
 
     fun launchFreshWave() {
+        val conn = playerConnection ?: return
+        val starter = aiWaveEngine.buildInstantStarterSongs(excludeIds = setOfNotNull(currentSong?.id))
+        val startedInstant =
+            if (starter.isNotEmpty()) {
+                conn.playQueue(
+                    songs = starter,
+                    queueTitle = "Моя волна",
+                    finite = false,
+                    forceStartPlaying = true,
+                )
+                true
+            } else {
+                false
+            }
+
         scope.launch {
             aiWaveEngine
-                .generateWaveSongs()
-                .onSuccess { songs ->
-                    playerConnection?.playQueue(
-                        songs = songs,
-                        queueTitle = "Моя волна",
-                        finite = false,
-                        forceStartPlaying = true,
-                    )
+                .generateWaveSongs(backgroundLabel = startedInstant)
+                .onSuccess { fresh ->
+                    if (startedInstant && conn.queueTitle.value?.startsWith("Моя волна") == true) {
+                        conn.replaceUpcomingWaveQueue(fresh)
+                    } else {
+                        conn.playQueue(
+                            songs = fresh,
+                            queueTitle = "Моя волна",
+                            finite = false,
+                            forceStartPlaying = true,
+                        )
+                    }
                 }.onFailure { err ->
-                    Toast.makeText(context, err.message ?: "Не удалось запустить волну", Toast.LENGTH_SHORT).show()
+                    if (!startedInstant) {
+                        Toast.makeText(context, err.message ?: "Не удалось запустить волну", Toast.LENGTH_SHORT).show()
+                    }
                 }
         }
     }
@@ -301,6 +286,7 @@ fun WaveHomeScreen(
                 ) {
                     ActiveExternalContextPill(
                         label = activeContextLabel,
+                        onOpenContext = onExpandPlayer,
                         onResetToWave = ::launchFreshWave,
                     )
                 }
@@ -374,9 +360,8 @@ fun WaveHomeScreen(
                         AmbientWaveButton(
                             isPlaying = isPlaying,
                             isGenerating = isGenerating,
-                            bassEnergy = bassEnergy,
-                            beatKick = beatKick,
-                            size = 240.dp,
+                            showMascot = cfg.mascotEnabled,
+                            size = 244.dp,
                             onClick = ::startOrToggleWave,
                         )
                     }
@@ -399,9 +384,8 @@ fun WaveHomeScreen(
                     AmbientWaveButton(
                         isPlaying = isPlaying,
                         isGenerating = isGenerating,
-                        bassEnergy = bassEnergy,
-                        beatKick = beatKick,
-                        size = 248.dp,
+                        showMascot = cfg.mascotEnabled,
+                        size = 252.dp,
                         onClick = ::startOrToggleWave,
                     )
 
@@ -524,19 +508,19 @@ fun WaveHomeScreen(
 @Composable
 private fun ActiveExternalContextPill(
     label: String,
+    onOpenContext: () -> Unit,
     onResetToWave: () -> Unit,
 ) {
     Surface(
-        onClick = onResetToWave,
         shape = RoundedCornerShape(999.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
     ) {
         Row(
-            modifier = Modifier.padding(start = 14.dp, end = 8.dp, top = 6.dp, bottom = 6.dp).widthIn(max = 320.dp),
+            modifier = Modifier.padding(start = 4.dp, end = 6.dp, top = 4.dp, bottom = 4.dp).widthIn(max = 320.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Text(
                 text = label,
@@ -545,13 +529,19 @@ private fun ActiveExternalContextPill(
                 color = MaterialTheme.colorScheme.primary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
+                modifier =
+                    Modifier
+                        .weight(1f, fill = false)
+                        .clip(RoundedCornerShape(999.dp))
+                        .clickable(onClick = onOpenContext)
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
             )
             Surface(
+                onClick = onResetToWave,
                 shape = CircleShape,
                 color = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.size(22.dp),
+                modifier = Modifier.size(26.dp),
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     val crossColor = MaterialTheme.colorScheme.onPrimary
@@ -615,8 +605,7 @@ private fun ReturnToWavePillButton(
 private fun AmbientWaveButton(
     isPlaying: Boolean,
     isGenerating: Boolean,
-    bassEnergy: Float,
-    beatKick: Float,
+    showMascot: Boolean,
     size: Dp,
     onClick: () -> Unit,
 ) {
@@ -625,26 +614,58 @@ private fun AmbientWaveButton(
     val containerColor = MaterialTheme.colorScheme.primaryContainer
     val onContainerColor = MaterialTheme.colorScheme.onPrimaryContainer
 
-    val pulse = bassEnergy.coerceIn(0f, 1f)
-    val kick = beatKick.coerceIn(0f, 1f)
+    val bassEnergy = remember { mutableFloatStateOf(0f) }
+    val beatKick = remember { mutableFloatStateOf(0f) }
+
+    LaunchedEffect(isPlaying) {
+        if (!isPlaying) {
+            while (isActive) {
+                bassEnergy.floatValue = (bassEnergy.floatValue * 0.85f).coerceAtLeast(0f)
+                beatKick.floatValue = (beatKick.floatValue * 0.80f).coerceAtLeast(0f)
+                if (bassEnergy.floatValue < 0.01f && beatKick.floatValue < 0.01f) break
+                delay(33L)
+            }
+            return@LaunchedEffect
+        }
+        com.metrolist.shared.equalizer.AudioSpectrumMeter.addConsumer()
+        var avgBass = 0.15f
+        try {
+            while (isActive) {
+                val levels = com.metrolist.shared.equalizer.AudioSpectrumMeter.levels()
+                val rawBass =
+                    (
+                        (levels.getOrElse(0) { 0f } * 0.45f) +
+                            (levels.getOrElse(1) { 0f } * 0.35f) +
+                            (levels.getOrElse(2) { 0f } * 0.20f)
+                    ).coerceIn(0f, 1f)
+                bassEnergy.floatValue =
+                    if (rawBass > bassEnergy.floatValue) rawBass else (bassEnergy.floatValue * 0.78f + rawBass * 0.22f)
+
+                val delta = (rawBass - avgBass).coerceAtLeast(0f)
+                avgBass = avgBass * 0.90f + rawBass * 0.10f
+                val kickNow = (delta * 3.2f).coerceIn(0f, 1f)
+                beatKick.floatValue = if (kickNow > beatKick.floatValue) kickNow else (beatKick.floatValue * 0.76f)
+                delay(33L)
+            }
+        } finally {
+            com.metrolist.shared.equalizer.AudioSpectrumMeter.removeConsumer()
+        }
+    }
 
     val infiniteTransition = rememberInfiniteTransition(label = "waveAmbient")
-    val idleBreath by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec =
-            infiniteRepeatable(
-                animation = tween(durationMillis = 3200, easing = FastOutSlowInEasing),
-                repeatMode = RepeatMode.Reverse,
-            ),
-        label = "idleBreath",
-    )
+    val idleBreathState =
+        infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec =
+                infiniteRepeatable(
+                    animation = tween(durationMillis = 3200, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+            label = "idleBreath",
+        )
 
-    val centerScale by animateFloatAsState(
-        targetValue = if (isPlaying) 1f + pulse * 0.06f + kick * 0.04f else 1f,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
-        label = "centerScale",
-    )
+    val mascotResId = if (showMascot) CustomMascotAssets.drawableResId else 0
 
     Box(
         contentAlignment = Alignment.Center,
@@ -653,7 +674,9 @@ private fun AmbientWaveButton(
         Canvas(modifier = Modifier.fillMaxSize()) {
             val center = Offset(this.size.width / 2f, this.size.height / 2f)
             val maxR = this.size.minDimension / 2f
-            val energy = if (isPlaying) pulse else idleBreath * 0.28f
+            val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
+            val kick = beatKick.floatValue.coerceIn(0f, 1f)
+            val energy = if (isPlaying) pulse else idleBreathState.value * 0.28f
 
             val outerR = maxR * (0.78f + energy * 0.18f + kick * 0.06f)
             drawCircle(
@@ -661,7 +684,7 @@ private fun AmbientWaveButton(
                     Brush.radialGradient(
                         colors =
                             listOf(
-                                primaryColor.copy(alpha = (0.34f + energy * 0.28f + kick * 0.12f).coerceIn(0f, 0.72f)),
+                                primaryColor.copy(alpha = (0.36f + energy * 0.30f + kick * 0.12f).coerceIn(0f, 0.76f)),
                                 tertiaryColor.copy(alpha = (0.14f + energy * 0.16f).coerceIn(0f, 0.42f)),
                                 Color.Transparent,
                             ),
@@ -672,7 +695,7 @@ private fun AmbientWaveButton(
                 center = center,
             )
 
-            val innerR = maxR * (0.50f + energy * 0.12f)
+            val innerR = maxR * (0.52f + energy * 0.12f)
             drawCircle(
                 brush =
                     Brush.radialGradient(
@@ -691,19 +714,47 @@ private fun AmbientWaveButton(
 
         Surface(
             onClick = onClick,
-            enabled = !isGenerating,
             shape = CircleShape,
             color = containerColor.copy(alpha = 0.92f),
             contentColor = onContainerColor,
             tonalElevation = 6.dp,
             shadowElevation = 10.dp,
-            border = BorderStroke(1.dp, primaryColor.copy(alpha = 0.35f)),
-            modifier = Modifier.size(112.dp).scale(centerScale),
+            border = BorderStroke(1.5.dp, primaryColor.copy(alpha = 0.45f)),
+            modifier =
+                Modifier
+                    .size(if (mascotResId != 0) 136.dp else 112.dp)
+                    .graphicsLayer {
+                        val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
+                        val kick = beatKick.floatValue.coerceIn(0f, 1f)
+                        val s =
+                            if (isPlaying) {
+                                1f + pulse * 0.06f + kick * 0.045f
+                            } else {
+                                1f + idleBreathState.value * 0.02f
+                            }
+                        scaleX = s
+                        scaleY = s
+                    },
         ) {
             Box(contentAlignment = Alignment.Center) {
-                if (isGenerating) {
+                if (mascotResId != 0) {
+                    Image(
+                        painter = painterResource(id = mascotResId),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    Box(
+                        modifier =
+                            Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = if (isPlaying) 0.24f else 0.42f)),
+                    )
+                }
+
+                if (isGenerating && !isPlaying) {
                     CircularProgressIndicator(
-                        color = onContainerColor,
+                        color = if (mascotResId != 0) Color.White else onContainerColor,
                         strokeWidth = 3.dp,
                         modifier = Modifier.size(34.dp),
                     )
@@ -711,7 +762,8 @@ private fun AmbientWaveButton(
                     Icon(
                         imageVector = if (isPlaying) MetrolistIcons.Filled.Pause else MetrolistIcons.Filled.PlayArrow,
                         contentDescription = if (isPlaying) "Пауза" else "Запустить волну",
-                        modifier = Modifier.size(48.dp),
+                        tint = if (mascotResId != 0) Color.White else onContainerColor,
+                        modifier = Modifier.size(46.dp),
                     )
                 }
             }
@@ -809,7 +861,7 @@ private fun WaveBottomStatusAndPlayer(
     ) {
         val song = currentSong ?: return@AnimatedVisibility
         val artistLine = song.artists.joinToString(", ") { it.name }.trim()
-        val hdCover = ResolverDiagnostics.hdCoverFor(song.id) ?: song.thumbnail
+        val hdCover = ResolverDiagnostics.hdCoverFor(song.id) ?: song.thumbnail ?: CustomMascotAssets.fallbackCoverUri
 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Spacer(modifier = Modifier.height(18.dp))
@@ -1151,6 +1203,11 @@ fun CustomEngineSettingsContent(
             title = "Кэш волны (до 2 ГБ) и автоскачивание лайков",
             checked = cfg.cacheWaveAndDownloadLikes,
             onCheckedChange = { v -> configStore.update { it.copy(cacheWaveAndDownloadLikes = v) } },
+        )
+        SettingSwitchRow(
+            title = "Маскот в центре «Волны»",
+            checked = cfg.mascotEnabled,
+            onCheckedChange = { v -> configStore.update { it.copy(mascotEnabled = v) } },
         )
         SettingSwitchRow(
             title = "Открывать вкладку «Волна» при старте",
@@ -1586,16 +1643,19 @@ fun SearchAiPlaylistCard(
     aiWaveEngine: AiWaveEngine,
     onPlaySongs: (List<SongItem>, String) -> Unit,
     onEnqueueSongs: (List<SongItem>) -> Unit,
+    onSaveToLibrary: ((String, List<SongItem>) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     var isLoading by remember(query) { mutableStateOf(true) }
     var result by remember(query) { mutableStateOf<AiPlaylistResult?>(null) }
     var errorText by remember(query) { mutableStateOf<String?>(null) }
+    var savedToLibrary by remember(query) { mutableStateOf(false) }
 
     LaunchedEffect(query) {
         isLoading = true
         errorText = null
         result = null
+        savedToLibrary = false
         aiWaveEngine
             .generateCustomPlaylist(query)
             .onSuccess { built -> result = built }
@@ -1652,7 +1712,10 @@ fun SearchAiPlaylistCard(
 
                 result != null -> {
                     val songs = result!!.songs
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
                         Button(
                             onClick = { onPlaySongs(songs, result!!.query) },
                             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
@@ -1666,6 +1729,18 @@ fun SearchAiPlaylistCard(
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                         ) {
                             Text("В очередь")
+                        }
+                        if (onSaveToLibrary != null) {
+                            OutlinedButton(
+                                enabled = !savedToLibrary,
+                                onClick = {
+                                    onSaveToLibrary(result!!.query, songs)
+                                    savedToLibrary = true
+                                },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                            ) {
+                                Text(if (savedToLibrary) "Сохранено" else "В плейлисты")
+                            }
                         }
                     }
 
