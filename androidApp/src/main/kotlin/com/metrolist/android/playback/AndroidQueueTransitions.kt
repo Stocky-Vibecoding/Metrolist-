@@ -39,6 +39,18 @@ import kotlinx.coroutines.withContext
 import timber.log.Timber
 import kotlin.time.Duration.Companion.milliseconds
 
+internal const val DEFAULT_SMOOTH_CROSSFADE_MS = 3_000L
+internal const val MANUAL_SKIP_CROSSFADE_MS = 450L
+
+internal fun effectiveCrossfadeEnabled(): Boolean = true
+
+internal fun effectiveCrossfadeDurationMs(): Long =
+    if (Settings.shared.crossfadeEnabled) {
+        (Settings.shared.crossfadeDuration * 1_000f).toLong().coerceIn(1_000L, 12_000L)
+    } else {
+        DEFAULT_SMOOTH_CROSSFADE_MS
+    }
+
 internal class AndroidQueueTransitions(
     private val player: AndroidPlaybackPlayer,
     private val scope: CoroutineScope,
@@ -53,6 +65,7 @@ internal class AndroidQueueTransitions(
     companion object {
         private const val TAG = "MusicService"
         private const val NEXT_RENDER_WAIT_TIMEOUT_MS = 5_000L
+        private const val MANUAL_RENDER_WAIT_TIMEOUT_MS = 1_000L
     }
 
     private var nextTrackPreloadJob: Job? = null
@@ -82,7 +95,7 @@ internal class AndroidQueueTransitions(
     private var preCacheJob: Job? = null
 
     fun observe(sleepTimer: SleepTimerController) {
-        player.consumePreloadedNext = { consumePreloadedNext(player.currentPlaybackInstanceId) }
+        player.consumePreloadedNext = { startQuickManualCrossfadeOrSwap(player.currentPlaybackInstanceId) }
 
         scope.launch {
             nextTrackPreloadTriggers(
@@ -134,12 +147,13 @@ internal class AndroidQueueTransitions(
                 val current = player.currentSong.value
                 val isGapless =
                     Settings.shared.crossfadeGapless && songsShareAlbum(current, next)
+                val crossfadeActive = effectiveCrossfadeEnabled()
                 val crossfadeDurationMs =
                     playbackCrossfadeDurationMs(
-                        enabled = Settings.shared.crossfadeEnabled,
+                        enabled = crossfadeActive,
                         preserveSameAlbumGapless = Settings.shared.crossfadeGapless,
                         sameAlbum = isGapless,
-                        configuredDurationMs = (Settings.shared.crossfadeDuration * 1_000f).toLong().coerceAtLeast(1_000L),
+                        configuredDurationMs = effectiveCrossfadeDurationMs(),
                         outgoingDurationMs = duration,
                         incomingDurationMs = next.duration?.times(1_000L) ?: duration,
                     )
@@ -149,7 +163,7 @@ internal class AndroidQueueTransitions(
                         durationMs = duration,
                         crossfadeDurationMs = crossfadeDurationMs,
                         isPlaying = isPlaying,
-                        crossfadeEnabled = Settings.shared.crossfadeEnabled,
+                        crossfadeEnabled = crossfadeActive,
                         isCrossfading = isCrossfading,
                         repeatMode = queue.repeatMode.value,
                         isGapless = isGapless,
@@ -360,6 +374,98 @@ internal class AndroidQueueTransitions(
             nextTrackPreloadInvalidation.value++
         }
         player.cancelNext()
+    }
+
+    private fun startQuickManualCrossfadeOrSwap(completedPlaybackInstanceId: Long): Boolean {
+        if (isCrossfading) return false
+        val token = nextTrackPreloadToken ?: return false
+        val resource = nextTrackPreloadResource ?: return false
+        if (!isPreloadedPlaybackModeCurrent() || nextTrackPreloadExpectedInstanceId != completedPlaybackInstanceId ||
+            AndroidDeviceConnect.manager.remote.isActive || AndroidListenTogetherManager.isGuestPlaybackLocked
+        ) {
+            cancelNextTrackPreload()
+            return false
+        }
+        val nextSong = nextTrackPreloadSong ?: player.songQueue.value.firstOrNull { it.id == token.queueSongId } ?: return false
+        if (!player.isPreloadedPlaybackActive(token)) return false
+
+        // Пробуем запустить отдельный предзагруженный плеер для мягкого перехлёста 450 мс
+        player.setCrossfadeVolumes(100f, 0f)
+        if (!player.startNextPlayback()) {
+            player.setCrossfadeVolumes(100f, 0f)
+            return consumePreloadedNext(completedPlaybackInstanceId)
+        }
+
+        isCrossfading = true
+        crossfadeCompletionGuard.arm(completedPlaybackInstanceId)
+        crossfadeJob?.cancel()
+        crossfadeJob =
+            scope.launch {
+                val waitStart = SystemClock.elapsedRealtime()
+                while (
+                    isActive &&
+                    isPreloadedPlaybackModeCurrent() &&
+                    player.isPreloadedPlaybackActive(token) &&
+                    !player.isNextPlaybackRendering &&
+                    SystemClock.elapsedRealtime() - waitStart < MANUAL_RENDER_WAIT_TIMEOUT_MS
+                ) {
+                    delay(16L.milliseconds)
+                }
+                if (!isPreloadedPlaybackModeCurrent() || !player.isPreloadedPlaybackActive(token)) {
+                    crossfadeCompletionGuard.clear()
+                    player.setCrossfadeVolumes(100f, 0f)
+                    cancelNextTrackPreload(resetAttempt = false)
+                    isCrossfading = false
+                    crossfadeJob = null
+                    return@launch
+                }
+
+                crossfadeController.start(
+                    nextSong = nextSong,
+                    outgoingSong = player.currentSong.value,
+                    positionMs = player.nextPlaybackPositionMs,
+                    durationMs = player.nextPlaybackDurationMs,
+                )
+
+                val startedAt = SystemClock.elapsedRealtime()
+                while (isActive && isPreloadedPlaybackModeCurrent() && player.isPreloadedPlaybackActive(token)) {
+                    val elapsed = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)
+                    val progress = (elapsed.toFloat() / MANUAL_SKIP_CROSSFADE_MS.toFloat()).coerceIn(0f, 1f)
+                    val (outgoingGain, incomingGain) = playbackCrossfadeGains(progress)
+                    player.setCrossfadeVolumes(outgoingGain * 100f, incomingGain * 100f)
+                    crossfadeController.update(
+                        progress = progress,
+                        positionMs = player.nextPlaybackPositionMs,
+                        durationMs = player.nextPlaybackDurationMs,
+                    )
+                    if (progress >= 1f) break
+                    delay(16L.milliseconds)
+                }
+
+                crossfadeController.complete()
+                if (
+                    completedPlaybackInstanceId == player.currentPlaybackInstanceId &&
+                    isPreloadedPlaybackModeCurrent() &&
+                    player.swapToPreloadedQueueNext(token, resource, preloadedQueueSongForPromotion())
+                ) {
+                    crossfadeCompletionGuard.discardConsumedCompletion()
+                    nextTrackPreloadJob = null
+                    nextTrackPreloadToken = null
+                    nextTrackPreloadResource = null
+                    nextTrackPreloadSong = null
+                    nextTrackPreloadSourceSong = null
+                    nextTrackPreloadExpectedInstanceId = 0L
+                    nextTrackPreloadAttempt = null
+                } else {
+                    crossfadeController.cancel()
+                    crossfadeCompletionGuard.clear()
+                    player.setCrossfadeVolumes(100f, 0f)
+                    cancelNextTrackPreload(resetAttempt = false)
+                }
+                isCrossfading = false
+                crossfadeJob = null
+            }
+        return true
     }
 
     fun startAndroidCrossfade() {
