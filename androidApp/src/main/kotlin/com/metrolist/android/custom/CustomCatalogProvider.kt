@@ -7,12 +7,14 @@ import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.screens.CustomHomeShelvesBridge
+import com.metrolist.shared.ui.screens.CustomSearchBridge
 import com.metrolist.shared.ui.screens.HomeShelf
 import com.metrolist.shared.ui.screens.HomeShelfHeaderAction
 import com.metrolist.shared.ui.screens.HomeShelfStyle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -125,6 +127,83 @@ class CustomCatalogProvider(
                     )
                 }
             }
+        }
+
+    suspend fun searchYandexTracks(
+        query: String,
+        limit: Int = 10,
+    ): List<SongItem> =
+        withContext(Dispatchers.IO) {
+            val clean = query.trim()
+            if (clean.isBlank()) return@withContext emptyList()
+            val token = sanitizeYandexToken(configStore.current.yandexToken)
+            val headers =
+                buildMap {
+                    put("User-Agent", YANDEX_UA)
+                    put("Accept-Language", "ru")
+                    if (token.isNotBlank()) put("Authorization", "OAuth $token")
+                }
+            runCatching<List<SongItem>> {
+                val url = "${yandexApiBase()}/search?text=${CustomHttp.urlEncode(clean)}&type=track&page=0"
+                val resp = CustomHttp.get(url, headers = headers, timeoutMs = 8_000)
+                if (!resp.isSuccess) return@runCatching emptyList<SongItem>()
+                val arr =
+                    JSONObject(resp.body)
+                        .optJSONObject("result")
+                        ?.optJSONObject("tracks")
+                        ?.optJSONArray("results")
+                        ?: return@runCatching emptyList<SongItem>()
+
+                buildList {
+                    for (i in 0 until minOf(arr.length(), limit)) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        parseYandexTrack(obj)?.toSongItem()?.let(::add)
+                    }
+                }.distinctBy { it.id }
+            }.getOrDefault(emptyList())
+        }
+
+    suspend fun searchVkTracks(
+        query: String,
+        limit: Int = 10,
+    ): List<SongItem> =
+        withContext(Dispatchers.IO) {
+            val clean = query.trim()
+            if (clean.isBlank()) return@withContext emptyList()
+            if (System.currentTimeMillis() < vkSearchFloodUntilMs) return@withContext emptyList()
+            val token = sanitizeVkToken(configStore.current.vkToken)
+            if (token.isBlank()) return@withContext emptyList()
+
+            val encodedQuery = CustomHttp.urlEncode(clean)
+            val encodedToken = CustomHttp.urlEncode(token)
+            val urls =
+                listOf(
+                    "${vkApiBase()}/catalog.getAudioSearch?query=$encodedQuery&need_blocks=1&lang=ru&access_token=$encodedToken&v=5.131",
+                    "${vkApiBase()}/audio.search?q=$encodedQuery&count=$limit&sort=2&auto_complete=1&lang=ru&access_token=$encodedToken&v=5.95",
+                )
+
+            for (url in urls) {
+                val found =
+                    runCatching<List<SongItem>?> {
+                        val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to KATE_UA), timeoutMs = 8_000)
+                        if (!resp.isSuccess) return@runCatching null
+                        val root = JSONObject(resp.body)
+                        if (root.has("error")) {
+                            val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
+                            if (code == 9) {
+                                vkSearchFloodUntilMs = System.currentTimeMillis() + 3 * 60 * 1_000L
+                                return@runCatching emptyList<SongItem>()
+                            }
+                            return@runCatching null
+                        }
+                        val respObj = root.optJSONObject("response") ?: return@runCatching emptyList<SongItem>()
+                        val arr = respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
+                        parseVkAudioArray(arr).take(limit).map { it.toSongItem() }.distinctBy { it.id }
+                    }.getOrNull()
+
+                if (found != null) return@withContext found
+            }
+            emptyList()
         }
 
     suspend fun importYandexLikes(
@@ -662,6 +741,15 @@ class CustomCatalogProvider(
         @Volatile
         private var isHomeLoading: Boolean = false
 
+        @Volatile
+        private var vkSearchFloodUntilMs: Long = 0L
+
+        @Volatile
+        private var searchJob: Job? = null
+
+        @Volatile
+        private var lastSearchedQuery: String = ""
+
         fun bindHomeShelvesBridge(configStore: CustomConfigStore) {
             val provider = CustomCatalogProvider(configStore)
             CustomHomeShelvesBridge.onRefreshRequested = { force ->
@@ -688,6 +776,46 @@ class CustomCatalogProvider(
                             }
                         }
                     }
+                }
+            }
+
+            CustomSearchBridge.onSearchRequested = { rawQuery ->
+                val clean = rawQuery.trim()
+                if (clean.isNotBlank() && !clean.equals(lastSearchedQuery, ignoreCase = true)) {
+                    lastSearchedQuery = clean
+                    searchJob?.cancel()
+                    CustomSearchBridge.query = clean
+                    CustomSearchBridge.yandexSongs = emptyList()
+                    CustomSearchBridge.vkSongs = emptyList()
+                    CustomSearchBridge.isLoading = true
+                    searchJob =
+                        homeScope.launch {
+                            try {
+                                val (ymList, vkList) =
+                                    coroutineScope {
+                                        val ymTask = async { provider.searchYandexTracks(clean, limit = 10) }
+                                        val vkTask = async { provider.searchVkTracks(clean, limit = 10) }
+                                        ymTask.await() to vkTask.await()
+                                    }
+                                if (lastSearchedQuery.equals(clean, ignoreCase = true)) {
+                                    withContext(Dispatchers.Main) {
+                                        CustomSearchBridge.query = clean
+                                        CustomSearchBridge.yandexSongs = ymList
+                                        CustomSearchBridge.vkSongs = vkList
+                                    }
+                                }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (err: Exception) {
+                                Log.w(TAG, "Custom search failed: ${err.message}")
+                            } finally {
+                                if (lastSearchedQuery.equals(clean, ignoreCase = true)) {
+                                    withContext(Dispatchers.Main) {
+                                        CustomSearchBridge.isLoading = false
+                                    }
+                                }
+                            }
+                        }
                 }
             }
         }
