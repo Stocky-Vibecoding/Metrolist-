@@ -5,6 +5,12 @@ package com.metrolist.android.custom
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Matrix
+import android.graphics.RenderEffect
+import android.graphics.RuntimeShader
+import android.net.Uri
+import android.os.Build
+import android.view.TextureView
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -64,6 +70,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -77,6 +84,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlendMode
@@ -95,6 +103,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.exoplayer.ExoPlayer
 import com.metrolist.android.playback.PlayerConnection
 import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
@@ -111,8 +128,46 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
+
+private const val MASCOT_BLACK_KEY_AGSL = """
+uniform shader content;
+uniform float2 iResolution;
+
+float maxRgb(float2 p) {
+    half4 s = content.eval(p);
+    return float(max(s.r, max(s.g, s.b)));
+}
+
+half4 main(float2 fragCoord) {
+    half4 c = content.eval(fragCoord);
+    float m = float(max(c.r, max(c.g, c.b)));
+    float2 uv = fragCoord / max(iResolution, float2(1.0));
+
+    bool inTorsoCore = (uv.y > 0.68 && abs(uv.x - 0.5) < 0.34);
+
+    float nL = maxRgb(fragCoord + float2(-5.0, 0.0));
+    float nR = maxRgb(fragCoord + float2( 5.0, 0.0));
+    float nU = maxRgb(fragCoord + float2( 0.0,-5.0));
+    float nD = maxRgb(fragCoord + float2( 0.0, 5.0));
+
+    bool surroundedHoriz = (nL > 0.05 && nR > 0.05);
+    bool surroundedVert  = (nU > 0.05 && nD > 0.05);
+
+    float alpha = 1.0;
+    if (!inTorsoCore && !surroundedHoriz && !surroundedVert) {
+        alpha = smoothstep(0.012, 0.044, m);
+    }
+
+    float bottomFade = smoothstep(1.0, 0.92, uv.y);
+    float sideFade = smoothstep(0.0, 0.05, uv.x) * smoothstep(1.0, 0.95, uv.x);
+    alpha *= bottomFade * sideFade;
+
+    return half4(c.rgb * half(alpha), half(alpha));
+}
+"""
 
 @Composable
 fun WaveHomeScreen(
@@ -368,7 +423,7 @@ fun WaveHomeScreen(
                             isPlaying = isPlaying,
                             isGenerating = isGenerating,
                             showMascot = cfg.mascotEnabled,
-                            stageSize = 270.dp,
+                            stageSize = 280.dp,
                             onClick = ::startOrToggleWave,
                         )
                     }
@@ -392,11 +447,11 @@ fun WaveHomeScreen(
                         isPlaying = isPlaying,
                         isGenerating = isGenerating,
                         showMascot = cfg.mascotEnabled,
-                        stageSize = 290.dp,
+                        stageSize = 300.dp,
                         onClick = ::startOrToggleWave,
                     )
 
-                    Spacer(modifier = Modifier.height(14.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
 
                     filterControlsBlock()
 
@@ -614,6 +669,196 @@ private fun ReturnToWavePillButton(
 }
 
 @Composable
+private fun LiveMascotVideoLayer(
+    isPlaying: Boolean,
+    bassEnergy: Float,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val sleepRes = CustomMascotAssets.sleepVideoResId
+    val wakeRes = CustomMascotAssets.wakeVideoResId
+    val awakeRes = CustomMascotAssets.awakeVideoResId
+
+    fun rawUri(resId: Int): Uri = Uri.parse("android.resource://${context.packageName}/$resId")
+
+    val exoPlayer =
+        remember(context) {
+            ExoPlayer.Builder(context).build().apply {
+                volume = 0f
+                trackSelectionParameters =
+                    trackSelectionParameters
+                        .buildUpon()
+                        .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+                        .build()
+                playWhenReady = true
+            }
+        }
+
+    var wasPlaying by remember { mutableStateOf<Boolean?>(null) }
+    var isInWakeTransition by remember { mutableStateOf(false) }
+    var videoWidth by remember { mutableIntStateOf(16) }
+    var videoHeight by remember { mutableIntStateOf(9) }
+    var textureViewRef by remember { mutableStateOf<TextureView?>(null) }
+    var lastAppliedSpeed by remember { mutableFloatStateOf(1f) }
+    var lastSpeedUpdateMs by remember { mutableLongStateOf(0L) }
+
+    fun applyCenterCropTransform(
+        tv: TextureView,
+        vw: Int,
+        vh: Int,
+    ) {
+        val viewW = tv.width
+        val viewH = tv.height
+        if (viewW <= 0 || viewH <= 0 || vw <= 0 || vh <= 0) return
+        val viewAspect = viewW.toFloat() / viewH.toFloat()
+        val videoAspect = vw.toFloat() / vh.toFloat()
+        val scaleX: Float
+        val scaleY: Float
+        if (videoAspect > viewAspect) {
+            scaleX = videoAspect / viewAspect
+            scaleY = 1f
+        } else {
+            scaleX = 1f
+            scaleY = viewAspect / videoAspect
+        }
+        val matrix = Matrix()
+        matrix.setScale(scaleX, scaleY, viewW / 2f, viewH / 2f)
+        tv.setTransform(matrix)
+    }
+
+    fun applyKeyShader(tv: TextureView) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val w = tv.width
+        val h = tv.height
+        if (w <= 0 || h <= 0) return
+        runCatching {
+            val shader = RuntimeShader(MASCOT_BLACK_KEY_AGSL)
+            shader.setFloatUniform("iResolution", w.toFloat(), h.toFloat())
+            tv.setRenderEffect(RenderEffect.createRuntimeShaderEffect(shader, "content"))
+        }
+    }
+
+    DisposableEffect(exoPlayer) {
+        val listener =
+            object : Player.Listener {
+                override fun onVideoSizeChanged(videoSize: VideoSize) {
+                    if (videoSize.width > 0 && videoSize.height > 0) {
+                        videoWidth = videoSize.width
+                        videoHeight = videoSize.height
+                        textureViewRef?.let { applyCenterCropTransform(it, videoSize.width, videoSize.height) }
+                    }
+                }
+
+                override fun onMediaItemTransition(
+                    mediaItem: MediaItem?,
+                    reason: Int,
+                ) {
+                    if (isInWakeTransition && exoPlayer.currentMediaItemIndex > 0) {
+                        isInWakeTransition = false
+                        exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                    }
+                }
+            }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+            textureViewRef?.let { exoPlayer.clearVideoTextureView(it) }
+            exoPlayer.release()
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, exoPlayer) {
+        val observer =
+            LifecycleEventObserver { _, event ->
+                when (event) {
+                    Lifecycle.Event.ON_START -> exoPlayer.playWhenReady = true
+                    Lifecycle.Event.ON_STOP -> exoPlayer.playWhenReady = false
+                    else -> Unit
+                }
+            }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(isPlaying, sleepRes, wakeRes, awakeRes) {
+        val previous = wasPlaying
+        wasPlaying = isPlaying
+
+        if (isPlaying) {
+            val loopTarget = awakeRes.takeIf { it != 0 } ?: wakeRes.takeIf { it != 0 } ?: sleepRes
+            if (previous == false && wakeRes != 0 && awakeRes != 0) {
+                isInWakeTransition = true
+                exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
+                exoPlayer.setMediaItems(
+                    listOf(
+                        MediaItem.fromUri(rawUri(wakeRes)),
+                        MediaItem.fromUri(rawUri(awakeRes)),
+                    ),
+                    true,
+                )
+            } else if (loopTarget != 0) {
+                isInWakeTransition = false
+                exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                exoPlayer.setMediaItem(MediaItem.fromUri(rawUri(loopTarget)))
+            }
+            exoPlayer.prepare()
+            exoPlayer.playWhenReady = true
+        } else {
+            val sleepTarget = sleepRes.takeIf { it != 0 } ?: awakeRes
+            isInWakeTransition = false
+            exoPlayer.setPlaybackSpeed(1f)
+            lastAppliedSpeed = 1f
+            if (sleepTarget != 0) {
+                exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
+                exoPlayer.setMediaItem(MediaItem.fromUri(rawUri(sleepTarget)))
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = true
+            }
+        }
+    }
+
+    LaunchedEffect(isPlaying, isInWakeTransition, bassEnergy) {
+        if (!isPlaying || isInWakeTransition) {
+            if (abs(lastAppliedSpeed - 1f) > 0.02f) {
+                exoPlayer.setPlaybackSpeed(1f)
+                lastAppliedSpeed = 1f
+            }
+            return@LaunchedEffect
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastSpeedUpdateMs < 220L) return@LaunchedEffect
+        val targetSpeed = (0.90f + bassEnergy.coerceIn(0f, 1f) * 0.30f).coerceIn(0.88f, 1.22f)
+        if (abs(targetSpeed - lastAppliedSpeed) >= 0.04f) {
+            exoPlayer.setPlaybackSpeed(targetSpeed)
+            lastAppliedSpeed = targetSpeed
+            lastSpeedUpdateMs = now
+        }
+    }
+
+    AndroidView(
+        factory = { ctx ->
+            TextureView(ctx).apply {
+                isOpaque = false
+                textureViewRef = this
+                exoPlayer.setVideoTextureView(this)
+                addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                    applyCenterCropTransform(this, videoWidth, videoHeight)
+                    applyKeyShader(this)
+                }
+            }
+        },
+        update = { tv ->
+            textureViewRef = tv
+            applyCenterCropTransform(tv, videoWidth, videoHeight)
+            applyKeyShader(tv)
+        },
+        modifier = modifier.clipToBounds(),
+    )
+}
+
+@Composable
 private fun AnimatedWaveMascotStage(
     isPlaying: Boolean,
     isGenerating: Boolean,
@@ -722,9 +967,10 @@ private fun AnimatedWaveMascotStage(
             label = "zzzPhase",
         )
 
+    val useVideoMascot = showMascot && CustomMascotAssets.hasVideoMascot
     val hasDedicatedSprites = CustomMascotAssets.hasDedicatedSprites
     val mascotResId =
-        if (!showMascot) {
+        if (!showMascot || useVideoMascot) {
             0
         } else if (!isPlaying) {
             CustomMascotAssets.sleepResId.takeIf { it != 0 } ?: CustomMascotAssets.drawableResId
@@ -737,6 +983,7 @@ private fun AnimatedWaveMascotStage(
             }
         }
 
+    val hasAnyMascot = useVideoMascot || mascotResId != 0
     val tapInteraction = remember { MutableInteractionSource() }
 
     Column(
@@ -746,14 +993,13 @@ private fun AnimatedWaveMascotStage(
             contentAlignment = Alignment.Center,
             modifier =
                 Modifier
-                    .size(stageSize)
+                    .size(width = stageSize * 1.08f, height = stageSize * 0.96f)
                     .clickable(
                         interactionSource = tapInteraction,
                         indication = null,
                         onClick = onClick,
                     ),
         ) {
-            // Задний живой фон: свечение + звёзды + круговой эквалайзер в такт басу
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val _tick = eqTick.longValue
                 val center = Offset(size.width / 2f, size.height / 2f)
@@ -763,7 +1009,6 @@ private fun AnimatedWaveMascotStage(
                 val breath = breathPhase.value
                 val energy = if (isPlaying) pulse else breath * 0.25f
 
-                // Внешнее мягкое неоновое свечение
                 val outerR = maxR * (0.86f + energy * 0.14f + kick * 0.05f)
                 drawCircle(
                     brush =
@@ -781,9 +1026,8 @@ private fun AnimatedWaveMascotStage(
                     center = center,
                 )
 
-                // Круговой эквалайзер вокруг персонажа
                 val barCount = eqBars.size
-                val innerRingR = maxR * (0.60f + kick * 0.03f)
+                val innerRingR = maxR * (0.62f + kick * 0.03f)
                 val maxBarLen = maxR * 0.24f
                 val barStroke = 3.dp.toPx()
                 for (i in 0 until barCount) {
@@ -813,7 +1057,6 @@ private fun AnimatedWaveMascotStage(
                     )
                 }
 
-                // Мягкие мерцающие звёздочки вокруг
                 val starAngles = floatArrayOf(0.4f, 1.35f, 2.25f, 3.55f, 4.45f, 5.45f)
                 val starRadii = floatArrayOf(0.84f, 0.90f, 0.82f, 0.88f, 0.83f, 0.91f)
                 for (idx in starAngles.indices) {
@@ -830,13 +1073,39 @@ private fun AnimatedWaveMascotStage(
                 }
             }
 
-            if (mascotResId != 0) {
+            if (useVideoMascot) {
+                Box(
+                    contentAlignment = Alignment.BottomCenter,
+                    modifier =
+                        Modifier
+                            .size(width = stageSize * 0.98f, height = stageSize * 0.84f)
+                            .graphicsLayer {
+                                val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
+                                val kick = beatKick.floatValue.coerceIn(0f, 1f)
+                                if (isPlaying) {
+                                    // Упругое проседание в такт басу поверх живой анимации из видео
+                                    translationY = (kick * 7.dp.toPx()) + (pulse * 1.5.dp.toPx())
+                                    scaleX = 1f + kick * 0.025f
+                                    scaleY = 1f - kick * 0.022f
+                                } else {
+                                    translationY = 0f
+                                    scaleX = 1f
+                                    scaleY = 1f
+                                }
+                            },
+                ) {
+                    LiveMascotVideoLayer(
+                        isPlaying = isPlaying,
+                        bassEnergy = bassEnergy.floatValue,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            } else if (mascotResId != 0) {
                 val mascotSize = stageSize * 0.78f
                 val spriteModifier =
                     if (hasDedicatedSprites) {
                         Modifier.fillMaxSize()
                     } else {
-                        // Плавное растворение краёв для квадратной картинки — без жёсткого кружка
                         Modifier
                             .fillMaxSize()
                             .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
@@ -870,14 +1139,12 @@ private fun AnimatedWaveMascotStage(
 
                                 if (isPlaying) {
                                     val beatDir = if (kickCounter.intValue % 2 == 0) 1f else -1f
-                                    // Живое качание головой и упругий кивок в такт бочке
                                     rotationZ = sway * (2.6f + pulse * 3.8f) + beatDir * kick * 2.2f
                                     translationY = (kick * 9.dp.toPx()) + (pulse * 2.dp.toPx())
                                     scaleX = 1f + kick * 0.045f + pulse * 0.02f
                                     scaleY = 1f - kick * 0.035f + pulse * 0.025f
                                     alpha = 1f
                                 } else {
-                                    // Спит: лёгкий наклон головы и медленное дыхание
                                     rotationZ = -2.2f + breath * 1.4f
                                     translationY = 4.dp.toPx() - breath * 3.dp.toPx()
                                     scaleX = 1f + breath * 0.015f
@@ -893,39 +1160,7 @@ private fun AnimatedWaveMascotStage(
                         modifier = spriteModifier,
                     )
                 }
-
-                // Сонные z Z z пока музыка на паузе
-                if (!isPlaying) {
-                    val zLetters = listOf("z" to 0.0f, "Z" to 0.33f, "z" to 0.66f)
-                    zLetters.forEachIndexed { idx, (letter, offsetPhase) ->
-                        Text(
-                            text = letter,
-                            fontSize = (14 + idx * 3).sp,
-                            fontWeight = FontWeight.Bold,
-                            color = primaryColor,
-                            modifier =
-                                Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(top = 46.dp, end = 42.dp)
-                                    .graphicsLayer {
-                                        val p = (zzzPhase.value + offsetPhase) % 1f
-                                        translationY = -p * 42.dp.toPx()
-                                        translationX = sin(p * PI * 2.0).toFloat() * 7.dp.toPx() + idx * 4.dp.toPx()
-                                        alpha =
-                                            when {
-                                                p < 0.2f -> p / 0.2f
-                                                p > 0.75f -> (1f - p) / 0.25f
-                                                else -> 1f
-                                            }.coerceIn(0f, 0.9f)
-                                        val s = 0.8f + p * 0.35f
-                                        scaleX = s
-                                        scaleY = s
-                                    },
-                        )
-                    }
-                }
             } else {
-                // Фолбэк, если маскот выключен в настройках
                 Surface(
                     onClick = onClick,
                     shape = CircleShape,
@@ -954,6 +1189,36 @@ private fun AnimatedWaveMascotStage(
                     }
                 }
             }
+
+            if (hasAnyMascot && !isPlaying) {
+                val zLetters = listOf("z" to 0.0f, "Z" to 0.33f, "z" to 0.66f)
+                zLetters.forEachIndexed { idx, (letter, offsetPhase) ->
+                    Text(
+                        text = letter,
+                        fontSize = (14 + idx * 3).sp,
+                        fontWeight = FontWeight.Bold,
+                        color = primaryColor,
+                        modifier =
+                            Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(top = 34.dp, end = 34.dp)
+                                .graphicsLayer {
+                                    val p = (zzzPhase.value + offsetPhase) % 1f
+                                    translationY = -p * 42.dp.toPx()
+                                    translationX = sin(p * PI * 2.0).toFloat() * 7.dp.toPx() + idx * 4.dp.toPx()
+                                    alpha =
+                                        when {
+                                            p < 0.2f -> p / 0.2f
+                                            p > 0.75f -> (1f - p) / 0.25f
+                                            else -> 1f
+                                        }.coerceIn(0f, 0.9f)
+                                    val s = 0.8f + p * 0.35f
+                                    scaleX = s
+                                    scaleY = s
+                                },
+                    )
+                }
+            }
         }
 
         if (isGenerating && !isPlaying) {
@@ -972,9 +1237,9 @@ private fun AnimatedWaveMascotStage(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-        } else if (!isPlaying && mascotResId != 0) {
+        } else if (!isPlaying && hasAnyMascot) {
             Text(
-                text = "Нажми, чтобы включить",
+                text = "Нажми, чтобы разбудить",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.78f),
             )
@@ -1074,7 +1339,7 @@ private fun WaveBottomStatusAndPlayer(
         val hdCover = ResolverDiagnostics.hdCoverFor(song.id) ?: song.thumbnail ?: CustomMascotAssets.fallbackCoverUri
 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(14.dp))
             Surface(
                 shape = RoundedCornerShape(22.dp),
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
