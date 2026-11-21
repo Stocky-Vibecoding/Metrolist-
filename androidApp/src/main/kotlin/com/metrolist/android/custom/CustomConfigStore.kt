@@ -3,6 +3,7 @@ package com.metrolist.android.custom
 import android.content.Context
 import com.metrolist.shared.api.lastfm.LastFM
 import com.metrolist.shared.ui.components.LocalProfileBridge
+import com.metrolist.shared.ui.screens.CustomHomeShelvesBridge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -160,6 +161,7 @@ class CustomConfigStore(
 
     init {
         CustomMediaCacheManager.init(appContext)
+        CustomCatalogProvider.bindHomeShelvesBridge(this)
         syncLocalProfileBridge(_config.value)
         LocalProfileBridge.onUpdateLocalName = { newName ->
             update { it.copy(localAccountName = newName.trim().ifBlank { "Локальный профиль" }) }
@@ -170,7 +172,11 @@ class CustomConfigStore(
     fun update(transform: (CustomAppConfig) -> CustomAppConfig) {
         val previous = _config.value
         val updated = transform(previous)
-        saveAndPublish(updated, yandexTokenChanged = previous.yandexToken != updated.yandexToken)
+        saveAndPublish(
+            updated = updated,
+            yandexTokenChanged = previous.yandexToken != updated.yandexToken,
+            vkTokenChanged = previous.vkToken != updated.vkToken,
+        )
     }
 
     fun setYandexPlusStatus(status: YandexPlusStatus) {
@@ -292,8 +298,7 @@ class CustomConfigStore(
                 val cleanArtist = item.artist.trim()
                 val cleanId = item.id.trim()
                 if (cleanId.isBlank() && cleanTitle.isBlank()) return
-                val key =
-                    buildTrackKey(cleanArtist, cleanTitle).ifBlank { "id::$cleanId" }
+                val key = buildTrackKey(cleanArtist, cleanTitle).ifBlank { "id::$cleanId" }
                 if (seenKeys.add(key)) {
                     merged.add(LikedTrackBackup(id = cleanId, artist = cleanArtist, title = cleanTitle))
                 }
@@ -366,7 +371,11 @@ class CustomConfigStore(
         runCatching {
             val parsed = fromJson(JSONObject(rawJson.trim()))
             val previous = _config.value
-            saveAndPublish(parsed, yandexTokenChanged = previous.yandexToken != parsed.yandexToken)
+            saveAndPublish(
+                updated = parsed,
+                yandexTokenChanged = previous.yandexToken != parsed.yandexToken,
+                vkTokenChanged = previous.vkToken != parsed.vkToken,
+            )
             parsed
         }
 
@@ -378,6 +387,7 @@ class CustomConfigStore(
     private fun saveAndPublish(
         updated: CustomAppConfig,
         yandexTokenChanged: Boolean,
+        vkTokenChanged: Boolean,
     ) {
         prefs.edit().putString(KEY_CONFIG_JSON, toJson(updated).toString()).apply()
         _config.value = updated
@@ -385,6 +395,9 @@ class CustomConfigStore(
         if (yandexTokenChanged) {
             _yandexPlusStatus.value =
                 if (updated.yandexToken.isBlank()) YandexPlusStatus.NO_TOKEN else YandexPlusStatus.UNKNOWN
+        }
+        if (yandexTokenChanged || vkTokenChanged) {
+            CustomHomeShelvesBridge.requestLoad(force = true)
         }
         applyRuntimeIntegrations(updated)
     }
