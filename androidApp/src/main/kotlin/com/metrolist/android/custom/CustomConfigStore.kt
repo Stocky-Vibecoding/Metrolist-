@@ -52,6 +52,17 @@ enum class WaveCharacter(
     POPULAR("Популярное", "громкие хиты, чартовые и самые известные треки в подходящем стиле"),
 }
 
+enum class WaveEra(
+    val label: String,
+    val promptHint: String,
+) {
+    ANY("Любая", "любая эпоха и год выхода треков"),
+    MODERN("Современное", "только современные релизы 2020–2026 годов и актуальное звучание"),
+    RETRO("Ретро", "ретро-хиты и классика прошлых десятилетий (80-е, 90-е, начало 2000-х)"),
+    Y2000S("2000-е", "треки и хиты 2000-х годов"),
+    Y90S("90-е", "треки и классика 1990-х годов"),
+}
+
 enum class WaveLanguage(
     val label: String,
     val promptHint: String,
@@ -88,6 +99,7 @@ data class CustomAppConfig(
     val useLocalAccountOnly: Boolean = true,
     val hybridResolverEnabled: Boolean = true,
     val preferVkForExplicit: Boolean = true,
+    val cacheWaveAndDownloadLikes: Boolean = true,
     val aiCensorshipCheckEnabled: Boolean = false,
     val yandexToken: String = "",
     val vkToken: String = "",
@@ -102,6 +114,7 @@ data class CustomAppConfig(
     val mascotFolderUri: String = "",
     val neonColorMode: NeonColorMode = NeonColorMode.AUTO,
     val waveCharacter: WaveCharacter = WaveCharacter.DEFAULT,
+    val waveEra: WaveEra = WaveEra.ANY,
     val waveLanguage: WaveLanguage = WaveLanguage.ANY,
     val waveMood: WaveMood = WaveMood.ANY,
     val trackSourceOverrides: Map<String, TrackSourcePreference> = emptyMap(),
@@ -113,6 +126,7 @@ data class CustomAppConfig(
         val parts =
             buildList {
                 if (waveCharacter != WaveCharacter.DEFAULT) add(waveCharacter.label)
+                if (waveEra != WaveEra.ANY) add(waveEra.label)
                 if (waveLanguage != WaveLanguage.ANY) add(waveLanguage.label)
                 if (waveMood != WaveMood.ANY) add(waveMood.label)
             }
@@ -127,8 +141,9 @@ data class CustomAppConfig(
 class CustomConfigStore(
     context: Context,
 ) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    private val censorshipPrefs = context.applicationContext.getSharedPreferences(CENSORSHIP_PREFS_NAME, Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val censorshipPrefs = appContext.getSharedPreferences(CENSORSHIP_PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _config = MutableStateFlow(loadInitial())
     val config: StateFlow<CustomAppConfig> = _config.asStateFlow()
@@ -143,6 +158,7 @@ class CustomConfigStore(
         get() = _config.value
 
     init {
+        CustomMediaCacheManager.init(appContext)
         applyRuntimeIntegrations(_config.value)
     }
 
@@ -350,11 +366,12 @@ class CustomConfigStore(
         extraLikedIds: Set<String> = emptySet(),
     ): JSONObject =
         JSONObject().apply {
-            put("schemaVersion", 3)
+            put("schemaVersion", 4)
             put("localAccountName", cfg.localAccountName)
             put("useLocalAccountOnly", cfg.useLocalAccountOnly)
             put("hybridResolverEnabled", cfg.hybridResolverEnabled)
             put("preferVkForExplicit", cfg.preferVkForExplicit)
+            put("cacheWaveAndDownloadLikes", cfg.cacheWaveAndDownloadLikes)
             put("aiCensorshipCheckEnabled", cfg.aiCensorshipCheckEnabled)
             put("yandexToken", cfg.yandexToken)
             put("vkToken", cfg.vkToken)
@@ -369,6 +386,7 @@ class CustomConfigStore(
             put("mascotFolderUri", cfg.mascotFolderUri)
             put("neonColorMode", cfg.neonColorMode.name)
             put("waveCharacter", cfg.waveCharacter.name)
+            put("waveEra", cfg.waveEra.name)
             put("waveLanguage", cfg.waveLanguage.name)
             put("waveMood", cfg.waveMood.name)
 
@@ -474,6 +492,7 @@ class CustomConfigStore(
             useLocalAccountOnly = obj.optBoolean("useLocalAccountOnly", defaults.useLocalAccountOnly),
             hybridResolverEnabled = obj.optBoolean("hybridResolverEnabled", defaults.hybridResolverEnabled),
             preferVkForExplicit = obj.optBoolean("preferVkForExplicit", defaults.preferVkForExplicit),
+            cacheWaveAndDownloadLikes = obj.optBoolean("cacheWaveAndDownloadLikes", defaults.cacheWaveAndDownloadLikes),
             aiCensorshipCheckEnabled = obj.optBoolean("aiCensorshipCheckEnabled", defaults.aiCensorshipCheckEnabled),
             yandexToken = obj.optString("yandexToken", defaults.yandexToken),
             vkToken = obj.optString("vkToken", defaults.vkToken),
@@ -488,6 +507,7 @@ class CustomConfigStore(
             mascotFolderUri = obj.optString("mascotFolderUri", defaults.mascotFolderUri),
             neonColorMode = enumByName(obj.optString("neonColorMode"), defaults.neonColorMode),
             waveCharacter = enumByName(obj.optString("waveCharacter"), defaults.waveCharacter),
+            waveEra = enumByName(obj.optString("waveEra"), defaults.waveEra),
             waveLanguage = enumByName(obj.optString("waveLanguage"), defaults.waveLanguage),
             waveMood = enumByName(obj.optString("waveMood"), defaults.waveMood),
             trackSourceOverrides = overrides,
