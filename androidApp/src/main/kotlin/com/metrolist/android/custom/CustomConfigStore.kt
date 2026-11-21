@@ -90,6 +90,7 @@ data class LikedTrackBackup(
     val id: String,
     val artist: String,
     val title: String,
+    val thumbnail: String? = null,
 )
 
 data class ArtistReputation(
@@ -334,9 +335,11 @@ class CustomConfigStore(
         artist: String,
         title: String,
         songId: String = "",
+        thumbnail: String? = null,
     ) {
         val tKey = buildTrackKey(artist, title)
         val aKey = buildArtistKey(artist)
+        val cleanThumb = thumbnail?.trim()?.takeIf { it.isNotBlank() && it != CustomMascotAssets.fallbackCoverUri }
         update { cfg ->
             val nextDisliked =
                 if (tKey.isNotBlank()) cfg.dislikedTracks - tKey else cfg.dislikedTracks
@@ -347,7 +350,19 @@ class CustomConfigStore(
             }
             val nextLiked =
                 if (songId.isNotBlank() || title.isNotBlank()) {
-                    val entry = LikedTrackBackup(id = songId.trim(), artist = artist.trim(), title = title.trim())
+                    val existingThumb =
+                        cfg.likedTracksBackup
+                            .firstOrNull {
+                                (songId.isNotBlank() && it.id == songId) ||
+                                    (it.artist.equals(artist, ignoreCase = true) && it.title.equals(title, ignoreCase = true))
+                            }?.thumbnail
+                    val entry =
+                        LikedTrackBackup(
+                            id = songId.trim(),
+                            artist = artist.trim(),
+                            title = title.trim(),
+                            thumbnail = cleanThumb ?: existingThumb,
+                        )
                     (listOf(entry) + cfg.likedTracksBackup.filterNot {
                         (entry.id.isNotBlank() && it.id == entry.id) ||
                             (it.artist.equals(entry.artist, ignoreCase = true) && it.title.equals(entry.title, ignoreCase = true))
@@ -375,10 +390,11 @@ class CustomConfigStore(
                 val cleanTitle = item.title.trim()
                 val cleanArtist = item.artist.trim()
                 val cleanId = item.id.trim()
+                val cleanThumb = item.thumbnail?.trim()?.takeIf { it.isNotBlank() && it != CustomMascotAssets.fallbackCoverUri }
                 if (cleanId.isBlank() && cleanTitle.isBlank()) return
                 val key = buildTrackKey(cleanArtist, cleanTitle).ifBlank { "id::$cleanId" }
                 if (seenKeys.add(key)) {
-                    merged.add(LikedTrackBackup(id = cleanId, artist = cleanArtist, title = cleanTitle))
+                    merged.add(LikedTrackBackup(id = cleanId, artist = cleanArtist, title = cleanTitle, thumbnail = cleanThumb))
                 }
             }
 
@@ -496,7 +512,7 @@ class CustomConfigStore(
         extraLikedIds: Set<String> = emptySet(),
     ): JSONObject =
         JSONObject().apply {
-            put("schemaVersion", 5)
+            put("schemaVersion", 6)
             put("localAccountName", cfg.localAccountName)
             put("useLocalAccountOnly", cfg.useLocalAccountOnly)
             put("hybridResolverEnabled", cfg.hybridResolverEnabled)
@@ -547,7 +563,10 @@ class CustomConfigStore(
                     JSONObject()
                         .put("id", item.id)
                         .put("artist", item.artist)
-                        .put("title", item.title),
+                        .put("title", item.title)
+                        .apply {
+                            if (!item.thumbnail.isNullOrBlank()) put("thumbnail", item.thumbnail)
+                        },
                 )
             }
             extraLikedIds.forEach { id ->
@@ -568,7 +587,10 @@ class CustomConfigStore(
                     JSONObject()
                         .put("id", item.id)
                         .put("artist", item.artist)
-                        .put("title", item.title),
+                        .put("title", item.title)
+                        .apply {
+                            if (!item.thumbnail.isNullOrBlank()) put("thumbnail", item.thumbnail)
+                        },
                 )
             }
             put("lastWaveTracks", waveArr)
@@ -622,8 +644,9 @@ class CustomConfigStore(
                     val id = item.optString("id").trim()
                     val artist = item.optString("artist").trim()
                     val title = item.optString("title").trim()
+                    val thumb = item.optString("thumbnail").trim().takeIf { it.isNotBlank() }
                     if (id.isNotBlank() || title.isNotBlank()) {
-                        add(LikedTrackBackup(id = id, artist = artist, title = title))
+                        add(LikedTrackBackup(id = id, artist = artist, title = title, thumbnail = thumb))
                     }
                 }
             }
