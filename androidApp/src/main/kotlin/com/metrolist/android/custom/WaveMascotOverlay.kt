@@ -146,8 +146,6 @@ half4 main(float2 fragCoord) {
     float m = float(max(c.r, max(c.g, c.b)));
     float2 uv = fragCoord / max(iResolution, float2(1.0));
 
-    bool inTorsoCore = (uv.y > 0.68 && abs(uv.x - 0.5) < 0.34);
-
     float nL = maxRgb(fragCoord + float2(-5.0, 0.0));
     float nR = maxRgb(fragCoord + float2( 5.0, 0.0));
     float nU = maxRgb(fragCoord + float2( 0.0,-5.0));
@@ -155,9 +153,10 @@ half4 main(float2 fragCoord) {
 
     bool surroundedHoriz = (nL > 0.05 && nR > 0.05);
     bool surroundedVert  = (nU > 0.05 && nD > 0.05);
+    bool inCenterTorso   = (uv.y > 0.72 && abs(uv.x - 0.5) < 0.22 && m > 0.015);
 
     float alpha = 1.0;
-    if (!inTorsoCore && !surroundedHoriz && !surroundedVert) {
+    if (!inCenterTorso && !surroundedHoriz && !surroundedVert) {
         alpha = smoothstep(0.012, 0.044, m);
     }
 
@@ -386,7 +385,12 @@ fun WaveHomeScreen(
                         val artist = song.artists.joinToString(", ") { it.name }.trim()
                         SongLikeState.toggleLike(song)
                         if (willLike) {
-                            configStore.likeTrack(artist = artist, title = song.title, songId = song.id)
+                            configStore.likeTrack(
+                                artist = artist,
+                                title = song.title,
+                                songId = song.id,
+                                thumbnail = song.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri },
+                            )
                             aiWaveEngine.recordLike(song)
                             if (cfg.cacheWaveAndDownloadLikes) {
                                 CustomMediaCacheManager.downloadLikedTrack(song, playbackResource)
@@ -400,6 +404,9 @@ fun WaveHomeScreen(
                         aiWaveEngine.recordDislike(song)
                         Toast.makeText(context, "Трек скрыт из волны навсегда", Toast.LENGTH_SHORT).show()
                         playerConnection?.skipToNext()
+                    },
+                    onPreviousClick = {
+                        playerConnection?.skipToPrevious()
                     },
                     onNextClick = {
                         currentSong?.let { aiWaveEngine.recordSessionSkip(it) }
@@ -1083,7 +1090,6 @@ private fun AnimatedWaveMascotStage(
                                 val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
                                 val kick = beatKick.floatValue.coerceIn(0f, 1f)
                                 if (isPlaying) {
-                                    // Упругое проседание в такт басу поверх живой анимации из видео
                                     translationY = (kick * 7.dp.toPx()) + (pulse * 1.5.dp.toPx())
                                     scaleX = 1f + kick * 0.025f
                                     scaleY = 1f - kick * 0.022f
@@ -1313,6 +1319,7 @@ private fun WaveBottomStatusAndPlayer(
     statusOrPhrase: String?,
     onToggleLike: (SongItem) -> Unit,
     onDislikeClick: (SongItem) -> Unit,
+    onPreviousClick: () -> Unit,
     onNextClick: () -> Unit,
     onOpenFullPlayer: () -> Unit,
 ) {
@@ -1360,7 +1367,7 @@ private fun WaveBottomStatusAndPlayer(
                                 .clip(RoundedCornerShape(14.dp))
                                 .clickable(onClick = onOpenFullPlayer),
                     )
-                    Spacer(modifier = Modifier.width(12.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
                     Column(
                         modifier = Modifier.weight(1f).clickable(onClick = onOpenFullPlayer),
                     ) {
@@ -1382,17 +1389,24 @@ private fun WaveBottomStatusAndPlayer(
                             )
                         }
                     }
-                    IconButton(onClick = { onDislikeClick(song) }) {
+                    IconButton(onClick = { onDislikeClick(song) }, modifier = Modifier.size(38.dp)) {
                         DislikeBanIcon(tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    IconButton(onClick = { onToggleLike(song) }) {
+                    IconButton(onClick = { onToggleLike(song) }, modifier = Modifier.size(38.dp)) {
                         Icon(
                             imageVector = if (isLiked) MetrolistIcons.Filled.Favorite else MetrolistIcons.Outlined.FavoriteBorder,
                             contentDescription = "Лайк",
                             tint = if (isLiked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    IconButton(onClick = onNextClick) {
+                    IconButton(onClick = onPreviousClick, modifier = Modifier.size(38.dp)) {
+                        Icon(
+                            imageVector = MetrolistIcons.Filled.SkipPrevious,
+                            contentDescription = "Предыдущий",
+                            tint = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                    IconButton(onClick = onNextClick, modifier = Modifier.size(38.dp)) {
                         Icon(
                             imageVector = MetrolistIcons.Filled.SkipNext,
                             contentDescription = "Следующий",
