@@ -273,7 +273,7 @@ fun LibraryContent(
     val currentSongIdState = rememberUpdatedState(currentSongId)
     val isPlayingState = rememberUpdatedState(isPlaying)
     val rootActive = LocalRootContentActive.current
-    val likedIds by SongLikeState.likedSongIdsForDisplay.collectAsState(initial = SongLikeState.likedSongIds)
+    val rawLikedSongs by SongLikeState.likedSongsFlow.collectAsState(initial = SongLikeState.likedSongs)
     val downloadedSongIds = LocalDownloadedSongIds.current
 
     val sortingFilter = selectedFilter?.let { LibraryFilterType.valueOf(it.name) } ?: LibraryFilterType.ALL
@@ -383,14 +383,10 @@ fun LibraryContent(
             }
         }
     val likedHeroSongs =
-        remember(items, likedIds, contentFilterVersion) {
-            val allSongs =
-                items
-                    .filterIsInstance<SongItem>()
-                    .filterNot { it.isPodcast || it.isUnavailable }
-            val filtered = if (likedIds.isNotEmpty()) allSongs.filter { it.id in likedIds } else allSongs
-            val source = if (filtered.isNotEmpty()) filtered else allSongs
-            source
+        remember(rawLikedSongs, contentFilterVersion) {
+            BlockedContent
+                .filterSongs(rawLikedSongs)
+                .filterNot { it.isPodcast || it.isUnavailable }
                 .distinctBy { it.id }
                 .sortedByDescending { it.libraryAddedAt ?: 0L }
         }
@@ -402,6 +398,8 @@ fun LibraryContent(
                 searchedAutoPlaylists
             }
         }
+    val showCompactAutoPlaylistRow =
+        likedHeroPlaylist != null && isGridView && gridAutoPlaylists.isNotEmpty()
 
     val toggleSearch = {
         if (isSearchOpen) onSearchQueryChange?.invoke("")
@@ -547,26 +545,63 @@ fun LibraryContent(
                             }
                         }
                     }
-                    items(
-                        count = gridAutoPlaylists.size,
-                        key = { "auto_${gridAutoPlaylists[it].type}" },
-                        contentType = { "auto_playlist" },
-                        span = { GridItemSpan(if (isGridView) 1 else maxLineSpan) },
-                    ) { index ->
-                        val playlist = gridAutoPlaylists[index]
-                        Box(Modifier.animateItem()) {
-                            itemContainer(
-                                HiddenLibraryItem(
-                                    HiddenLibraryItemType.AUTO,
-                                    playlist.type,
-                                    playlist.title,
-                                    subtitle = playlist.subtitle,
-                                ),
-                                null,
-                                isGridView,
-                                { onAutoPlaylistClick(playlist.type) },
+                    if (showCompactAutoPlaylistRow) {
+                        item(key = "library_auto_playlists_compact", contentType = "auto_playlist_row", span = { GridItemSpan(maxLineSpan) }) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
-                                AutoPlaylistItem(playlist, isGridView)
+                                gridAutoPlaylists.chunked(4).forEach { rowPlaylists ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    ) {
+                                        rowPlaylists.forEach { playlist ->
+                                            Box(modifier = Modifier.weight(1f)) {
+                                                itemContainer(
+                                                    HiddenLibraryItem(
+                                                        HiddenLibraryItemType.AUTO,
+                                                        playlist.type,
+                                                        playlist.title,
+                                                        subtitle = playlist.subtitle,
+                                                    ),
+                                                    null,
+                                                    true,
+                                                    { onAutoPlaylistClick(playlist.type) },
+                                                ) {
+                                                    AutoPlaylistItem(playlist, isGridView = true)
+                                                }
+                                            }
+                                        }
+                                        repeat(4 - rowPlaylists.size) {
+                                            Spacer(modifier = Modifier.weight(1f))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        items(
+                            count = gridAutoPlaylists.size,
+                            key = { "auto_${gridAutoPlaylists[it].type}" },
+                            contentType = { "auto_playlist" },
+                            span = { GridItemSpan(if (isGridView) 1 else maxLineSpan) },
+                        ) { index ->
+                            val playlist = gridAutoPlaylists[index]
+                            Box(Modifier.animateItem()) {
+                                itemContainer(
+                                    HiddenLibraryItem(
+                                        HiddenLibraryItemType.AUTO,
+                                        playlist.type,
+                                        playlist.title,
+                                        subtitle = playlist.subtitle,
+                                    ),
+                                    null,
+                                    isGridView,
+                                    { onAutoPlaylistClick(playlist.type) },
+                                ) {
+                                    AutoPlaylistItem(playlist, isGridView)
+                                }
                             }
                         }
                     }
