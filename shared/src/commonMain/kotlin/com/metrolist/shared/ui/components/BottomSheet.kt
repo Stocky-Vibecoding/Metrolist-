@@ -518,6 +518,7 @@ class BottomSheetState(
 
     fun collapse(animationSpec: AnimationSpec<Dp>): Job {
         onDismissComplete = null
+        isDragging = false
         changeAnchor(COLLAPSED_ANCHOR)
         return coroutineScope.launch {
             animatable.animateTo(collapsedBound, animationSpec)
@@ -526,9 +527,15 @@ class BottomSheetState(
 
     fun expand(animationSpec: AnimationSpec<Dp>) {
         onDismissComplete = null
+        isDragging = false
         changeAnchor(EXPANDED_ANCHOR)
         coroutineScope.launch {
-            animatable.upperBound?.let { animatable.animateTo(it, animationSpec) }
+            val target = expandedBound.coerceAtLeast(collapsedBound)
+            val lower = (if (isDismissible) dismissedBound else collapsedBound).coerceAtMost(target)
+            if (animatable.upperBound == null || animatable.upperBound != target) {
+                animatable.updateBounds(lower, target)
+            }
+            animatable.animateTo(target, animationSpec)
         }
     }
 
