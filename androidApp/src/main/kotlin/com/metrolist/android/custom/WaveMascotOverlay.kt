@@ -24,6 +24,8 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -91,6 +93,7 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -146,27 +149,92 @@ half4 main(float2 fragCoord) {
     float m = float(max(c.r, max(c.g, c.b)));
     float2 uv = fragCoord / max(iResolution, float2(1.0));
 
-    float nL = maxRgb(fragCoord + float2(-5.0, 0.0));
-    float nR = maxRgb(fragCoord + float2( 5.0, 0.0));
-    float nU = maxRgb(fragCoord + float2( 0.0,-5.0));
-    float nD = maxRgb(fragCoord + float2( 0.0, 5.0));
+    float nL = maxRgb(fragCoord + float2(-4.0, 0.0));
+    float nR = maxRgb(fragCoord + float2( 4.0, 0.0));
+    float nU = maxRgb(fragCoord + float2( 0.0,-4.0));
+    float nD = maxRgb(fragCoord + float2( 0.0, 4.0));
 
-    bool surroundedHoriz = (nL > 0.05 && nR > 0.05);
-    bool surroundedVert  = (nU > 0.05 && nD > 0.05);
-    bool inCenterTorso   = (uv.y > 0.72 && abs(uv.x - 0.5) < 0.22 && m > 0.015);
+    bool surroundedHoriz = (nL > 0.075 && nR > 0.075);
+    bool surroundedVert  = (nU > 0.075 && nD > 0.075);
 
     float alpha = 1.0;
-    if (!inCenterTorso && !surroundedHoriz && !surroundedVert) {
-        alpha = smoothstep(0.012, 0.044, m);
+    if (!surroundedHoriz && !surroundedVert) {
+        alpha = smoothstep(0.022, 0.056, m);
     }
 
-    float bottomFade = smoothstep(1.0, 0.92, uv.y);
+    float bottomFade = smoothstep(1.0, 0.90, uv.y);
     float sideFade = smoothstep(0.0, 0.05, uv.x) * smoothstep(1.0, 0.95, uv.x);
     alpha *= bottomFade * sideFade;
 
     return half4(c.rgb * half(alpha), half(alpha));
 }
 """
+
+private fun pickFallbackMascotPhrase(
+    mood: WaveMood,
+    lastPhrase: String?,
+): String {
+    val pool =
+        when (mood) {
+            WaveMood.DRIVE ->
+                listOf(
+                    "О, вот это уже пошёл нормальный темп!",
+                    "Добавляй громкости, этот трек тащит.",
+                    "Погнали — ритм прям то что надо.",
+                    "Вот под такой вайб не заскучаешь.",
+                    "Хороший разгон, держим волну!",
+                )
+
+            WaveMood.NIGHT ->
+                listOf(
+                    "Ночной вайб — мой любимый режим.",
+                    "Идеально под фонари и пустую дорогу.",
+                    "Атмосфера на максимуме, слушаем дальше.",
+                    "Тёмный, глубокий звук — прямо в точку.",
+                    "Тишина вокруг, и только этот бит в наушниках.",
+                )
+
+            WaveMood.HARD_BASS ->
+                listOf(
+                    "Осторожнее, саб сейчас всё вокруг потрясёт!",
+                    "Вот это жир — бас прямо в грудь.",
+                    "808 отрабатывает на все сто.",
+                    "Наушники держатся? Качает знатно!",
+                    "Плотнейший звук, не переключай.",
+                )
+
+            WaveMood.CHILL ->
+                listOf(
+                    "Расслабляемся и ловим спокойный поток.",
+                    "Мягко заходит, никуда не спешим.",
+                    "Уютный трек — можно просто выдохнуть.",
+                    "Лёгкий вайб, идеальный фон.",
+                    "Плавно идём дальше по волне.",
+                )
+
+            WaveMood.SAD ->
+                listOf(
+                    "Чувствуется настроение… побуду рядом.",
+                    "Сильный трек, прямо за душу берёт.",
+                    "Иногда именно такая музыка и нужна.",
+                    "Тихо слушаем, без лишних слов.",
+                    "Глубокая подача, цепляет.",
+                )
+
+            WaveMood.ANY ->
+                listOf(
+                    "О, этот трек хорошо зашёл!",
+                    "Ловлю ритм — дальше будет не хуже.",
+                    "Кайфовое звучание, оставляем в потоке.",
+                    "Вот за такое я и люблю твою волну.",
+                    "Настроенa на твой вкус — слушаем!",
+                    "Прямо в настроение попало.",
+                    "Классный переход, держим этот вайб.",
+                )
+        }
+    val candidates = pool.filterNot { it == lastPhrase }
+    return (candidates.ifEmpty { pool }).random()
+}
 
 @Composable
 fun WaveHomeScreen(
@@ -206,24 +274,25 @@ fun WaveHomeScreen(
     var showEngineSettingsSheet by remember { mutableStateOf(false) }
     var showSourcePickerSheet by remember { mutableStateOf(false) }
 
-    LaunchedEffect(currentSong?.id, isPlaying) {
+    LaunchedEffect(currentSong?.id) {
         val song = currentSong
         if (song == null) {
             mascotPhrase = null
             lastPhraseSongId = null
             return@LaunchedEffect
         }
-        if (song.id != lastPhraseSongId) {
-            mascotPhrase = null
-            lastPhraseSongId = song.id
-        } else if (mascotPhrase != null) {
+        if (song.id == lastPhraseSongId && !mascotPhrase.isNullOrBlank()) {
             return@LaunchedEffect
         }
-        if (!isPlaying) return@LaunchedEffect
-        delay(1_200L)
-        if (currentSong?.id == song.id) {
-            val artist = song.artists.joinToString(", ") { it.name }.trim()
-            mascotPhrase =
+        val previousPhrase = mascotPhrase
+        lastPhraseSongId = song.id
+        mascotPhrase = null
+        delay(650L)
+        if (currentSong?.id != song.id) return@LaunchedEffect
+
+        val artist = song.artists.joinToString(", ") { it.name }.trim()
+        val bankPhrase =
+            runCatching {
                 phraseBank.nextPhraseForTrack(
                     artist = artist,
                     title = song.title,
@@ -231,6 +300,10 @@ fun WaveHomeScreen(
                     moodLabel = cfg.waveMood.label,
                     hasGeminiKey = cfg.geminiApiKey.isNotBlank(),
                 )
+            }.getOrNull()?.trim()?.takeIf { it.isNotBlank() }
+
+        if (currentSong?.id == song.id) {
+            mascotPhrase = bankPhrase ?: pickFallbackMascotPhrase(cfg.waveMood, previousPhrase)
         }
     }
 
@@ -279,6 +352,13 @@ fun WaveHomeScreen(
         }
         launchFreshWave()
     }
+
+    val activeBubbleText =
+        when {
+            !waveStatus.isNullOrBlank() -> waveStatus
+            isPlaying && !mascotPhrase.isNullOrBlank() -> mascotPhrase
+            else -> null
+        }
 
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val qualityBadge =
@@ -379,7 +459,6 @@ fun WaveHomeScreen(
                 WaveBottomStatusAndPlayer(
                     currentSong = currentSong,
                     isLiked = isCurrentLiked,
-                    statusOrPhrase = waveStatus ?: mascotPhrase,
                     onToggleLike = { song ->
                         val willLike = !isCurrentLiked
                         val artist = song.artists.joinToString(", ") { it.name }.trim()
@@ -430,6 +509,12 @@ fun WaveHomeScreen(
                             isPlaying = isPlaying,
                             isGenerating = isGenerating,
                             showMascot = cfg.mascotEnabled,
+                            speechBubbleText = activeBubbleText,
+                            onSpeechBubbleClick = {
+                                if (waveStatus.isNullOrBlank() && isPlaying) {
+                                    mascotPhrase = pickFallbackMascotPhrase(cfg.waveMood, mascotPhrase)
+                                }
+                            },
                             stageSize = 280.dp,
                             onClick = ::startOrToggleWave,
                         )
@@ -454,7 +539,13 @@ fun WaveHomeScreen(
                         isPlaying = isPlaying,
                         isGenerating = isGenerating,
                         showMascot = cfg.mascotEnabled,
-                        stageSize = 300.dp,
+                        speechBubbleText = activeBubbleText,
+                        onSpeechBubbleClick = {
+                            if (waveStatus.isNullOrBlank() && isPlaying) {
+                                mascotPhrase = pickFallbackMascotPhrase(cfg.waveMood, mascotPhrase)
+                            }
+                        },
+                        stageSize = 290.dp,
                         onClick = ::startOrToggleWave,
                     )
 
@@ -574,6 +665,66 @@ fun WaveHomeScreen(
                     showEngineSettingsSheet = false
                     launchFreshWave()
                 },
+            )
+        }
+    }
+}
+
+@Composable
+private fun MascotSpeechBubble(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val bubbleColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f)
+    val borderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.42f)
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier,
+    ) {
+        Surface(
+            onClick = onClick,
+            shape = RoundedCornerShape(18.dp),
+            color = bubbleColor,
+            contentColor = MaterialTheme.colorScheme.onSurface,
+            border = BorderStroke(1.dp, borderColor),
+            tonalElevation = 4.dp,
+            shadowElevation = 6.dp,
+            modifier = Modifier.widthIn(min = 120.dp, max = 300.dp),
+        ) {
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            )
+        }
+        Canvas(modifier = Modifier.size(width = 16.dp, height = 8.dp)) {
+            val fillPath =
+                Path().apply {
+                    moveTo(0f, 0f)
+                    lineTo(size.width, 0f)
+                    lineTo(size.width / 2f, size.height)
+                    close()
+                }
+            drawPath(path = fillPath, color = bubbleColor)
+            val strokePx = 1.dp.toPx()
+            drawLine(
+                color = borderColor,
+                start = Offset(0f, 0f),
+                end = Offset(size.width / 2f, size.height),
+                strokeWidth = strokePx,
+            )
+            drawLine(
+                color = borderColor,
+                start = Offset(size.width, 0f),
+                end = Offset(size.width / 2f, size.height),
+                strokeWidth = strokePx,
             )
         }
     }
@@ -870,6 +1021,8 @@ private fun AnimatedWaveMascotStage(
     isPlaying: Boolean,
     isGenerating: Boolean,
     showMascot: Boolean,
+    speechBubbleText: String?,
+    onSpeechBubbleClick: () -> Unit,
     stageSize: Dp,
     onClick: () -> Unit,
 ) {
@@ -996,6 +1149,22 @@ private fun AnimatedWaveMascotStage(
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        Box(
+            contentAlignment = Alignment.BottomCenter,
+            modifier = Modifier.height(54.dp),
+        ) {
+            AnimatedVisibility(
+                visible = !speechBubbleText.isNullOrBlank(),
+                enter = fadeIn(tween(260)) + scaleIn(initialScale = 0.9f, animationSpec = tween(260)),
+                exit = fadeOut(tween(180)) + scaleOut(targetScale = 0.94f, animationSpec = tween(180)),
+            ) {
+                MascotSpeechBubble(
+                    text = speechBubbleText.orEmpty(),
+                    onClick = onSpeechBubbleClick,
+                )
+            }
+        }
+
         Box(
             contentAlignment = Alignment.Center,
             modifier =
@@ -1316,26 +1485,12 @@ private fun DislikeBanIcon(
 private fun WaveBottomStatusAndPlayer(
     currentSong: SongItem?,
     isLiked: Boolean,
-    statusOrPhrase: String?,
     onToggleLike: (SongItem) -> Unit,
     onDislikeClick: (SongItem) -> Unit,
     onPreviousClick: () -> Unit,
     onNextClick: () -> Unit,
     onOpenFullPlayer: () -> Unit,
 ) {
-    if (!statusOrPhrase.isNullOrBlank()) {
-        Spacer(modifier = Modifier.height(10.dp))
-        Text(
-            text = statusOrPhrase,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 8.dp),
-        )
-    }
-
     AnimatedVisibility(
         visible = currentSong != null,
         enter = fadeIn(),
