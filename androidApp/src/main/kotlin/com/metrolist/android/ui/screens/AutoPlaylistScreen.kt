@@ -289,25 +289,38 @@ fun AutoPlaylistScreen(
     val playCounts by remember(database, countIds) {
         if (countIds.isEmpty()) flowOf(emptyMap()) else database.collectionPlayCounts(countIds)
     }.collectAsState(emptyMap())
-    var playlistSort by remember(currentType) {
-        mutableStateOf(
-            Settings.shared
-                .playlistSongSorting(
+
+    val defaultLikedSort =
+        remember {
+            PlaylistSongSort.entries.firstOrNull {
+                it.name.contains("RECENT", ignoreCase = true) ||
+                    it.name.contains("ADDED", ignoreCase = true) ||
+                    it.name.contains("CREATE", ignoreCase = true)
+            } ?: Settings.shared.likedSongSort
+        }
+
+    val initialSongSorting =
+        remember(currentType) {
+            if (currentType == "liked") {
+                Settings.shared.playlistSongSorting(
+                    "special:liked",
+                    defaultLikedSort,
+                    SortDirection.DESCENDING,
+                )
+            } else {
+                Settings.shared.playlistSongSorting(
                     "special:$currentType",
-                    if (currentType == "liked") Settings.shared.likedSongSort else Settings.shared.playlistSongSort,
-                    if (currentType == "liked") Settings.shared.likedSongSortDirection else Settings.shared.playlistSongSortDirection,
-                ).sort,
-        )
+                    Settings.shared.playlistSongSort,
+                    Settings.shared.playlistSongSortDirection,
+                )
+            }
+        }
+
+    var playlistSort by remember(currentType) {
+        mutableStateOf(initialSongSorting.sort)
     }
     var playlistSortDirection by remember(currentType) {
-        mutableStateOf(
-            Settings.shared
-                .playlistSongSorting(
-                    "special:$currentType",
-                    if (currentType == "liked") Settings.shared.likedSongSort else Settings.shared.playlistSongSort,
-                    if (currentType == "liked") Settings.shared.likedSongSortDirection else Settings.shared.playlistSongSortDirection,
-                ).direction,
-        )
+        mutableStateOf(initialSongSorting.direction)
     }
     var topPeriod by remember { mutableStateOf(TopPlaylistPeriod.ALL_TIME) }
     var topDirection by remember { mutableStateOf(SortDirection.DESCENDING) }
@@ -887,10 +900,17 @@ fun AutoPlaylistScreen(
                                     reorderMode = isLikedCollection && likedReorderMode,
                                     canReorder = isLikedCollection,
                                     onSortChange = {
+                                        val nextDirection =
+                                            if (isLikedCollection && it == defaultLikedSort) {
+                                                SortDirection.DESCENDING
+                                            } else {
+                                                playlistSortDirection
+                                            }
                                         playlistSort = it
+                                        playlistSortDirection = nextDirection
                                         Settings.shared.setPlaylistSongSorting(
                                             "special:$currentType",
-                                            SavedPlaylistSongSorting(it, playlistSortDirection),
+                                            SavedPlaylistSongSorting(it, nextDirection),
                                         )
                                     },
                                     onSortDirectionChange = {
