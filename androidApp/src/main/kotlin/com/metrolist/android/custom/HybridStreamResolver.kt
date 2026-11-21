@@ -443,7 +443,17 @@ object LocalCensorshipAdvisor {
             "три дня дождя",
             "дк",
             "dk",
+            "aarne",
+            "villian",
+            "madk1d",
+            "blago white",
+            "mag luzi",
+            "цинк уродов",
+            "a v g",
         )
+
+    fun hasCyrillic(text: String): Boolean =
+        text.any { ch -> ch in 'а'..'я' || ch in 'А'..'Я' || ch == 'ё' || ch == 'Ё' }
 
     fun rememberCensoredArtist(artist: String) {
         val parts = artist.split(",", "&", "feat.", "ft.")
@@ -462,7 +472,7 @@ object LocalCensorshipAdvisor {
         if (learnedArtists.any { normArtist.contains(it) }) return true
         if (knownRuCensoredArtists.any { normArtist.contains(it) }) return true
         val normTitle = TrackMatcher.normalize(title)
-        return normTitle.contains("explicit") || normTitle.contains("uncensored") || normTitle.contains("без цензуры")
+        return normTitle.contains("uncensored") || normTitle.contains("без цензуры")
     }
 }
 
@@ -822,24 +832,25 @@ class HybridStreamResolver(
                 fallbackExplicit = song.isExplicit || song.explicitness == true,
             )
 
+        val isRuTrack = LocalCensorshipAdvisor.hasCyrillic(artist) || LocalCensorshipAdvisor.hasCyrillic(title)
         val localCensored =
             manualPref == TrackSourcePreference.AUTO &&
                 cfg.preferVkForExplicit &&
                 cfg.vkToken.isNotBlank() &&
-                LocalCensorshipAdvisor.isLikelyCensoredOnYandex(artist, title)
+                (
+                    LocalCensorshipAdvisor.isLikelyCensoredOnYandex(artist, title) ||
+                        (reference.isExplicit && isRuTrack)
+                )
 
         val isManualCustom = manualPref == TrackSourcePreference.YANDEX || manualPref == TrackSourcePreference.VK
         val (order, reason) =
             when {
                 manualPref == TrackSourcePreference.YANDEX -> listOf("yandex") to "ручной выбор"
                 manualPref == TrackSourcePreference.VK -> listOf("vk") to "ручной выбор"
-                (reference.isExplicit || localCensored) && cfg.preferVkForExplicit && cfg.vkToken.isNotBlank() -> {
-                    val tag = if (localCensored) "антицензура → VK" else "Explicit → VK"
-                    listOf("vk", "yandex") to tag
-                }
+                localCensored -> listOf("vk", "yandex") to "антицензура РФ → VK"
                 videoId.startsWith("vk_") -> listOf("vk", "yandex") to "каталог VK"
                 videoId.startsWith("ym_") -> listOf("yandex", "vk") to "каталог Яндекса"
-                else -> listOf("yandex", "vk") to "автокаскад"
+                else -> listOf("yandex", "vk") to "приоритет Я.Музыка"
             }
 
         val vkVariant = vkVariantIndexByVideo[videoId] ?: 0
