@@ -539,6 +539,25 @@ class PlayerConnection(
             }
     }
 
+    fun replaceUpcomingWaveQueue(songs: List<SongItem>) {
+        if (songs.isEmpty()) return
+        if (deferUntilConnected { replaceUpcomingWaveQueue(songs) }) return
+        val player = musicService?.player ?: return
+        val currentId = _currentSong.value?.id
+        val upcoming = if (currentId != null) songs.filterNot { it.id == currentId } else songs
+        if (upcoming.isEmpty()) return
+        if (_currentSong.value == null) {
+            playQueue(
+                songs = upcoming,
+                queueTitle = "Моя волна",
+                finite = false,
+                forceStartPlaying = true,
+            )
+        } else {
+            player.replaceUpcomingQueue(upcoming)
+        }
+    }
+
     private fun startWaveFromTrackId(songId: String) {
         val song =
             _currentSong.value?.takeIf { it.id == songId }
@@ -815,7 +834,7 @@ class PlayerConnection(
         val existingIds = snapshot.displayedItems.mapTo(HashSet()) { it.id }
         waveRefillJob =
             scope.launch {
-                engine.generateWaveSongs(count = 20).onSuccess { fresh ->
+                engine.generateWaveSongs(count = 20, backgroundLabel = true).onSuccess { fresh ->
                     val unique = fresh.filter { it.id !in existingIds }
                     if (unique.isNotEmpty() && _queueTitle.value?.startsWith("Моя волна") == true) {
                         addToQueue(unique, playNext = false)
