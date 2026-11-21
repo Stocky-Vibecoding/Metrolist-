@@ -794,8 +794,7 @@ fun MetrolistApp(
         val statusBarHeight = WindowInsets.statusBars.getTop(LocalDensity.current)
         val hasDesktopCaption = shouldUseDesktopCaption(Build.VERSION.SDK_INT, captionHeight, useDesktopLayout, statusBarHeight)
         val shouldShowNavigationBar =
-            (useDesktopUi || currentRoute in topLevelRoutes) &&
-                !(currentRoute == Screen.Search && searchResultsVisible)
+            useDesktopUi || currentRoute in topLevelRoutes
         val usesDirectionalNavigation = isAndroidTv || isAutomotive
         val navigationSuiteType =
             when {
@@ -2044,6 +2043,7 @@ fun MetrolistApp(
         }
     }
 }
+
 @Composable
 private fun ListenTogetherPlaybackRequestHandler(playerConnection: PlayerConnection) {
     var request by remember { mutableStateOf<ListenTogetherPlaybackRequest?>(null) }
