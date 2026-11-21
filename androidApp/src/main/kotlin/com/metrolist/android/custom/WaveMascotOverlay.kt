@@ -10,6 +10,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -20,8 +21,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -68,6 +69,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -75,9 +77,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -89,6 +94,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.metrolist.android.playback.PlayerConnection
 import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
@@ -104,6 +110,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
 
 @Composable
 fun WaveHomeScreen(
@@ -122,7 +131,6 @@ fun WaveHomeScreen(
     val cfg by configStore.config.collectAsState()
     val isGenerating by aiWaveEngine.isGeneratingWave.collectAsState()
     val waveStatus by aiWaveEngine.statusText.collectAsState()
-    val activeModel by geminiClient.activeModel.collectAsState()
     val diagnosticsRevision by ResolverDiagnostics.revision.collectAsState()
 
     val phraseBank = remember(context, geminiClient) { MascotPhraseBank(context.applicationContext, geminiClient) }
@@ -292,7 +300,7 @@ fun WaveHomeScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             val filterControlsBlock: @Composable () -> Unit = {
                 FlowRow(
@@ -318,7 +326,6 @@ fun WaveHomeScreen(
                     currentSong = currentSong,
                     isLiked = isCurrentLiked,
                     statusOrPhrase = waveStatus ?: mascotPhrase,
-                    activeModel = activeModel,
                     onToggleLike = { song ->
                         val willLike = !isCurrentLiked
                         val artist = song.artists.joinToString(", ") { it.name }.trim()
@@ -357,11 +364,11 @@ fun WaveHomeScreen(
                         modifier = Modifier.weight(1f),
                         contentAlignment = Alignment.Center,
                     ) {
-                        AmbientWaveButton(
+                        AnimatedWaveMascotStage(
                             isPlaying = isPlaying,
                             isGenerating = isGenerating,
                             showMascot = cfg.mascotEnabled,
-                            size = 244.dp,
+                            stageSize = 270.dp,
                             onClick = ::startOrToggleWave,
                         )
                     }
@@ -381,15 +388,15 @@ fun WaveHomeScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    AmbientWaveButton(
+                    AnimatedWaveMascotStage(
                         isPlaying = isPlaying,
                         isGenerating = isGenerating,
                         showMascot = cfg.mascotEnabled,
-                        size = 252.dp,
+                        stageSize = 290.dp,
                         onClick = ::startOrToggleWave,
                     )
 
-                    Spacer(modifier = Modifier.height(18.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
 
                     filterControlsBlock()
 
@@ -407,8 +414,9 @@ fun WaveHomeScreen(
         ) {
             WaveFilterSheetContent(
                 config = cfg,
+                isGenerating = isGenerating,
                 onUpdate = { transform -> configStore.update(transform) },
-                onApplyAndWave = {
+                onRefreshWave = {
                     showWaveSettingsSheet = false
                     launchFreshWave()
                 },
@@ -500,6 +508,10 @@ fun WaveHomeScreen(
                 yandexProvider = yandexProvider,
                 vkProvider = vkProvider,
                 geminiClient = geminiClient,
+                onRefreshWave = {
+                    showEngineSettingsSheet = false
+                    launchFreshWave()
+                },
             )
         }
     }
@@ -602,11 +614,11 @@ private fun ReturnToWavePillButton(
 }
 
 @Composable
-private fun AmbientWaveButton(
+private fun AnimatedWaveMascotStage(
     isPlaying: Boolean,
     isGenerating: Boolean,
     showMascot: Boolean,
-    size: Dp,
+    stageSize: Dp,
     onClick: () -> Unit,
 ) {
     val primaryColor = MaterialTheme.colorScheme.primary
@@ -616,19 +628,29 @@ private fun AmbientWaveButton(
 
     val bassEnergy = remember { mutableFloatStateOf(0f) }
     val beatKick = remember { mutableFloatStateOf(0f) }
+    val eqBars = remember { FloatArray(28) }
+    val eqTick = remember { mutableLongStateOf(0L) }
+    val kickCounter = remember { mutableIntStateOf(0) }
 
     LaunchedEffect(isPlaying) {
         if (!isPlaying) {
             while (isActive) {
                 bassEnergy.floatValue = (bassEnergy.floatValue * 0.85f).coerceAtLeast(0f)
                 beatKick.floatValue = (beatKick.floatValue * 0.80f).coerceAtLeast(0f)
-                if (bassEnergy.floatValue < 0.01f && beatKick.floatValue < 0.01f) break
+                var maxBar = 0f
+                for (i in eqBars.indices) {
+                    eqBars[i] = (eqBars[i] * 0.82f).coerceAtLeast(0f)
+                    if (eqBars[i] > maxBar) maxBar = eqBars[i]
+                }
+                eqTick.longValue += 1L
+                if (bassEnergy.floatValue < 0.01f && beatKick.floatValue < 0.01f && maxBar < 0.01f) break
                 delay(33L)
             }
             return@LaunchedEffect
         }
         com.metrolist.shared.equalizer.AudioSpectrumMeter.addConsumer()
-        var avgBass = 0.15f
+        var avgBass = 0.14f
+        var lastKickAt = 0L
         try {
             while (isActive) {
                 val levels = com.metrolist.shared.equalizer.AudioSpectrumMeter.levels()
@@ -639,12 +661,25 @@ private fun AmbientWaveButton(
                             (levels.getOrElse(2) { 0f } * 0.20f)
                     ).coerceIn(0f, 1f)
                 bassEnergy.floatValue =
-                    if (rawBass > bassEnergy.floatValue) rawBass else (bassEnergy.floatValue * 0.78f + rawBass * 0.22f)
+                    if (rawBass > bassEnergy.floatValue) rawBass else (bassEnergy.floatValue * 0.76f + rawBass * 0.24f)
 
                 val delta = (rawBass - avgBass).coerceAtLeast(0f)
-                avgBass = avgBass * 0.90f + rawBass * 0.10f
-                val kickNow = (delta * 3.2f).coerceIn(0f, 1f)
-                beatKick.floatValue = if (kickNow > beatKick.floatValue) kickNow else (beatKick.floatValue * 0.76f)
+                avgBass = avgBass * 0.88f + rawBass * 0.12f
+                val kickNow = (delta * 3.4f).coerceIn(0f, 1f)
+                val nowMs = System.currentTimeMillis()
+                if (kickNow > 0.35f && nowMs - lastKickAt > 260L) {
+                    kickCounter.intValue += 1
+                    lastKickAt = nowMs
+                }
+                beatKick.floatValue = if (kickNow > beatKick.floatValue) kickNow else (beatKick.floatValue * 0.74f)
+
+                val srcSize = levels.size.coerceAtLeast(1)
+                for (i in eqBars.indices) {
+                    val sampleIdx = (i * srcSize / eqBars.size).coerceIn(0, srcSize - 1)
+                    val target = levels.getOrElse(sampleIdx) { rawBass }.coerceIn(0f, 1f)
+                    eqBars[i] = if (target > eqBars[i]) target else (eqBars[i] * 0.72f + target * 0.28f)
+                }
+                eqTick.longValue += 1L
                 delay(33L)
             }
         } finally {
@@ -652,121 +687,297 @@ private fun AmbientWaveButton(
         }
     }
 
-    val infiniteTransition = rememberInfiniteTransition(label = "waveAmbient")
-    val idleBreathState =
+    val infiniteTransition = rememberInfiniteTransition(label = "mascotMotion")
+    val breathPhase =
         infiniteTransition.animateFloat(
             initialValue = 0f,
             targetValue = 1f,
             animationSpec =
                 infiniteRepeatable(
-                    animation = tween(durationMillis = 3200, easing = FastOutSlowInEasing),
+                    animation = tween(durationMillis = 3000, easing = FastOutSlowInEasing),
                     repeatMode = RepeatMode.Reverse,
                 ),
-            label = "idleBreath",
+            label = "breathPhase",
+        )
+    val headSwayPhase =
+        infiniteTransition.animateFloat(
+            initialValue = -1f,
+            targetValue = 1f,
+            animationSpec =
+                infiniteRepeatable(
+                    animation = tween(durationMillis = 880, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+            label = "headSwayPhase",
+        )
+    val zzzPhase =
+        infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec =
+                infiniteRepeatable(
+                    animation = tween(durationMillis = 2600, easing = LinearEasing),
+                    repeatMode = RepeatMode.Restart,
+                ),
+            label = "zzzPhase",
         )
 
-    val mascotResId = if (showMascot) CustomMascotAssets.drawableResId else 0
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier.size(size),
-    ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val center = Offset(this.size.width / 2f, this.size.height / 2f)
-            val maxR = this.size.minDimension / 2f
-            val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
-            val kick = beatKick.floatValue.coerceIn(0f, 1f)
-            val energy = if (isPlaying) pulse else idleBreathState.value * 0.28f
-
-            val outerR = maxR * (0.78f + energy * 0.18f + kick * 0.06f)
-            drawCircle(
-                brush =
-                    Brush.radialGradient(
-                        colors =
-                            listOf(
-                                primaryColor.copy(alpha = (0.36f + energy * 0.30f + kick * 0.12f).coerceIn(0f, 0.76f)),
-                                tertiaryColor.copy(alpha = (0.14f + energy * 0.16f).coerceIn(0f, 0.42f)),
-                                Color.Transparent,
-                            ),
-                        center = center,
-                        radius = outerR,
-                    ),
-                radius = outerR,
-                center = center,
-            )
-
-            val innerR = maxR * (0.52f + energy * 0.12f)
-            drawCircle(
-                brush =
-                    Brush.radialGradient(
-                        colors =
-                            listOf(
-                                primaryColor.copy(alpha = (0.28f + energy * 0.22f).coerceIn(0f, 0.60f)),
-                                Color.Transparent,
-                            ),
-                        center = center,
-                        radius = innerR,
-                    ),
-                radius = innerR,
-                center = center,
-            )
+    val hasDedicatedSprites = CustomMascotAssets.hasDedicatedSprites
+    val mascotResId =
+        if (!showMascot) {
+            0
+        } else if (!isPlaying) {
+            CustomMascotAssets.sleepResId.takeIf { it != 0 } ?: CustomMascotAssets.drawableResId
+        } else {
+            val vibe = CustomMascotAssets.vibeResId
+            if (vibe != 0 && beatKick.floatValue > 0.45f) {
+                vibe
+            } else {
+                CustomMascotAssets.awakeResId.takeIf { it != 0 } ?: CustomMascotAssets.drawableResId
+            }
         }
 
-        Surface(
-            onClick = onClick,
-            shape = CircleShape,
-            color = containerColor.copy(alpha = 0.92f),
-            contentColor = onContainerColor,
-            tonalElevation = 6.dp,
-            shadowElevation = 10.dp,
-            border = BorderStroke(1.5.dp, primaryColor.copy(alpha = 0.45f)),
+    val tapInteraction = remember { MutableInteractionSource() }
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
             modifier =
                 Modifier
-                    .size(if (mascotResId != 0) 136.dp else 112.dp)
-                    .graphicsLayer {
-                        val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
-                        val kick = beatKick.floatValue.coerceIn(0f, 1f)
-                        val s =
-                            if (isPlaying) {
-                                1f + pulse * 0.06f + kick * 0.045f
-                            } else {
-                                1f + idleBreathState.value * 0.02f
-                            }
-                        scaleX = s
-                        scaleY = s
-                    },
+                    .size(stageSize)
+                    .clickable(
+                        interactionSource = tapInteraction,
+                        indication = null,
+                        onClick = onClick,
+                    ),
         ) {
-            Box(contentAlignment = Alignment.Center) {
-                if (mascotResId != 0) {
-                    Image(
-                        painter = painterResource(id = mascotResId),
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                    Box(
-                        modifier =
-                            Modifier
-                                .fillMaxSize()
-                                .background(Color.Black.copy(alpha = if (isPlaying) 0.24f else 0.42f)),
+            // Задний живой фон: свечение + звёзды + круговой эквалайзер в такт басу
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val _tick = eqTick.longValue
+                val center = Offset(size.width / 2f, size.height / 2f)
+                val maxR = size.minDimension / 2f
+                val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
+                val kick = beatKick.floatValue.coerceIn(0f, 1f)
+                val breath = breathPhase.value
+                val energy = if (isPlaying) pulse else breath * 0.25f
+
+                // Внешнее мягкое неоновое свечение
+                val outerR = maxR * (0.86f + energy * 0.14f + kick * 0.05f)
+                drawCircle(
+                    brush =
+                        Brush.radialGradient(
+                            colors =
+                                listOf(
+                                    primaryColor.copy(alpha = (0.30f + energy * 0.28f + kick * 0.12f).coerceIn(0f, 0.70f)),
+                                    tertiaryColor.copy(alpha = (0.14f + energy * 0.14f).coerceIn(0f, 0.38f)),
+                                    Color.Transparent,
+                                ),
+                            center = center,
+                            radius = outerR,
+                        ),
+                    radius = outerR,
+                    center = center,
+                )
+
+                // Круговой эквалайзер вокруг персонажа
+                val barCount = eqBars.size
+                val innerRingR = maxR * (0.60f + kick * 0.03f)
+                val maxBarLen = maxR * 0.24f
+                val barStroke = 3.dp.toPx()
+                for (i in 0 until barCount) {
+                    val angle = (i.toFloat() / barCount) * (2.0 * PI) - PI / 2.0
+                    val barAmp =
+                        if (isPlaying) {
+                            (eqBars[i] * 0.85f + pulse * 0.22f).coerceIn(0.06f, 1f)
+                        } else {
+                            0.08f + 0.06f * sin(breath * PI + i * 0.5).toFloat().coerceAtLeast(0f)
+                        }
+                    val startR = innerRingR
+                    val endR = innerRingR + maxBarLen * barAmp
+                    val cosA = cos(angle).toFloat()
+                    val sinA = sin(angle).toFloat()
+                    val barColor =
+                        if (i % 2 == 0) {
+                            primaryColor.copy(alpha = (0.28f + barAmp * 0.55f).coerceIn(0.2f, 0.85f))
+                        } else {
+                            tertiaryColor.copy(alpha = (0.22f + barAmp * 0.48f).coerceIn(0.18f, 0.75f))
+                        }
+                    drawLine(
+                        color = barColor,
+                        start = Offset(center.x + cosA * startR, center.y + sinA * startR),
+                        end = Offset(center.x + cosA * endR, center.y + sinA * endR),
+                        strokeWidth = barStroke,
+                        cap = StrokeCap.Round,
                     )
                 }
 
-                if (isGenerating && !isPlaying) {
-                    CircularProgressIndicator(
-                        color = if (mascotResId != 0) Color.White else onContainerColor,
-                        strokeWidth = 3.dp,
-                        modifier = Modifier.size(34.dp),
-                    )
-                } else {
-                    Icon(
-                        imageVector = if (isPlaying) MetrolistIcons.Filled.Pause else MetrolistIcons.Filled.PlayArrow,
-                        contentDescription = if (isPlaying) "Пауза" else "Запустить волну",
-                        tint = if (mascotResId != 0) Color.White else onContainerColor,
-                        modifier = Modifier.size(46.dp),
+                // Мягкие мерцающие звёздочки вокруг
+                val starAngles = floatArrayOf(0.4f, 1.35f, 2.25f, 3.55f, 4.45f, 5.45f)
+                val starRadii = floatArrayOf(0.84f, 0.90f, 0.82f, 0.88f, 0.83f, 0.91f)
+                for (idx in starAngles.indices) {
+                    val a = starAngles[idx] + breath * 0.08f
+                    val r = maxR * starRadii[idx]
+                    val sx = center.x + cos(a) * r
+                    val sy = center.y + sin(a) * r
+                    val twinkle = (0.25f + 0.55f * ((sin(breath * PI * 2.0 + idx).toFloat() + 1f) * 0.5f))
+                    drawCircle(
+                        color = if (idx % 2 == 0) primaryColor.copy(alpha = twinkle) else tertiaryColor.copy(alpha = twinkle),
+                        radius = (1.6.dp + (idx % 2).dp).toPx() * (1f + kick * 0.4f),
+                        center = Offset(sx, sy),
                     )
                 }
             }
+
+            if (mascotResId != 0) {
+                val mascotSize = stageSize * 0.78f
+                val spriteModifier =
+                    if (hasDedicatedSprites) {
+                        Modifier.fillMaxSize()
+                    } else {
+                        // Плавное растворение краёв для квадратной картинки — без жёсткого кружка
+                        Modifier
+                            .fillMaxSize()
+                            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                            .drawWithContent {
+                                drawContent()
+                                drawRect(
+                                    brush =
+                                        Brush.radialGradient(
+                                            0.0f to Color.Black,
+                                            0.58f to Color.Black,
+                                            0.84f to Color.Black.copy(alpha = 0.5f),
+                                            1.0f to Color.Transparent,
+                                            center = Offset(size.width / 2f, size.height / 2f),
+                                            radius = size.minDimension / 2f,
+                                        ),
+                                    blendMode = BlendMode.DstIn,
+                                )
+                            }
+                    }
+
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier =
+                        Modifier
+                            .size(mascotSize)
+                            .graphicsLayer {
+                                val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
+                                val kick = beatKick.floatValue.coerceIn(0f, 1f)
+                                val sway = headSwayPhase.value
+                                val breath = breathPhase.value
+
+                                if (isPlaying) {
+                                    val beatDir = if (kickCounter.intValue % 2 == 0) 1f else -1f
+                                    // Живое качание головой и упругий кивок в такт бочке
+                                    rotationZ = sway * (2.6f + pulse * 3.8f) + beatDir * kick * 2.2f
+                                    translationY = (kick * 9.dp.toPx()) + (pulse * 2.dp.toPx())
+                                    scaleX = 1f + kick * 0.045f + pulse * 0.02f
+                                    scaleY = 1f - kick * 0.035f + pulse * 0.025f
+                                    alpha = 1f
+                                } else {
+                                    // Спит: лёгкий наклон головы и медленное дыхание
+                                    rotationZ = -2.2f + breath * 1.4f
+                                    translationY = 4.dp.toPx() - breath * 3.dp.toPx()
+                                    scaleX = 1f + breath * 0.015f
+                                    scaleY = 1f + breath * 0.028f
+                                    alpha = 0.84f
+                                }
+                            },
+                ) {
+                    Image(
+                        painter = painterResource(id = mascotResId),
+                        contentDescription = if (isPlaying) "Пауза" else "Разбудить и включить волну",
+                        contentScale = if (hasDedicatedSprites) ContentScale.Fit else ContentScale.Crop,
+                        modifier = spriteModifier,
+                    )
+                }
+
+                // Сонные z Z z пока музыка на паузе
+                if (!isPlaying) {
+                    val zLetters = listOf("z" to 0.0f, "Z" to 0.33f, "z" to 0.66f)
+                    zLetters.forEachIndexed { idx, (letter, offsetPhase) ->
+                        Text(
+                            text = letter,
+                            fontSize = (14 + idx * 3).sp,
+                            fontWeight = FontWeight.Bold,
+                            color = primaryColor,
+                            modifier =
+                                Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(top = 46.dp, end = 42.dp)
+                                    .graphicsLayer {
+                                        val p = (zzzPhase.value + offsetPhase) % 1f
+                                        translationY = -p * 42.dp.toPx()
+                                        translationX = sin(p * PI * 2.0).toFloat() * 7.dp.toPx() + idx * 4.dp.toPx()
+                                        alpha =
+                                            when {
+                                                p < 0.2f -> p / 0.2f
+                                                p > 0.75f -> (1f - p) / 0.25f
+                                                else -> 1f
+                                            }.coerceIn(0f, 0.9f)
+                                        val s = 0.8f + p * 0.35f
+                                        scaleX = s
+                                        scaleY = s
+                                    },
+                        )
+                    }
+                }
+            } else {
+                // Фолбэк, если маскот выключен в настройках
+                Surface(
+                    onClick = onClick,
+                    shape = CircleShape,
+                    color = containerColor.copy(alpha = 0.92f),
+                    contentColor = onContainerColor,
+                    tonalElevation = 6.dp,
+                    shadowElevation = 10.dp,
+                    border = BorderStroke(1.5.dp, primaryColor.copy(alpha = 0.45f)),
+                    modifier =
+                        Modifier
+                            .size(116.dp)
+                            .graphicsLayer {
+                                val pulse = bassEnergy.floatValue.coerceIn(0f, 1f)
+                                val kick = beatKick.floatValue.coerceIn(0f, 1f)
+                                val s = if (isPlaying) 1f + pulse * 0.06f + kick * 0.045f else 1f + breathPhase.value * 0.02f
+                                scaleX = s
+                                scaleY = s
+                            },
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = if (isPlaying) MetrolistIcons.Filled.Pause else MetrolistIcons.Filled.PlayArrow,
+                            contentDescription = if (isPlaying) "Пауза" else "Запустить волну",
+                            modifier = Modifier.size(46.dp),
+                        )
+                    }
+                }
+            }
+        }
+
+        if (isGenerating && !isPlaying) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                CircularProgressIndicator(
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(16.dp),
+                )
+                Text(
+                    text = "Подбираю волну…",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else if (!isPlaying && mascotResId != 0) {
+            Text(
+                text = "Нажми, чтобы включить",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.78f),
+            )
         }
     }
 }
@@ -835,14 +1046,13 @@ private fun WaveBottomStatusAndPlayer(
     currentSong: SongItem?,
     isLiked: Boolean,
     statusOrPhrase: String?,
-    activeModel: String?,
     onToggleLike: (SongItem) -> Unit,
     onDislikeClick: (SongItem) -> Unit,
     onNextClick: () -> Unit,
     onOpenFullPlayer: () -> Unit,
 ) {
     if (!statusOrPhrase.isNullOrBlank()) {
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
         Text(
             text = statusOrPhrase,
             style = MaterialTheme.typography.bodySmall,
@@ -864,7 +1074,7 @@ private fun WaveBottomStatusAndPlayer(
         val hdCover = ResolverDiagnostics.hdCoverFor(song.id) ?: song.thumbnail ?: CustomMascotAssets.fallbackCoverUri
 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(modifier = Modifier.height(18.dp))
+            Spacer(modifier = Modifier.height(16.dp))
             Surface(
                 shape = RoundedCornerShape(22.dp),
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -928,15 +1138,6 @@ private fun WaveBottomStatusAndPlayer(
             }
         }
     }
-
-    if (!activeModel.isNullOrBlank()) {
-        Spacer(modifier = Modifier.height(6.dp))
-        Text(
-            text = "ИИ: $activeModel",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-        )
-    }
 }
 
 @Composable
@@ -962,9 +1163,16 @@ private fun NativeSourceBadge(
 @Composable
 private fun WaveFilterSheetContent(
     config: CustomAppConfig,
+    isGenerating: Boolean,
     onUpdate: ((CustomAppConfig) -> CustomAppConfig) -> Unit,
-    onApplyAndWave: () -> Unit,
+    onRefreshWave: () -> Unit,
 ) {
+    val hasCustomFilters =
+        config.waveCharacter != WaveCharacter.DEFAULT ||
+            config.waveEra != WaveEra.ANY ||
+            config.waveLanguage != WaveLanguage.ANY ||
+            config.waveMood != WaveMood.ANY
+
     Column(
         modifier =
             Modifier
@@ -1023,11 +1231,34 @@ private fun WaveFilterSheetContent(
             }
         }
 
-        Button(
-            onClick = onApplyAndWave,
-            modifier = Modifier.fillMaxWidth().height(48.dp),
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Запустить с настройками", fontWeight = FontWeight.SemiBold)
+            if (hasCustomFilters) {
+                OutlinedButton(
+                    onClick = {
+                        onUpdate {
+                            it.copy(
+                                waveCharacter = WaveCharacter.DEFAULT,
+                                waveEra = WaveEra.ANY,
+                                waveLanguage = WaveLanguage.ANY,
+                                waveMood = WaveMood.ANY,
+                            )
+                        }
+                    },
+                    modifier = Modifier.height(48.dp),
+                ) {
+                    Text("Сбросить")
+                }
+            }
+            Button(
+                enabled = !isGenerating,
+                onClick = onRefreshWave,
+                modifier = Modifier.weight(1f).height(48.dp),
+            ) {
+                Text("Обновить волну", fontWeight = FontWeight.SemiBold)
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -1050,6 +1281,7 @@ fun CustomEngineSettingsContent(
     vkProvider: VkMusicProvider,
     geminiClient: GeminiClient,
     onOpenClassicHome: () -> Unit = {},
+    onRefreshWave: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -1189,13 +1421,24 @@ fun CustomEngineSettingsContent(
             fontWeight = FontWeight.SemiBold,
         )
 
+        if (onRefreshWave != null) {
+            Button(
+                onClick = onRefreshWave,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(MetrolistIcons.Outlined.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Обновить волну сейчас", fontWeight = FontWeight.SemiBold)
+            }
+        }
+
         SettingSwitchRow(
             title = "Гибридный резолвер (Яндекс / ВК / YTM)",
             checked = cfg.hybridResolverEnabled,
             onCheckedChange = { v -> configStore.update { it.copy(hybridResolverEnabled = v) } },
         )
         SettingSwitchRow(
-            title = "Антицензура (Explicit и РФ-рэп → VK, 0 запросов ИИ)",
+            title = "Антицензура (РФ Explicit → VK, зарубежное → Яндекс)",
             checked = cfg.preferVkForExplicit,
             onCheckedChange = { v -> configStore.update { it.copy(preferVkForExplicit = v) } },
         )
@@ -1205,7 +1448,7 @@ fun CustomEngineSettingsContent(
             onCheckedChange = { v -> configStore.update { it.copy(cacheWaveAndDownloadLikes = v) } },
         )
         SettingSwitchRow(
-            title = "Маскот в центре «Волны»",
+            title = "Анимированный маскот на экране «Волны»",
             checked = cfg.mascotEnabled,
             onCheckedChange = { v -> configStore.update { it.copy(mascotEnabled = v) } },
         )
