@@ -4,6 +4,8 @@ package com.metrolist.shared.ui.screens
 
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateZoom
@@ -11,6 +13,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -20,10 +23,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
@@ -44,6 +50,8 @@ import androidx.compose.material3.ToggleButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -55,7 +63,10 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
@@ -63,9 +74,11 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -114,14 +127,17 @@ import com.metrolist.shared.settings.displayName
 import com.metrolist.shared.settings.displayTitle
 import com.metrolist.shared.settings.moveLibraryItems
 import com.metrolist.shared.settings.orderLibraryItems
+import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.components.ChipShelf
 import com.metrolist.shared.ui.components.CollectionPreviews
 import com.metrolist.shared.ui.components.ContainedLoadingIndicator
 import com.metrolist.shared.ui.components.ExpandableSearchBar
 import com.metrolist.shared.ui.components.GridCard
 import com.metrolist.shared.ui.components.ListCard
+import com.metrolist.shared.ui.components.LocalDownloadedSongIds
 import com.metrolist.shared.ui.components.ReorderMenu
 import com.metrolist.shared.ui.components.albumPlayOverlay
+import com.metrolist.shared.ui.components.images.AsyncImage
 import com.metrolist.shared.ui.components.libraryArtwork
 import com.metrolist.shared.ui.components.libraryCover
 import com.metrolist.shared.ui.components.menuAnchorSemantics
@@ -257,6 +273,8 @@ fun LibraryContent(
     val currentSongIdState = rememberUpdatedState(currentSongId)
     val isPlayingState = rememberUpdatedState(isPlaying)
     val rootActive = LocalRootContentActive.current
+    val likedIds by SongLikeState.likedSongIdsForDisplay.collectAsState(initial = SongLikeState.likedSongIds)
+    val downloadedSongIds = LocalDownloadedSongIds.current
 
     val sortingFilter = selectedFilter?.let { LibraryFilterType.valueOf(it.name) } ?: LibraryFilterType.ALL
     val sorting = Settings.shared.librarySorting(sortingFilter)
@@ -351,6 +369,37 @@ fun LibraryContent(
             } else {
                 val term = searchQuery.trim()
                 visibleAutoPlaylists.filter { it.title.contains(term, ignoreCase = true) }
+            }
+        }
+
+    val likedHeroPlaylist =
+        remember(searchedAutoPlaylists, effectiveFilter, searchQuery) {
+            if (effectiveFilter == null && searchQuery.isBlank()) {
+                searchedAutoPlaylists.firstOrNull {
+                    it.type.equals("liked", ignoreCase = true) || it.type == "LM"
+                }
+            } else {
+                null
+            }
+        }
+    val likedHeroSongs =
+        remember(items, likedIds, contentFilterVersion) {
+            val allSongs =
+                items
+                    .filterIsInstance<SongItem>()
+                    .filterNot { it.isPodcast || it.isUnavailable }
+            val filtered = if (likedIds.isNotEmpty()) allSongs.filter { it.id in likedIds } else allSongs
+            val source = if (filtered.isNotEmpty()) filtered else allSongs
+            source
+                .distinctBy { it.id }
+                .sortedByDescending { it.libraryAddedAt ?: 0L }
+        }
+    val gridAutoPlaylists =
+        remember(searchedAutoPlaylists, likedHeroPlaylist) {
+            if (likedHeroPlaylist != null) {
+                searchedAutoPlaylists.filterNot { it.type == likedHeroPlaylist.type }
+            } else {
+                searchedAutoPlaylists
             }
         }
 
@@ -473,6 +522,19 @@ fun LibraryContent(
                             )
                         }
                     }
+                    if (likedHeroPlaylist != null) {
+                        item(key = "library_liked_hero", contentType = "liked_hero", span = { GridItemSpan(maxLineSpan) }) {
+                            LikedHeroSection(
+                                playlist = likedHeroPlaylist,
+                                songs = likedHeroSongs,
+                                downloadedSongIds = downloadedSongIds,
+                                currentSongIdState = currentSongIdState,
+                                isPlayingState = isPlayingState,
+                                onOpenAll = { onAutoPlaylistClick(likedHeroPlaylist.type) },
+                                onPlaySongAt = { index -> onPlaySongs(likedHeroSongs, index) },
+                            )
+                        }
+                    }
                     if (!isLoading && error) {
                         item(key = "library_error", contentType = "status", span = { GridItemSpan(maxLineSpan) }) {
                             Column(Modifier.fillMaxWidth().padding(24.dp)) {
@@ -486,12 +548,12 @@ fun LibraryContent(
                         }
                     }
                     items(
-                        count = searchedAutoPlaylists.size,
-                        key = { "auto_${searchedAutoPlaylists[it].type}" },
+                        count = gridAutoPlaylists.size,
+                        key = { "auto_${gridAutoPlaylists[it].type}" },
                         contentType = { "auto_playlist" },
                         span = { GridItemSpan(if (isGridView) 1 else maxLineSpan) },
                     ) { index ->
-                        val playlist = searchedAutoPlaylists[index]
+                        val playlist = gridAutoPlaylists[index]
                         Box(Modifier.animateItem()) {
                             itemContainer(
                                 HiddenLibraryItem(
@@ -585,6 +647,223 @@ fun LibraryContent(
                                                 null
                                             },
                                     )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LikedHeroSection(
+    playlist: LibraryAutoPlaylist,
+    songs: List<SongItem>,
+    downloadedSongIds: Set<String>,
+    currentSongIdState: State<String?>,
+    isPlayingState: State<Boolean>,
+    onOpenAll: () -> Unit,
+    onPlaySongAt: (Int) -> Unit,
+) {
+    val countSubtitle =
+        if (songs.isNotEmpty()) {
+            pluralStringResource(Res.plurals.song_count, songs.size, songs.size)
+        } else {
+            playlist.subtitle
+        }
+
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 6.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .clickable(onClick = onOpenAll)
+                        .padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Box(
+                    modifier =
+                        Modifier
+                            .size(52.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(
+                                Brush.linearGradient(
+                                    colors =
+                                        listOf(
+                                            Color(0xFFFF4D6D),
+                                            Color(0xFFC9184A),
+                                        ),
+                                ),
+                            ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = MetrolistIcons.Filled.Favorite,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(28.dp),
+                    )
+                }
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = "Мне нравится",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Icon(
+                            imageVector = MetrolistIcons.Outlined.KeyboardArrowDown,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(22.dp).rotate(-90f),
+                        )
+                    }
+                    if (countSubtitle.isNotBlank()) {
+                        Text(
+                            text = countSubtitle,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+
+                if (songs.isNotEmpty()) {
+                    FilledTonalIconButton(
+                        onClick = { onPlaySongAt(0) },
+                        modifier = Modifier.size(44.dp),
+                        colors =
+                            IconButtonDefaults.filledTonalIconButtonColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                            ),
+                        shapes = IconButtonDefaults.shapes(),
+                    ) {
+                        Icon(
+                            imageVector = MetrolistIcons.Filled.PlayArrow,
+                            contentDescription = null,
+                            modifier = Modifier.size(24.dp),
+                        )
+                    }
+                }
+            }
+
+            if (songs.isNotEmpty()) {
+                val previewColumns = remember(songs) { songs.take(18).chunked(3) }
+                BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                    val columnWidth =
+                        if (maxWidth >= 600.dp) {
+                            310.dp
+                        } else {
+                            (maxWidth - 46.dp).coerceIn(248.dp, 320.dp)
+                        }
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 14.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        itemsIndexed(previewColumns) { colIndex, columnSongs ->
+                            Column(
+                                modifier = Modifier.width(columnWidth),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                columnSongs.forEachIndexed { rowIndex, song ->
+                                    val globalIndex = colIndex * 3 + rowIndex
+                                    val playback by rememberItemPlayback(song.id, currentSongIdState, isPlayingState)
+                                    val isDownloaded = song.id in downloadedSongIds
+                                    val artistText = song.artists.joinToString(", ") { it.displayName }
+
+                                    Row(
+                                        modifier =
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(
+                                                    if (playback.isCurrent) {
+                                                        MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f)
+                                                    } else {
+                                                        Color.Transparent
+                                                    },
+                                                ).clickable { onPlaySongAt(globalIndex) }
+                                                .padding(horizontal = 6.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    ) {
+                                        Box(
+                                            modifier =
+                                                Modifier
+                                                    .size(48.dp)
+                                                    .clip(RoundedCornerShape(10.dp))
+                                                    .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            if (!song.displayThumbnailUrl.isNullOrBlank()) {
+                                                AsyncImage(
+                                                    url = song.displayThumbnailUrl,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.fillMaxSize(),
+                                                    contentScale = ContentScale.Crop,
+                                                )
+                                            }
+                                        }
+
+                                        Column(
+                                            modifier = Modifier.weight(1f),
+                                            verticalArrangement = Arrangement.Center,
+                                        ) {
+                                            Text(
+                                                text = song.displayTitle,
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color =
+                                                    if (playback.isCurrent) {
+                                                        MaterialTheme.colorScheme.primary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.onSurface
+                                                    },
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            if (artistText.isNotBlank()) {
+                                                Text(
+                                                    text = artistText,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            }
+                                        }
+
+                                        if (isDownloaded) {
+                                            Icon(
+                                                imageVector = SongStatusIcons.Downloaded,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(16.dp),
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
