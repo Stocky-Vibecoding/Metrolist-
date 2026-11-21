@@ -19,6 +19,8 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.metrolist.android.MainActivity
 import com.metrolist.android.R
+import com.metrolist.android.custom.CustomMediaCacheManager
+import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.innertubex.extraction.ContentHints
 import com.metrolist.innertubex.extraction.StreamResolveException
 import com.metrolist.innertubex.sabr.SabrProtocolException
@@ -69,6 +71,25 @@ class SongDownloadManager(
         }
 
     private val queueRestored = workerScope.async { requestState.value = restoreQueue() }
+
+    init {
+        CustomMediaCacheManager.systemDownloadLikeHook = { song ->
+            workerScope.launch {
+                runCatching { download(song) }
+            }
+        }
+        CustomMediaCacheManager.systemRemoveLikeHook = { songId ->
+            workerScope.launch {
+                runCatching {
+                    synchronized(queueLock) {
+                        cancellationRevision++
+                        activeDownloads[songId]?.control?.cancel()
+                    }
+                    audioCacheManager.removeDownload(songId)
+                }
+            }
+        }
+    }
 
     internal suspend fun flushQueue() {
         queueRestored.await()
@@ -451,7 +472,12 @@ class SongDownloadManager(
         val resolver = GlobalYouTubeRepository.streamResolver ?: return null
         val hints = song.toContentHints().forAudioDownload(preferSabr = refresh)
         val quality = playbackAudioQuality()
-        return resolver.resolveRemote(song.id, hints, quality, sourceSong = song, refresh = refresh)
+        HybridStreamResolver.beginSystemDownload(song.id)
+        return try {
+            resolver.resolveRemote(song.id, hints, quality, sourceSong = song, refresh = refresh)
+        } finally {
+            HybridStreamResolver.endSystemDownload(song.id)
+        }
     }
 
     internal fun aggregateNotification(): Notification {
