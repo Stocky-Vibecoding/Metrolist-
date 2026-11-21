@@ -2,6 +2,7 @@ package com.metrolist.android.custom
 
 import android.content.Context
 import com.metrolist.shared.api.lastfm.LastFM
+import com.metrolist.shared.ui.components.LocalProfileBridge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -159,6 +160,10 @@ class CustomConfigStore(
 
     init {
         CustomMediaCacheManager.init(appContext)
+        syncLocalProfileBridge(_config.value)
+        LocalProfileBridge.onUpdateLocalName = { newName ->
+            update { it.copy(localAccountName = newName.trim().ifBlank { "Локальный профиль" }) }
+        }
         applyRuntimeIntegrations(_config.value)
     }
 
@@ -337,12 +342,18 @@ class CustomConfigStore(
             parsed
         }
 
+    private fun syncLocalProfileBridge(cfg: CustomAppConfig) {
+        LocalProfileBridge.localName = cfg.localAccountName
+        LocalProfileBridge.localModeEnabled = cfg.useLocalAccountOnly
+    }
+
     private fun saveAndPublish(
         updated: CustomAppConfig,
         yandexTokenChanged: Boolean,
     ) {
         prefs.edit().putString(KEY_CONFIG_JSON, toJson(updated).toString()).apply()
         _config.value = updated
+        syncLocalProfileBridge(updated)
         if (yandexTokenChanged) {
             _yandexPlusStatus.value =
                 if (updated.yandexToken.isBlank()) YandexPlusStatus.NO_TOKEN else YandexPlusStatus.UNKNOWN
