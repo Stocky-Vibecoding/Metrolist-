@@ -104,11 +104,31 @@ data class ArtistReputation(
         get() = !isAutoMuted && dislikes >= 3 && dislikes > likes * 2
 }
 
+data class LocalArtistStat(
+    val displayName: String,
+    val plays: Int = 0,
+    val completes: Int = 0,
+    val likes: Int = 0,
+    val lastPlayedMs: Long = 0L,
+) {
+    fun rankScore(nowMs: Long = System.currentTimeMillis()): Double {
+        val recencyDays = ((nowMs - lastPlayedMs).coerceAtLeast(0L)).toDouble() / (24.0 * 3600.0 * 1000.0)
+        val recencyBoost =
+            when {
+                lastPlayedMs <= 0L -> 0.0
+                recencyDays <= 7.0 -> 8.0
+                recencyDays <= 30.0 -> 4.0
+                else -> 1.0
+            }
+        return plays * 1.0 + completes * 2.5 + likes * 4.0 + recencyBoost
+    }
+}
+
 enum class WaveCharacter(
     val label: String,
     val promptHint: String,
 ) {
-    DEFAULT("Обычная", "сбалансированный микс знакомых и новых треков по вкусу пользователя"),
+    DEFAULT("Любой", "сбалансированный микс знакомых и новых треков по вкусу пользователя"),
     FAVORITE("Любимое", "максимально близко к любимым артистам и жанрам из истории, проверенные хиты и треки того же круга"),
     DISCOVERY("Незнакомое", "свежие открытия, малоизвестные и новые артисты, НЕ повторяй треки и главных артистов из истории"),
     POPULAR("Популярное", "громкие хиты, чартовые и самые известные треки в подходящем стиле"),
@@ -184,6 +204,12 @@ data class CustomAppConfig(
     val artistReputation: Map<String, ArtistReputation> = emptyMap(),
     val likedTracksBackup: List<LikedTrackBackup> = emptyList(),
     val lastWaveTracks: List<LikedTrackBackup> = emptyList(),
+    val externalTasteProfile: List<LikedTrackBackup> = emptyList(),
+    val localArtistStats: Map<String, LocalArtistStat> = emptyMap(),
+    val playedTrackTimestamps: Map<String, Long> = emptyMap(),
+    val blacklistedVkAudioIds: Set<String> = emptySet(),
+    val learnedCensoredArtists: Map<String, Int> = emptyMap(),
+    val lastTasteScanMs: Long = 0L,
 ) {
     fun waveFilterSummary(): String {
         val parts =
@@ -227,6 +253,7 @@ class CustomConfigStore(
         CustomMediaCacheManager.init(appContext)
         CustomCatalogProvider.bindHomeShelvesBridge(this)
         syncLocalProfileBridge(_config.value)
+        syncLearnedCensorship(_config.value)
         LocalProfileBridge.onUpdateLocalName = { newName ->
             update { it.copy(localAccountName = newName.trim().ifBlank { "Локальный профиль" }) }
         }
@@ -340,6 +367,7 @@ class CustomConfigStore(
         val tKey = buildTrackKey(artist, title)
         val aKey = buildArtistKey(artist)
         val cleanThumb = thumbnail?.trim()?.takeIf { it.isNotBlank() && it != CustomMascotAssets.fallbackCoverUri }
+        val now = System.currentTimeMillis()
         update { cfg ->
             val nextDisliked =
                 if (tKey.isNotBlank()) cfg.dislikedTracks - tKey else cfg.dislikedTracks
@@ -348,6 +376,21 @@ class CustomConfigStore(
                 val prev = nextRep[aKey] ?: ArtistReputation()
                 nextRep[aKey] = prev.copy(likes = prev.likes + 1)
             }
+            val nextArtistStats = cfg.localArtistStats.toMutableMap()
+            splitArtistNames(artist).forEach { singleName ->
+                val norm = buildArtistKey(singleName)
+                if (norm.isNotBlank()) {
+                    val prev = nextArtistStats[norm] ?: LocalArtistStat(displayName = singleName)
+                    nextArtistStats[norm] =
+                        prev.copy(
+                            displayName = prev.displayName.ifBlank { singleName },
+                            likes = prev.likes + 1,
+                            lastPlayedMs = maxOf(prev.lastPlayedMs, now),
+                        )
+                }
+            }
+            val trimmedArtistStats = trimArtistStats(nextArtistStats)
+
             val nextLiked =
                 if (songId.isNotBlank() || title.isNotBlank()) {
                     val existingThumb =
@@ -373,8 +416,177 @@ class CustomConfigStore(
             cfg.copy(
                 dislikedTracks = nextDisliked,
                 artistReputation = nextRep,
+                localArtistStats = trimmedArtistStats,
                 likedTracksBackup = nextLiked,
             )
+        }
+    }
+
+    fun recordTrackPlayed(
+        artist: String,
+        title: String,
+        completed: Boolean,
+    ) {
+        val tKey = buildTrackKey(artist, title)
+        val now = System.currentTimeMillis()
+        update { cfg ->
+            val nextPlayed = cfg.playedTrackTimestamps.toMutableMap()
+            if (tKey.isNotBlank()) {
+                nextPlayed[tKey] = now
+            }
+            val cutoff = now - MAX_PLAYED_HISTORY_AGE_MS
+            val cleanedPlayed =
+                nextPlayed.entries
+                    .asSequence()
+                    .filter { it.value >= cutoff }
+                    .sortedByDescending { it.value }
+                    .take(MAX_PLAYED_HISTORY)
+                    .associate { it.key to it.value }
+
+            val nextStats = cfg.localArtistStats.toMutableMap()
+            splitArtistNames(artist).forEach { singleName ->
+                val norm = buildArtistKey(singleName)
+                if (norm.isNotBlank()) {
+                    val prev = nextStats[norm] ?: LocalArtistStat(displayName = singleName)
+                    nextStats[norm] =
+                        prev.copy(
+                            displayName = prev.displayName.ifBlank { singleName },
+                            plays = prev.plays + 1,
+                            completes = prev.completes + if (completed) 1 else 0,
+                            lastPlayedMs = now,
+                        )
+                }
+            }
+            cfg.copy(
+                playedTrackTimestamps = cleanedPlayed,
+                localArtistStats = trimArtistStats(nextStats),
+            )
+        }
+    }
+
+    fun isTrackInRecentCooldown(
+        artist: String,
+        title: String,
+        cooldownMs: Long = DEFAULT_REPEAT_COOLDOWN_MS,
+    ): Boolean {
+        val tKey = buildTrackKey(artist, title)
+        if (tKey.isBlank()) return false
+        val playedAt = _config.value.playedTrackTimestamps[tKey] ?: return false
+        return (System.currentTimeMillis() - playedAt) < cooldownMs
+    }
+
+    fun getLocalTopArtists(limit: Int = 25): List<String> {
+        val cfg = _config.value
+        val now = System.currentTimeMillis()
+        val combined = LinkedHashMap<String, Pair<String, Double>>()
+
+        cfg.localArtistStats.forEach { (norm, stat) ->
+            if (cfg.artistReputation[norm]?.isAutoMuted == true) return@forEach
+            val score = stat.rankScore(now)
+            if (score > 0.0) {
+                combined[norm] = stat.displayName.ifBlank { norm } to score
+            }
+        }
+
+        cfg.likedTracksBackup.take(250).forEachIndexed { idx, item ->
+            val weight = if (idx < 30) 2.5 else 1.0
+            splitArtistNames(item.artist).forEach { single ->
+                val norm = buildArtistKey(single)
+                if (norm.isBlank() || cfg.artistReputation[norm]?.isAutoMuted == true) return@forEach
+                val prev = combined[norm]
+                combined[norm] = (prev?.first ?: single) to ((prev?.second ?: 0.0) + weight)
+            }
+        }
+
+        if (combined.size < limit) {
+            cfg.externalTasteProfile.take(200).forEach { item ->
+                splitArtistNames(item.artist).forEach { single ->
+                    val norm = buildArtistKey(single)
+                    if (norm.isBlank() || cfg.artistReputation[norm]?.isAutoMuted == true) return@forEach
+                    val prev = combined[norm]
+                    combined[norm] = (prev?.first ?: single) to ((prev?.second ?: 0.0) + 0.6)
+                }
+            }
+        }
+
+        return combined.values
+            .sortedByDescending { it.second }
+            .take(limit)
+            .map { it.first }
+    }
+
+    fun mergeExternalTasteProfile(entries: List<LikedTrackBackup>): Int {
+        if (entries.isEmpty()) return _config.value.externalTasteProfile.size
+        var finalCount = 0
+        val now = System.currentTimeMillis()
+        update { cfg ->
+            val seenKeys = HashSet<String>()
+            val merged = ArrayList<LikedTrackBackup>(minOf(entries.size + cfg.externalTasteProfile.size, MAX_EXTERNAL_TASTE))
+
+            fun addIfUnique(item: LikedTrackBackup) {
+                if (merged.size >= MAX_EXTERNAL_TASTE) return
+                val cleanTitle = item.title.trim()
+                val cleanArtist = item.artist.trim()
+                val cleanId = item.id.trim()
+                if (cleanTitle.isBlank() && cleanId.isBlank()) return
+                val key = buildTrackKey(cleanArtist, cleanTitle).ifBlank { "id::$cleanId" }
+                if (seenKeys.add(key)) {
+                    merged.add(LikedTrackBackup(id = cleanId, artist = cleanArtist, title = cleanTitle, thumbnail = null))
+                }
+            }
+
+            entries.forEach(::addIfUnique)
+            cfg.externalTasteProfile.forEach(::addIfUnique)
+            finalCount = merged.size
+            cfg.copy(externalTasteProfile = merged, lastTasteScanMs = now)
+        }
+        return finalCount
+    }
+
+    fun blacklistVkAudio(audioKey: String) {
+        val clean = audioKey.trim()
+        if (clean.isBlank()) return
+        update { cfg ->
+            val next = (cfg.blacklistedVkAudioIds + clean)
+            val trimmed = if (next.size > MAX_BLACKLISTED_VK) next.drop(next.size - MAX_BLACKLISTED_VK).toSet() else next
+            cfg.copy(blacklistedVkAudioIds = trimmed)
+        }
+    }
+
+    fun isVkAudioBlacklisted(audioKey: String): Boolean {
+        val clean = audioKey.trim()
+        return clean.isNotBlank() && clean in _config.value.blacklistedVkAudioIds
+    }
+
+    fun recordManualCensorshipSwitch(
+        artist: String,
+        forceImmediate: Boolean = false,
+    ) {
+        val names = splitArtistNames(artist)
+        if (names.isEmpty()) return
+        update { cfg ->
+            val next = cfg.learnedCensoredArtists.toMutableMap()
+            names.forEach { single ->
+                val norm = buildArtistKey(single)
+                if (norm.length >= 2) {
+                    val prev = next[norm] ?: 0
+                    val updatedCount = if (forceImmediate) maxOf(prev + 1, 2) else prev + 1
+                    next[norm] = updatedCount
+                    if (updatedCount >= 2) {
+                        LocalCensorshipAdvisor.rememberCensoredArtist(single)
+                    }
+                }
+            }
+            cfg.copy(learnedCensoredArtists = next)
+        }
+    }
+
+    fun isArtistLearnedCensored(artist: String): Boolean {
+        val map = _config.value.learnedCensoredArtists
+        if (map.isEmpty()) return false
+        return splitArtistNames(artist).any { single ->
+            val norm = buildArtistKey(single)
+            norm.length >= 2 && (map[norm] ?: 0) >= 2
         }
     }
 
@@ -436,6 +648,14 @@ class CustomConfigStore(
         update { it.copy(trackSourceOverrides = emptyMap()) }
     }
 
+    fun clearBlacklistedVkAudios() {
+        update { it.copy(blacklistedVkAudioIds = emptySet()) }
+    }
+
+    fun clearPlayedHistory() {
+        update { it.copy(playedTrackTimestamps = emptyMap()) }
+    }
+
     fun getCachedCensorship(
         artist: String,
         title: String,
@@ -458,6 +678,7 @@ class CustomConfigStore(
         censorshipPrefs.edit().putBoolean(key, censored).apply()
     }
 
+    /** Собирается строго на лету по нажатию «Экспорт», лишних файлов в памяти не держит. */
     fun exportToJson(extraLikedIds: Set<String> = emptySet()): String =
         toJson(_config.value, extraLikedIds).toString(2)
 
@@ -473,9 +694,26 @@ class CustomConfigStore(
             parsed
         }
 
+    private fun trimArtistStats(map: Map<String, LocalArtistStat>): Map<String, LocalArtistStat> {
+        if (map.size <= MAX_LOCAL_ARTISTS) return map
+        val now = System.currentTimeMillis()
+        return map.entries
+            .sortedByDescending { it.value.rankScore(now) }
+            .take(MAX_LOCAL_ARTISTS)
+            .associate { it.key to it.value }
+    }
+
     private fun syncLocalProfileBridge(cfg: CustomAppConfig) {
         LocalProfileBridge.localName = cfg.localAccountName
         LocalProfileBridge.localModeEnabled = cfg.useLocalAccountOnly
+    }
+
+    private fun syncLearnedCensorship(cfg: CustomAppConfig) {
+        cfg.learnedCensoredArtists.forEach { (norm, count) ->
+            if (count >= 2 && norm.length >= 2) {
+                LocalCensorshipAdvisor.rememberCensoredArtist(norm)
+            }
+        }
     }
 
     private fun saveAndPublish(
@@ -486,12 +724,14 @@ class CustomConfigStore(
         _config.value = updated
         persistChannel.trySend(updated)
         syncLocalProfileBridge(updated)
+        syncLearnedCensorship(updated)
         if (yandexTokenChanged) {
             _yandexPlusStatus.value =
                 if (updated.yandexToken.isBlank()) YandexPlusStatus.NO_TOKEN else YandexPlusStatus.UNKNOWN
         }
         if (yandexTokenChanged || vkTokenChanged) {
             CustomHomeShelvesBridge.requestLoad(force = true)
+            CustomCatalogProvider.triggerBackgroundTasteScan(this, force = true)
         }
         applyRuntimeIntegrations(updated)
     }
@@ -512,7 +752,7 @@ class CustomConfigStore(
         extraLikedIds: Set<String> = emptySet(),
     ): JSONObject =
         JSONObject().apply {
-            put("schemaVersion", 6)
+            put("schemaVersion", 7)
             put("localAccountName", cfg.localAccountName)
             put("useLocalAccountOnly", cfg.useLocalAccountOnly)
             put("hybridResolverEnabled", cfg.hybridResolverEnabled)
@@ -535,6 +775,7 @@ class CustomConfigStore(
             put("waveEra", cfg.waveEra.name)
             put("waveLanguage", cfg.waveLanguage.name)
             put("waveMood", cfg.waveMood.name)
+            put("lastTasteScanMs", cfg.lastTasteScanMs)
 
             val overridesObj = JSONObject()
             cfg.trackSourceOverrides.forEach { (k, v) -> overridesObj.put(k, v.name) }
@@ -594,6 +835,43 @@ class CustomConfigStore(
                 )
             }
             put("lastWaveTracks", waveArr)
+
+            val extTasteArr = JSONArray()
+            cfg.externalTasteProfile.forEach { item ->
+                extTasteArr.put(
+                    JSONObject()
+                        .put("id", item.id)
+                        .put("artist", item.artist)
+                        .put("title", item.title),
+                )
+            }
+            put("externalTasteProfile", extTasteArr)
+
+            val artistStatsObj = JSONObject()
+            cfg.localArtistStats.forEach { (norm, stat) ->
+                artistStatsObj.put(
+                    norm,
+                    JSONObject()
+                        .put("n", stat.displayName)
+                        .put("p", stat.plays)
+                        .put("c", stat.completes)
+                        .put("l", stat.likes)
+                        .put("t", stat.lastPlayedMs),
+                )
+            }
+            put("localArtistStats", artistStatsObj)
+
+            val playedObj = JSONObject()
+            cfg.playedTrackTimestamps.forEach { (k, ts) -> playedObj.put(k, ts) }
+            put("playedTrackTimestamps", playedObj)
+
+            val blacklistedVkArr = JSONArray()
+            cfg.blacklistedVkAudioIds.forEach { blacklistedVkArr.put(it) }
+            put("blacklistedVkAudioIds", blacklistedVkArr)
+
+            val learnedCensObj = JSONObject()
+            cfg.learnedCensoredArtists.forEach { (k, cnt) -> learnedCensObj.put(k, cnt) }
+            put("learnedCensoredArtists", learnedCensObj)
         }
 
     private fun fromJson(obj: JSONObject): CustomAppConfig {
@@ -636,7 +914,61 @@ class CustomConfigStore(
                 }
             }
 
-        fun parseTrackList(arr: JSONArray?, limit: Int): List<LikedTrackBackup> {
+        val localStats =
+            buildMap<String, LocalArtistStat> {
+                val statsObj = obj.optJSONObject("localArtistStats") ?: return@buildMap
+                val keys = statsObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val item = statsObj.optJSONObject(k) ?: continue
+                    put(
+                        k,
+                        LocalArtistStat(
+                            displayName = item.optString("n", k).ifBlank { k },
+                            plays = item.optInt("p", 0).coerceAtLeast(0),
+                            completes = item.optInt("c", 0).coerceAtLeast(0),
+                            likes = item.optInt("l", 0).coerceAtLeast(0),
+                            lastPlayedMs = item.optLong("t", 0L).coerceAtLeast(0L),
+                        ),
+                    )
+                }
+            }
+
+        val playedTimestamps =
+            buildMap<String, Long> {
+                val pObj = obj.optJSONObject("playedTrackTimestamps") ?: return@buildMap
+                val keys = pObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val ts = pObj.optLong(k, 0L)
+                    if (ts > 0L) put(k, ts)
+                }
+            }
+
+        val blacklistedVk =
+            buildSet<String> {
+                val arr = obj.optJSONArray("blacklistedVkAudioIds") ?: return@buildSet
+                for (i in 0 until arr.length()) {
+                    val s = arr.optString(i).trim()
+                    if (s.isNotBlank()) add(s)
+                }
+            }
+
+        val learnedCensored =
+            buildMap<String, Int> {
+                val cObj = obj.optJSONObject("learnedCensoredArtists") ?: return@buildMap
+                val keys = cObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val cnt = cObj.optInt(k, 0)
+                    if (cnt > 0) put(k, cnt)
+                }
+            }
+
+        fun parseTrackList(
+            arr: JSONArray?,
+            limit: Int,
+        ): List<LikedTrackBackup> {
             if (arr == null) return emptyList()
             return buildList {
                 for (i in 0 until minOf(arr.length(), limit)) {
@@ -654,6 +986,7 @@ class CustomConfigStore(
 
         val likedBackup = parseTrackList(obj.optJSONArray("likedTracksBackup"), MAX_LIKED_BACKUP)
         val lastWave = parseTrackList(obj.optJSONArray("lastWaveTracks"), 40)
+        val extTaste = parseTrackList(obj.optJSONArray("externalTasteProfile"), MAX_EXTERNAL_TASTE)
 
         return CustomAppConfig(
             localAccountName = obj.optString("localAccountName", defaults.localAccountName).ifBlank { defaults.localAccountName },
@@ -683,6 +1016,12 @@ class CustomConfigStore(
             artistReputation = repMap,
             likedTracksBackup = likedBackup,
             lastWaveTracks = lastWave,
+            externalTasteProfile = extTaste,
+            localArtistStats = localStats,
+            playedTrackTimestamps = playedTimestamps,
+            blacklistedVkAudioIds = blacklistedVk,
+            learnedCensoredArtists = learnedCensored,
+            lastTasteScanMs = obj.optLong("lastTasteScanMs", 0L).coerceAtLeast(0L),
         )
     }
 
@@ -696,6 +1035,19 @@ class CustomConfigStore(
         private const val CENSORSHIP_PREFS_NAME = "stocky_censorship_cache_prefs"
         private const val KEY_CONFIG_JSON = "custom_config_v2"
         private const val MAX_LIKED_BACKUP = 5_000
+        private const val MAX_EXTERNAL_TASTE = 1_500
+        private const val MAX_LOCAL_ARTISTS = 400
+        private const val MAX_PLAYED_HISTORY = 300
+        private const val MAX_BLACKLISTED_VK = 600
+        private const val MAX_PLAYED_HISTORY_AGE_MS = 72L * 60 * 60 * 1_000L
+        const val DEFAULT_REPEAT_COOLDOWN_MS = 16L * 60 * 60 * 1_000L
+
+        fun splitArtistNames(raw: String): List<String> =
+            raw
+                .split(",", "&", "feat.", "ft.", "featuring", "×")
+                .map { it.trim() }
+                .filter { it.length >= 2 }
+                .distinctBy { it.lowercase() }
 
         fun buildTrackKey(
             artist: String,
