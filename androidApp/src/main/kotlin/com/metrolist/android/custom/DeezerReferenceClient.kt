@@ -10,6 +10,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
@@ -92,9 +94,11 @@ data class TrackReference(
     val isExplicit: Boolean,
     val fromDeezer: Boolean,
     val coverXlUrl: String? = null,
+    val deezerId: String? = null,
 )
 
 private data class DeezerCandidate(
+    val id: String,
     val title: String,
     val artist: String,
     val duration: Long,
@@ -124,40 +128,12 @@ class DeezerReferenceClient {
                 isExplicit = fallbackExplicit,
                 fromDeezer = false,
                 coverXlUrl = null,
+                deezerId = null,
             )
 
         if (cleanTitle.isBlank()) return fallback
 
-        val fetched =
-            runCatching {
-                val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
-                val url = "${apiBaseUrl()}/search/track?q=${CustomHttp.urlEncode(query)}&limit=6"
-                val response = CustomHttp.get(url, timeoutMs = 3_000)
-                if (!response.isSuccess) return@runCatching null
-                val data = JSONObject(response.body).optJSONArray("data") ?: return@runCatching null
-                val candidates =
-                    buildList {
-                        for (i in 0 until data.length()) {
-                            val item = data.optJSONObject(i) ?: continue
-                            val albumObj = item.optJSONObject("album")
-                            val cover =
-                                albumObj?.optString("cover_xl")?.takeIf { it.isNotBlank() }
-                                    ?: albumObj?.optString("cover_big")?.takeIf { it.isNotBlank() }
-                            add(
-                                DeezerCandidate(
-                                    title = item.optString("title"),
-                                    artist = item.optJSONObject("artist")?.optString("name").orEmpty(),
-                                    duration = item.optLong("duration", 0L),
-                                    explicit = item.optBoolean("explicit_lyrics", false),
-                                    coverXl = cover,
-                                ),
-                            )
-                        }
-                    }
-                pickBestDeezerMatch(candidates, cleanArtist, cleanTitle, fallbackDurationSec)
-            }.onFailure { error ->
-                Log.d(TAG, "Deezer lookup skipped for $cleanArtist - $cleanTitle: ${error.message}")
-            }.getOrNull()
+        val fetched = searchBestCandidate(cleanArtist, cleanTitle, fallbackDurationSec)
 
         val resolved =
             if (fetched != null) {
@@ -168,15 +144,198 @@ class DeezerReferenceClient {
                     isExplicit = fetched.explicit || fallbackExplicit,
                     fromDeezer = true,
                     coverXlUrl = fetched.coverXl,
+                    deezerId = fetched.id.takeIf { it.isNotBlank() },
                 )
             } else {
                 fallback
             }
 
-        if (cache.size > 500) cache.clear()
+        if (cache.size > 600) cache.clear()
         cache[cacheKey] = resolved
         return resolved
     }
+
+    /** Строгий поиск карточки в Deezer для каскада волны — без случайного фоллбэка. */
+    suspend fun searchCatalogTrack(
+        artist: String,
+        title: String,
+        targetDurationSec: Long? = null,
+    ): ExternalCatalogTrack? {
+        val cleanArtist = TrackMatcher.cleanSearchTerm(artist)
+        val cleanTitle = TrackMatcher.cleanSearchTerm(title)
+        if (cleanTitle.isBlank()) return null
+
+        val best = searchBestCandidate(cleanArtist, cleanTitle, targetDurationSec) ?: return null
+        if (best.id.isBlank()) return null
+
+        val cacheKey = "${cleanArtist.lowercase()}::${cleanTitle.lowercase()}"
+        cache[cacheKey] =
+            TrackReference(
+                title = best.title.ifBlank { cleanTitle },
+                artist = best.artist.ifBlank { cleanArtist },
+                durationSec = best.duration.takeIf { it > 0L },
+                isExplicit = best.explicit,
+                fromDeezer = true,
+                coverXlUrl = best.coverXl,
+                deezerId = best.id,
+            )
+
+        return ExternalCatalogTrack(
+            source = "deezer",
+            externalId = "dz_${best.id}",
+            artist = best.artist.ifBlank { cleanArtist },
+            title = best.title.ifBlank { cleanTitle },
+            durationSec = best.duration.takeIf { it > 0L },
+            coverUrl = best.coverXl,
+            isExplicit = best.explicit,
+        )
+    }
+
+    /** Чарт Deezer для единого блока «Чарты» на Главной. */
+    suspend fun fetchChart(limit: Int = 25): List<ExternalCatalogTrack> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val safeLimit = limit.coerceIn(1, 50)
+                val url = "${apiBaseUrl()}/chart/0/tracks?limit=$safeLimit"
+                val response = CustomHttp.get(url, timeoutMs = 8_000)
+                if (!response.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
+                val data = JSONObject(response.body).optJSONArray("data") ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                buildList {
+                    for (i in 0 until data.length()) {
+                        val item = data.optJSONObject(i) ?: continue
+                        val id = item.optString("id").trim()
+                        val title = item.optString("title").trim()
+                        val artist = item.optJSONObject("artist")?.optString("name").orEmpty().trim()
+                        if (id.isBlank() || title.isBlank()) continue
+                        val albumObj = item.optJSONObject("album")
+                        val cover =
+                            albumObj?.optString("cover_xl")?.takeIf { it.isNotBlank() }
+                                ?: albumObj?.optString("cover_big")?.takeIf { it.isNotBlank() }
+                        add(
+                            ExternalCatalogTrack(
+                                source = "deezer",
+                                externalId = "dz_$id",
+                                artist = artist,
+                                title = title,
+                                durationSec = item.optLong("duration", 0L).takeIf { it > 0L },
+                                coverUrl = cover,
+                                isExplicit = item.optBoolean("explicit_lyrics", false),
+                            ),
+                        )
+                    }
+                }
+            }.getOrDefault(emptyList())
+        }
+
+    /** Свежие релизы конкретного артиста для «Радара новинок». */
+    suspend fun fetchArtistRecentReleases(
+        artistName: String,
+        maxAgeDays: Int = 60,
+        limit: Int = 2,
+    ): List<ExternalCatalogTrack> =
+        withContext(Dispatchers.IO) {
+            val cleanArtist = TrackMatcher.cleanSearchTerm(artistName)
+            if (cleanArtist.length < 2) return@withContext emptyList()
+            runCatching {
+                val artistResp =
+                    CustomHttp.get(
+                        url = "${apiBaseUrl()}/search/artist?q=${CustomHttp.urlEncode(cleanArtist)}&limit=3",
+                        timeoutMs = 5_000,
+                    )
+                if (!artistResp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
+                val artistData = JSONObject(artistResp.body).optJSONArray("data") ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                val normTarget = TrackMatcher.normalize(cleanArtist)
+                var artistId: String? = null
+                var resolvedName = cleanArtist
+                for (i in 0 until artistData.length()) {
+                    val obj = artistData.optJSONObject(i) ?: continue
+                    val name = obj.optString("name").trim()
+                    val normCand = TrackMatcher.normalize(name)
+                    if (normCand == normTarget || normCand.contains(normTarget) || normTarget.contains(normCand)) {
+                        artistId = obj.optString("id").trim().takeIf { it.isNotBlank() }
+                        resolvedName = name.ifBlank { cleanArtist }
+                        break
+                    }
+                }
+                val id = artistId ?: return@runCatching emptyList<ExternalCatalogTrack>()
+
+                val albumsResp =
+                    CustomHttp.get(
+                        url = "${apiBaseUrl()}/artist/$id/albums?limit=8",
+                        timeoutMs = 5_000,
+                    )
+                if (!albumsResp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
+                val albums = JSONObject(albumsResp.body).optJSONArray("data") ?: return@runCatching emptyList<ExternalCatalogTrack>()
+
+                val cutoffMs = System.currentTimeMillis() - maxAgeDays.toLong() * 24L * 3600L * 1_000L
+                val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+
+                val recent = mutableListOf<Pair<Long, ExternalCatalogTrack>>()
+                for (i in 0 until albums.length()) {
+                    val alb = albums.optJSONObject(i) ?: continue
+                    val albId = alb.optString("id").trim()
+                    val title = alb.optString("title").trim()
+                    val releaseStr = alb.optString("release_date").trim()
+                    if (albId.isBlank() || title.isBlank() || releaseStr.length < 10) continue
+                    val releaseMs = runCatching { dateFormat.parse(releaseStr.take(10))?.time }.getOrNull() ?: continue
+                    if (releaseMs < cutoffMs) continue
+                    val cover =
+                        alb.optString("cover_xl").takeIf { it.isNotBlank() }
+                            ?: alb.optString("cover_big").takeIf { it.isNotBlank() }
+                    recent.add(
+                        releaseMs to
+                            ExternalCatalogTrack(
+                                source = "deezer",
+                                externalId = "dz_alb_$albId",
+                                artist = resolvedName,
+                                title = title,
+                                coverUrl = cover,
+                                isExplicit = alb.optBoolean("explicit_lyrics", false),
+                            ),
+                    )
+                }
+                recent
+                    .sortedByDescending { it.first }
+                    .take(limit)
+                    .map { it.second }
+            }.getOrDefault(emptyList())
+        }
+
+    private suspend fun searchBestCandidate(
+        cleanArtist: String,
+        cleanTitle: String,
+        targetDurationSec: Long?,
+    ): DeezerCandidate? =
+        runCatching {
+            val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
+            val url = "${apiBaseUrl()}/search/track?q=${CustomHttp.urlEncode(query)}&limit=8"
+            val response = CustomHttp.get(url, timeoutMs = 4_000)
+            if (!response.isSuccess) return@runCatching null
+            val data = JSONObject(response.body).optJSONArray("data") ?: return@runCatching null
+            val candidates =
+                buildList {
+                    for (i in 0 until data.length()) {
+                        val item = data.optJSONObject(i) ?: continue
+                        val albumObj = item.optJSONObject("album")
+                        val cover =
+                            albumObj?.optString("cover_xl")?.takeIf { it.isNotBlank() }
+                                ?: albumObj?.optString("cover_big")?.takeIf { it.isNotBlank() }
+                        add(
+                            DeezerCandidate(
+                                id = item.optString("id").trim(),
+                                title = item.optString("title").trim(),
+                                artist = item.optJSONObject("artist")?.optString("name").orEmpty().trim(),
+                                duration = item.optLong("duration", 0L),
+                                explicit = item.optBoolean("explicit_lyrics", false),
+                                coverXl = cover,
+                            ),
+                        )
+                    }
+                }
+            pickBestDeezerMatch(candidates, cleanArtist, cleanTitle, targetDurationSec)
+        }.onFailure { error ->
+            Log.d(TAG, "Deezer lookup skipped for $cleanArtist - $cleanTitle: ${error.message}")
+        }.getOrNull()
 
     private fun pickBestDeezerMatch(
         candidates: List<DeezerCandidate>,
@@ -186,10 +345,11 @@ class DeezerReferenceClient {
     ): DeezerCandidate? =
         candidates
             .filter { candidate ->
-                !TrackMatcher.hasForbiddenStopWord(
-                    requestedTitle = targetTitle,
-                    candidateTitle = candidate.title,
-                )
+                candidate.duration > 35L &&
+                    !TrackMatcher.hasForbiddenStopWord(
+                        requestedTitle = targetTitle,
+                        candidateTitle = candidate.title,
+                    )
             }.mapNotNull { candidate ->
                 val score =
                     TrackMatcher.matchScore(
@@ -200,9 +360,9 @@ class DeezerReferenceClient {
                         candidateTitle = candidate.title,
                         candidateDurationSec = candidate.duration.takeIf { it > 0L },
                     )
-                if (score >= 60) candidate to score else null
+                if (score >= 62) candidate to score else null
             }.maxByOrNull { (candidate, score) ->
-                score + if (candidate.explicit) 5 else 0
+                score + if (candidate.explicit) 6 else 0
             }?.first
 
     companion object {
