@@ -1,5 +1,6 @@
 package com.metrolist.android.custom
 
+import android.content.Context
 import android.util.Log
 import com.metrolist.shared.model.ArtistTiny
 import com.metrolist.shared.model.SearchFilter
@@ -20,10 +21,14 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -62,6 +67,21 @@ data class ExternalCatalogTrack(
     }
 }
 
+data class HomeCatalogSnapshot(
+    val yandexChart: List<ExternalCatalogTrack> = emptyList(),
+    val vkChart: List<ExternalCatalogTrack> = emptyList(),
+    val deezerChart: List<ExternalCatalogTrack> = emptyList(),
+    val releaseRadar: List<ExternalCatalogTrack> = emptyList(),
+    val updatedAtMs: Long = 0L,
+) {
+    val isNotEmpty: Boolean
+        get() =
+            yandexChart.isNotEmpty() ||
+                vkChart.isNotEmpty() ||
+                deezerChart.isNotEmpty() ||
+                releaseRadar.isNotEmpty()
+}
+
 data class LibraryImportProgress(
     val message: String,
     val fetchedCount: Int = 0,
@@ -79,55 +99,93 @@ data class LibraryImportSummary(
 class CustomCatalogProvider(
     private val configStore: CustomConfigStore,
 ) {
-    suspend fun loadHomeShelves(): List<HomeShelf> =
+    private fun deezerClient(): DeezerReferenceClient =
+        HybridStreamResolver.getDeezerClient() ?: fallbackDeezerClient
+
+    suspend fun loadHomeSnapshot(): HomeCatalogSnapshot =
         coroutineScope {
-            val chartTask = async { fetchYandexChart(24) }
-            val releasesTask = async { fetchYandexNewReleases(16) }
-            val vkPopularTask = async { fetchVkPopular(24) }
+            val yandexChartTask = async { fetchYandexChart(24) }
+            val vkChartTask = async { fetchVkPopular(24) }
+            val deezerChartTask = async { deezerClient().fetchChart(24) }
+            val radarTask = async { fetchReleaseRadar(18) }
 
-            val chartSongs = chartTask.await().map { it.toSongItem() }.distinctBy { it.id }
-            val releaseSongs = releasesTask.await().map { it.toSongItem() }.distinctBy { it.id }
-            val vkSongs = vkPopularTask.await().map { it.toSongItem() }.distinctBy { it.id }
+            HomeCatalogSnapshot(
+                yandexChart = yandexChartTask.await().distinctBy { it.externalId },
+                vkChart = vkChartTask.await().distinctBy { it.externalId },
+                deezerChart = deezerChartTask.await().distinctBy { it.externalId },
+                releaseRadar = radarTask.await().distinctBy { CustomConfigStore.buildTrackKey(it.artist, it.title).ifBlank { it.externalId } },
+                updatedAtMs = System.currentTimeMillis(),
+            )
+        }
 
-            buildList {
-                if (chartSongs.isNotEmpty()) {
-                    add(
-                        HomeShelf(
-                            key = "custom_ym_chart_rf",
-                            title = "Чарт Я.Музыки • Топ РФ",
-                            items = chartSongs,
-                            style = HomeShelfStyle.SONG_GRID,
-                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
-                            rows = 4,
-                            compactRows = true,
-                        ),
-                    )
+    suspend fun loadHomeShelves(): List<HomeShelf> {
+        val snapshot = loadHomeSnapshot()
+        if (snapshot.isNotEmpty) {
+            _homeSnapshot.value = snapshot
+            saveSnapshotToDisk(snapshot)
+        }
+        return buildHomeShelvesFromSnapshot(
+            if (snapshot.isNotEmpty) snapshot else _homeSnapshot.value,
+        )
+    }
+
+    /**
+     * «Радар новинок» по локальному топу артистов пользователя (Deezer + Яндекс),
+     * чтобы видеть свежие релизы любимых артистов — включая вырезанные цензурой в РФ.
+     */
+    suspend fun fetchReleaseRadar(limit: Int = 18): List<ExternalCatalogTrack> =
+        coroutineScope {
+            val topArtists = configStore.getLocalTopArtists(limit = 16)
+            val yandexNewTask = async { fetchYandexNewReleases(28) }
+
+            val deezerRadar = mutableListOf<ExternalCatalogTrack>()
+            val deezer = deezerClient()
+            for (chunk in topArtists.take(12).chunked(4)) {
+                val found =
+                    chunk
+                        .map { artistName ->
+                            async(Dispatchers.IO) {
+                                deezer.fetchArtistRecentReleases(
+                                    artistName = artistName,
+                                    maxAgeDays = 60,
+                                    limit = 2,
+                                )
+                            }
+                        }.awaitAll()
+                        .flatten()
+                deezerRadar.addAll(found)
+            }
+
+            val yandexNew = yandexNewTask.await()
+            val normTopArtists = topArtists.mapTo(HashSet()) { CustomConfigStore.buildArtistKey(it) }
+            val matchedYandex =
+                yandexNew.filter { track ->
+                    CustomConfigStore.splitArtistNames(track.artist).any { single ->
+                        val norm = CustomConfigStore.buildArtistKey(single)
+                        norm.isNotBlank() && norm in normTopArtists
+                    }
                 }
-                if (releaseSongs.isNotEmpty()) {
-                    add(
-                        HomeShelf(
-                            key = "custom_ym_new_releases",
-                            title = "Новые релизы • Я.Музыка",
-                            items = releaseSongs,
-                            style = HomeShelfStyle.CAROUSEL,
-                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
-                        ),
-                    )
-                }
-                if (vkSongs.isNotEmpty()) {
-                    add(
-                        HomeShelf(
-                            key = "custom_vk_popular",
-                            title = "Для тебя в VK",
-                            items = vkSongs,
-                            style = HomeShelfStyle.SONG_GRID,
-                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
-                            rows = 4,
-                            compactRows = true,
-                        ),
-                    )
+            val otherYandex = yandexNew.filterNot { it in matchedYandex }
+
+            val seen = HashSet<String>()
+            val combined = ArrayList<ExternalCatalogTrack>(limit)
+
+            fun addUnique(items: List<ExternalCatalogTrack>) {
+                for (item in items) {
+                    if (combined.size >= limit) break
+                    val key = CustomConfigStore.buildTrackKey(item.artist, item.title).ifBlank { item.externalId }
+                    if (key.isNotBlank() && seen.add(key)) {
+                        combined.add(item)
+                    }
                 }
             }
+
+            addUnique(deezerRadar)
+            addUnique(matchedYandex)
+            if (combined.size < limit) {
+                addUnique(otherYandex)
+            }
+            combined
         }
 
     suspend fun searchYandexTracks(
@@ -213,7 +271,7 @@ class CustomCatalogProvider(
     ): Result<LibraryImportSummary> =
         runCatching {
             val token = sanitizeYandexToken(configStore.current.yandexToken)
-            require(token.isNotBlank()) { "Сначала укажи токен Яндекс.Музыки" }
+            require(token.isNotBlank()) { "Сначала войди в Яндекс.Музыку или укажи токен" }
 
             onProgress(LibraryImportProgress("Подключаюсь к Яндекс.Музыке…"))
             val tracks = fetchAllYandexLikedTracks(token) { count ->
@@ -235,7 +293,7 @@ class CustomCatalogProvider(
     ): Result<LibraryImportSummary> =
         runCatching {
             val token = sanitizeVkToken(configStore.current.vkToken)
-            require(token.isNotBlank()) { "Сначала укажи токен ВК" }
+            require(token.isNotBlank()) { "Сначала войди в ВК или укажи токен" }
 
             onProgress(LibraryImportProgress("Загружаю медиатеку ВК…"))
             val tracks = fetchAllVkAudioTracks(token) { fetched, total ->
@@ -250,6 +308,91 @@ class CustomCatalogProvider(
                 syncToLibraryLimit = syncToLibraryLimit,
                 onProgress = onProgress,
             )
+        }
+
+    /** Ручной импорт лайков из YouTube Music (подключается через `externalYouTubeLikesFetcher`). */
+    suspend fun importYouTubeLikes(
+        syncToLibraryLimit: Int,
+        onProgress: (LibraryImportProgress) -> Unit,
+    ): Result<LibraryImportSummary> =
+        runCatching {
+            val fetcher =
+                externalYouTubeLikesFetcher
+                    ?: error("Сначала подключи аккаунт YouTube Music в профиле")
+
+            onProgress(LibraryImportProgress("Загружаю лайки из YouTube Music…"))
+            val tracks = fetcher()
+            check(tracks.isNotEmpty()) { "В YouTube Music не найдено лайкнутых треков (или нет входа в аккаунт)" }
+
+            syncFetchedTracks(
+                sourceLabel = "YouTube",
+                tracks = tracks,
+                syncToLibraryLimit = syncToLibraryLimit,
+                onProgress = onProgress,
+            )
+        }
+
+    /**
+     * Фоновый скан вкуса: тихо считывает лайки из Я.Музыки, ВК и YouTube
+     * исключительно в `externalTasteProfile` для вычисления жанров и артистов «Волны».
+     * В локальную Библиотеку («Мне нравится») ничего само не добавляется.
+     */
+    suspend fun scanExternalTasteProfile(): Int =
+        coroutineScope {
+            val yandexToken = sanitizeYandexToken(configStore.current.yandexToken)
+            val vkToken = sanitizeVkToken(configStore.current.vkToken)
+
+            val ymTask =
+                async(Dispatchers.IO) {
+                    if (yandexToken.isBlank()) {
+                        emptyList()
+                    } else {
+                        runCatching {
+                            fetchAllYandexLikedTracks(
+                                token = yandexToken,
+                                maxTracksCap = BACKGROUND_SCAN_CAP,
+                                onBatchFetched = {},
+                            )
+                        }.getOrDefault(emptyList())
+                    }
+                }
+
+            val vkTask =
+                async(Dispatchers.IO) {
+                    if (vkToken.isBlank()) {
+                        emptyList()
+                    } else {
+                        runCatching {
+                            fetchAllVkAudioTracks(
+                                token = vkToken,
+                                maxTracksCap = BACKGROUND_SCAN_CAP,
+                                onPageFetched = { _, _ -> },
+                            )
+                        }.getOrDefault(emptyList())
+                    }
+                }
+
+            val ytTask =
+                async(Dispatchers.IO) {
+                    val fetcher = externalYouTubeLikesFetcher ?: return@async emptyList()
+                    runCatching { fetcher().take(BACKGROUND_SCAN_CAP) }.getOrDefault(emptyList())
+                }
+
+            val combined = ymTask.await() + vkTask.await() + ytTask.await()
+            if (combined.isEmpty()) return@coroutineScope configStore.current.externalTasteProfile.size
+
+            val entries =
+                combined.map { item ->
+                    LikedTrackBackup(
+                        id = item.externalId,
+                        artist = item.artist,
+                        title = item.title,
+                        thumbnail = null,
+                    )
+                }
+            val mergedCount = configStore.mergeExternalTasteProfile(entries)
+            Log.d(TAG, "Background taste scan updated externalTasteProfile: $mergedCount tracks")
+            mergedCount
         }
 
     suspend fun fetchYandexChart(limit: Int = 25): List<ExternalCatalogTrack> =
@@ -389,8 +532,11 @@ class CustomCatalogProvider(
                     id = item.externalId,
                     artist = item.artist,
                     title = item.title,
+                    thumbnail = item.coverUrl,
                 )
             }
+        // Сразу обогащаем и память вкуса, и бэкап лайков
+        configStore.mergeExternalTasteProfile(backupEntries)
         val savedTotal = configStore.mergeImportedLikes(backupEntries)
 
         val targetTracks =
@@ -419,8 +565,24 @@ class CustomCatalogProvider(
                 coroutineScope {
                     batch.map { ext ->
                         async(Dispatchers.IO) {
-                            // Если трека нет на YouTube — добавляем его напрямую как ym_/vk_, чтобы импортировались все 100%
-                            matchExternalToSongItem(ext) ?: ext.toSongItem()
+                            val song =
+                                if (ext.source == "youtube" && ext.externalId.isNotBlank() && !ext.externalId.startsWith("ym_") && !ext.externalId.startsWith("vk_")) {
+                                    ext.toSongItem()
+                                } else {
+                                    matchExternalToSongItem(ext) ?: ext.toSongItem()
+                                }
+
+                            // Сохраняем прямую привязку на диск для быстрого воспроизведения
+                            TrackBindingCache.put(song.id, ext.artist, ext.title) { prev ->
+                                prev.copy(
+                                    yandexId = if (ext.source == "yandex") ext.externalId.removePrefix("ym_") else prev.yandexId,
+                                    vkAudioKey = if (ext.source == "vk") ext.externalId.removePrefix("vk_") else prev.vkAudioKey,
+                                    hdCoverUrl = ext.coverUrl ?: prev.hdCoverUrl,
+                                    durationSec = ext.durationSec ?: prev.durationSec,
+                                    isExplicit = ext.isExplicit || prev.isExplicit,
+                                )
+                            }
+                            song
                         }
                     }.awaitAll()
                 }
@@ -434,7 +596,14 @@ class CustomCatalogProvider(
                             existingLikedIds.add(song.id)
                             addedToLibrary += 1
                             val art = song.artists.joinToString(", ") { it.name }.trim()
-                            resolvedBackups.add(LikedTrackBackup(id = song.id, artist = art, title = song.title))
+                            resolvedBackups.add(
+                                LikedTrackBackup(
+                                    id = song.id,
+                                    artist = art,
+                                    title = song.title,
+                                    thumbnail = song.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri },
+                                ),
+                            )
                         }
                     }
                 }
@@ -489,7 +658,7 @@ class CustomCatalogProvider(
                                 candidateTitle = song.title,
                                 candidateDurationSec = song.duration,
                             )
-                        if (score >= 52) song to score else null
+                        if (score >= 55) song to score else null
                     }.maxByOrNull { it.second }
                     ?.first
                     ?: return null
@@ -510,6 +679,7 @@ class CustomCatalogProvider(
 
     private suspend fun fetchAllYandexLikedTracks(
         token: String,
+        maxTracksCap: Int = 5_000,
         onBatchFetched: (Int) -> Unit,
     ): List<ExternalCatalogTrack> =
         withContext(Dispatchers.IO) {
@@ -541,7 +711,7 @@ class CustomCatalogProvider(
 
             val trackIds =
                 buildList {
-                    for (i in 0 until rawTracks.length()) {
+                    for (i in 0 until minOf(rawTracks.length(), maxTracksCap)) {
                         val obj = rawTracks.optJSONObject(i) ?: continue
                         val id = obj.optString("id").trim()
                         if (id.isNotBlank()) add(id)
@@ -563,13 +733,15 @@ class CustomCatalogProvider(
                     parseYandexTrack(item)?.let(allTracks::add)
                 }
                 onBatchFetched(allTracks.size)
+                if (allTracks.size >= maxTracksCap) break
                 delay(180L)
             }
-            allTracks
+            allTracks.take(maxTracksCap)
         }
 
     private suspend fun fetchAllVkAudioTracks(
         token: String,
+        maxTracksCap: Int = 5_000,
         onPageFetched: (fetched: Int, total: Int) -> Unit,
     ): List<ExternalCatalogTrack> =
         withContext(Dispatchers.IO) {
@@ -578,8 +750,7 @@ class CustomCatalogProvider(
             var workingVersion: String? = null
             var totalCount = -1
             var offset = 0
-            val pageSize = 200
-            val maxTracksCap = 5_000
+            val pageSize = minOf(200, maxTracksCap)
 
             while (offset < maxTracksCap) {
                 val versions = workingVersion?.let { listOf(it) } ?: versionsToTry
@@ -608,7 +779,7 @@ class CustomCatalogProvider(
                             error("VK #9: Флуд-контроль — подожди пару минут и повтори")
                         }
                         if (code == 5) {
-                            error("Токен ВК истёк (#5)")
+                            error("Токен ВК истёк (#5) — обнови через «Войти в ВК»")
                         }
                         lastErr = "VK #$code: $msg"
                         continue
@@ -639,10 +810,11 @@ class CustomCatalogProvider(
 
                 if (pageItems.size < pageSize) break
                 if (totalCount > 0 && offset >= totalCount) break
+                if (allTracks.size >= maxTracksCap) break
                 delay(550L)
             }
 
-            allTracks
+            allTracks.take(maxTracksCap)
         }
 
     private fun parseYandexTrack(obj: JSONObject): ExternalCatalogTrack? {
@@ -680,7 +852,7 @@ class CustomCatalogProvider(
         val clean = rawUri.trim()
         if (clean.isBlank()) return null
         val normalized = if (clean.startsWith("http")) clean else "https://$clean"
-        return normalized.replace("%%", "400x400")
+        return normalized.replace("%%", "600x600")
     }
 
     private fun parseVkAudioArray(items: JSONArray?): List<ExternalCatalogTrack> {
@@ -702,7 +874,9 @@ class CustomCatalogProvider(
                         .optJSONObject("album")
                         ?.optJSONObject("thumb")
                         ?.let { thumb ->
-                            thumb.optString("photo_600").ifBlank { thumb.optString("photo_300") }
+                            thumb.optString("photo_1200")
+                                .ifBlank { thumb.optString("photo_600") }
+                                .ifBlank { thumb.optString("photo_300") }
                         }?.takeIf { it.isNotBlank() }
                 add(
                     ExternalCatalogTrack(
@@ -763,15 +937,32 @@ class CustomCatalogProvider(
             "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
         private const val VK_ANDROID_UA =
             "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)"
-        private const val HOME_SHELVES_TTL_MS = 20 * 60 * 1_000L
+        private const val HOME_SHELVES_TTL_MS = 3L * 60 * 60 * 1_000L
+        private const val TASTE_SCAN_TTL_MS = 7L * 24 * 60 * 60 * 1_000L
+        private const val BACKGROUND_SCAN_CAP = 200
+        private const val HOME_CACHE_FILE_NAME = "custom_home_snapshot_v1.json"
 
         private val homeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        private val fallbackDeezerClient by lazy { DeezerReferenceClient() }
+
+        private val _homeSnapshot = MutableStateFlow(HomeCatalogSnapshot())
+        val homeSnapshot: StateFlow<HomeCatalogSnapshot> = _homeSnapshot.asStateFlow()
+
+        /** Подключается на Этапе 2 к аккаунту YTM для скана и ручного импорта лайков YouTube. */
+        @Volatile
+        var externalYouTubeLikesFetcher: (suspend () -> List<ExternalCatalogTrack>)? = null
+
+        @Volatile
+        private var homeCacheFile: File? = null
 
         @Volatile
         private var lastLoadedAtMs: Long = 0L
 
         @Volatile
         private var isHomeLoading: Boolean = false
+
+        @Volatile
+        private var isTasteScanning: Boolean = false
 
         @Volatile
         private var vkSearchFloodUntilMs: Long = 0L
@@ -782,9 +973,59 @@ class CustomCatalogProvider(
         @Volatile
         private var lastSearchedQuery: String = ""
 
+        fun initDiskCache(appContext: Context) {
+            if (homeCacheFile != null) return
+            val file = File(appContext.filesDir, HOME_CACHE_FILE_NAME)
+            homeCacheFile = file
+            homeScope.launch {
+                val restored = loadSnapshotFromDisk(file) ?: return@launch
+                if (restored.isNotEmpty) {
+                    _homeSnapshot.value = restored
+                    lastLoadedAtMs = restored.updatedAtMs
+                    val shelves = buildHomeShelvesFromSnapshot(restored)
+                    if (shelves.isNotEmpty() && CustomHomeShelvesBridge.shelves.isEmpty()) {
+                        withContext(Dispatchers.Main) {
+                            CustomHomeShelvesBridge.shelves = shelves
+                        }
+                    }
+                }
+            }
+        }
+
+        fun triggerBackgroundTasteScan(
+            configStore: CustomConfigStore,
+            force: Boolean = false,
+        ) {
+            val cfg = configStore.current
+            if (cfg.yandexToken.isBlank() && cfg.vkToken.isBlank() && externalYouTubeLikesFetcher == null) return
+            val now = System.currentTimeMillis()
+            val stale = cfg.externalTasteProfile.isEmpty() || (now - cfg.lastTasteScanMs) > TASTE_SCAN_TTL_MS
+            if (!force && !stale) return
+            if (isTasteScanning) return
+
+            isTasteScanning = true
+            homeScope.launch {
+                try {
+                    CustomCatalogProvider(configStore).scanExternalTasteProfile()
+                } catch (err: Exception) {
+                    Log.w(TAG, "Background taste scan skipped: ${err.message}")
+                } finally {
+                    isTasteScanning = false
+                }
+            }
+        }
+
         fun bindHomeShelvesBridge(configStore: CustomConfigStore) {
             val provider = CustomCatalogProvider(configStore)
+
+            // Автоматический фоновый скан вкуса при старте (без добавления в Библиотеку)
+            triggerBackgroundTasteScan(configStore, force = false)
+
             CustomHomeShelvesBridge.onRefreshRequested = { force ->
+                val cached = _homeSnapshot.value
+                if (CustomHomeShelvesBridge.shelves.isEmpty() && cached.isNotEmpty) {
+                    CustomHomeShelvesBridge.shelves = buildHomeShelvesFromSnapshot(cached)
+                }
                 val now = System.currentTimeMillis()
                 val stale = CustomHomeShelvesBridge.shelves.isEmpty() || now - lastLoadedAtMs > HOME_SHELVES_TTL_MS
                 if ((force || stale) && !isHomeLoading) {
@@ -800,7 +1041,7 @@ class CustomCatalogProvider(
                                 lastLoadedAtMs = System.currentTimeMillis()
                             }
                         } catch (err: Exception) {
-                            Log.w(TAG, "Failed to load RF home shelves: ${err.message}")
+                            Log.w(TAG, "Failed to load home shelves: ${err.message}")
                         } finally {
                             isHomeLoading = false
                             withContext(Dispatchers.Main) {
@@ -848,6 +1089,141 @@ class CustomCatalogProvider(
                                 }
                             }
                         }
+                }
+            }
+        }
+
+        private fun buildHomeShelvesFromSnapshot(snapshot: HomeCatalogSnapshot): List<HomeShelf> {
+            val radarSongs = snapshot.releaseRadar.map { it.toSongItem() }.distinctBy { it.id }
+            val chartSongs = snapshot.yandexChart.map { it.toSongItem() }.distinctBy { it.id }
+            val vkSongs = snapshot.vkChart.map { it.toSongItem() }.distinctBy { it.id }
+            val deezerSongs = snapshot.deezerChart.map { it.toSongItem() }.distinctBy { it.id }
+
+            return buildList {
+                if (radarSongs.isNotEmpty()) {
+                    add(
+                        HomeShelf(
+                            key = "custom_release_radar",
+                            title = "Радар новинок",
+                            items = radarSongs,
+                            style = HomeShelfStyle.CAROUSEL,
+                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                        ),
+                    )
+                }
+                if (chartSongs.isNotEmpty()) {
+                    add(
+                        HomeShelf(
+                            key = "custom_ym_chart_rf",
+                            title = "Чарт Я.Музыки",
+                            items = chartSongs,
+                            style = HomeShelfStyle.SONG_GRID,
+                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                            rows = 4,
+                            compactRows = true,
+                        ),
+                    )
+                }
+                if (vkSongs.isNotEmpty()) {
+                    add(
+                        HomeShelf(
+                            key = "custom_vk_popular",
+                            title = "Чарт и рекомендации VK",
+                            items = vkSongs,
+                            style = HomeShelfStyle.SONG_GRID,
+                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                            rows = 4,
+                            compactRows = true,
+                        ),
+                    )
+                }
+                if (deezerSongs.isNotEmpty()) {
+                    add(
+                        HomeShelf(
+                            key = "custom_deezer_chart",
+                            title = "Мировой чарт • Deezer",
+                            items = deezerSongs,
+                            style = HomeShelfStyle.SONG_GRID,
+                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                            rows = 4,
+                            compactRows = true,
+                        ),
+                    )
+                }
+            }
+        }
+
+        private fun saveSnapshotToDisk(snapshot: HomeCatalogSnapshot) {
+            val file = homeCacheFile ?: return
+            runCatching {
+                val root =
+                    JSONObject()
+                        .put("updatedAtMs", snapshot.updatedAtMs)
+                        .put("yandexChart", serializeTrackList(snapshot.yandexChart))
+                        .put("vkChart", serializeTrackList(snapshot.vkChart))
+                        .put("deezerChart", serializeTrackList(snapshot.deezerChart))
+                        .put("releaseRadar", serializeTrackList(snapshot.releaseRadar))
+                val tmp = File(file.parentFile, "$HOME_CACHE_FILE_NAME.tmp")
+                tmp.writeText(root.toString(), Charsets.UTF_8)
+                if (!tmp.renameTo(file)) {
+                    tmp.copyTo(file, overwrite = true)
+                    tmp.delete()
+                }
+            }.onFailure { err ->
+                Log.w(TAG, "Failed to save home snapshot cache: ${err.message}")
+            }
+        }
+
+        private fun loadSnapshotFromDisk(file: File): HomeCatalogSnapshot? {
+            if (!file.exists()) return null
+            return runCatching {
+                val root = JSONObject(file.readText(Charsets.UTF_8))
+                HomeCatalogSnapshot(
+                    yandexChart = parseTrackList(root.optJSONArray("yandexChart")),
+                    vkChart = parseTrackList(root.optJSONArray("vkChart")),
+                    deezerChart = parseTrackList(root.optJSONArray("deezerChart")),
+                    releaseRadar = parseTrackList(root.optJSONArray("releaseRadar")),
+                    updatedAtMs = root.optLong("updatedAtMs", 0L),
+                )
+            }.getOrNull()
+        }
+
+        private fun serializeTrackList(list: List<ExternalCatalogTrack>): JSONArray =
+            JSONArray().apply {
+                list.forEach { t ->
+                    put(
+                        JSONObject()
+                            .put("src", t.source)
+                            .put("id", t.externalId)
+                            .put("a", t.artist)
+                            .put("t", t.title)
+                            .apply {
+                                if (t.durationSec != null && t.durationSec > 0L) put("d", t.durationSec)
+                                if (!t.coverUrl.isNullOrBlank()) put("c", t.coverUrl)
+                                if (t.isExplicit) put("e", true)
+                            },
+                    )
+                }
+            }
+
+        private fun parseTrackList(arr: JSONArray?): List<ExternalCatalogTrack> {
+            if (arr == null) return emptyList()
+            return buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val title = o.optString("t").trim()
+                    if (title.isBlank()) continue
+                    add(
+                        ExternalCatalogTrack(
+                            source = o.optString("src", "yandex"),
+                            externalId = o.optString("id").trim(),
+                            artist = o.optString("a").trim(),
+                            title = title,
+                            durationSec = o.optLong("d", -1L).takeIf { it > 0L },
+                            coverUrl = o.optString("c").takeIf { it.isNotBlank() },
+                            isExplicit = o.optBoolean("e", false),
+                        ),
+                    )
                 }
             }
         }
