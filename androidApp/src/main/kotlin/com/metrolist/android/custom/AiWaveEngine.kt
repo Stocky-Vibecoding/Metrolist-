@@ -8,7 +8,6 @@ import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.GlobalYouTube
 import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
-import com.metrolist.shared.ui.screens.CustomHomeShelvesBridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -31,9 +30,14 @@ private data class StructuredTasteProfile(
     val coreRecentTracks: List<String>,
     val topArtists: List<String>,
     val extraContextTracks: List<String>,
+    val sessionPositiveTracks: List<String>,
 ) {
     val isNotEmpty: Boolean
-        get() = coreRecentTracks.isNotEmpty() || topArtists.isNotEmpty() || extraContextTracks.isNotEmpty()
+        get() =
+            coreRecentTracks.isNotEmpty() ||
+                topArtists.isNotEmpty() ||
+                extraContextTracks.isNotEmpty() ||
+                sessionPositiveTracks.isNotEmpty()
 }
 
 class AiWaveEngine(
@@ -43,7 +47,14 @@ class AiWaveEngine(
     private val waveMutex = Mutex()
     private val sessionSkippedUntilMs = ConcurrentHashMap<String, Long>()
     private val sessionSkippedLabels = ConcurrentHashMap<String, String>()
-    private val recentGeneratedKeys = LinkedHashSet<String>()
+    private val sessionPositiveLabels = ArrayDeque<String>()
+    private val sessionLock = Any()
+
+    @Volatile
+    private var consecutiveQuickSkips: Int = 0
+
+    @Volatile
+    private var lastAutoPivotMs: Long = 0L
 
     private val _isGeneratingWave = MutableStateFlow(false)
     val isGeneratingWave: StateFlow<Boolean> = _isGeneratingWave.asStateFlow()
@@ -55,82 +66,142 @@ class AiWaveEngine(
         sharedInstance = this
     }
 
+    /**
+     * Мгновенный старт волны при открытии/перезапуске:
+     * 1. Продолжает сохранённую прошлую очередь (`lastWaveTracks`) без сброса и лишнего запроса к Gemini.
+     * 2. Если её нет или нет сети — подхватывает умную подборку из локального кэша 4 ГБ / защищённых лайков.
+     */
     fun buildInstantStarterSongs(
         excludeIds: Set<String> = emptySet(),
-        limit: Int = 8,
+        limit: Int = 12,
     ): List<SongItem> {
         val cfg = configStore.current
-
-        val freshPool =
+        val savedWave =
             filterSongsByFeedback(
-                CustomHomeShelvesBridge.shelves
-                    .flatMap { it.items }
-                    .filterIsInstance<SongItem>() +
-                    cfg.lastWaveTracks.mapNotNull { it.toStarterSongItem() },
+                cfg.lastWaveTracks.mapNotNull { it.toStarterSongItem() },
+                respectSessionSkips = true,
+                respectPlayedCooldown = false,
             ).filter { it.id.isNotBlank() && it.id !in excludeIds }
                 .distinctBy { it.id }
-                .shuffled()
+
+        if (savedWave.isNotEmpty()) {
+            return savedWave.take(limit)
+        }
+
+        val offlinePool =
+            filterSongsByFeedback(
+                CustomMediaCacheManager.getOfflineCachedSongs(
+                    preferredVibe = currentVibeTag(cfg),
+                    preferredArtists = configStore.getLocalTopArtists(15).toSet(),
+                    excludeIds = excludeIds,
+                    limit = limit * 2,
+                ),
+                respectSessionSkips = true,
+                respectPlayedCooldown = false,
+            ).distinctBy { it.id }
+
+        if (offlinePool.isNotEmpty()) {
+            return offlinePool.take(limit)
+        }
 
         val recentLikedPool =
             filterSongsByFeedback(
                 SongLikeState.likedSongs
                     .sortedByDescending { it.libraryAddedAt ?: 0L }
-                    .take(20) +
-                    cfg.likedTracksBackup.take(20).mapNotNull { it.toStarterSongItem() },
+                    .take(24) +
+                    cfg.likedTracksBackup.take(24).mapNotNull { it.toStarterSongItem() },
+                respectSessionSkips = true,
+                respectPlayedCooldown = false,
             ).filter { it.id.isNotBlank() && it.id !in excludeIds }
                 .distinctBy { it.id }
                 .shuffled()
 
-        if (freshPool.isEmpty()) {
-            return recentLikedPool.take(limit)
-        }
-
-        val result = mutableListOf<SongItem>()
-        val usedIds = HashSet<String>()
-        var freshIdx = 0
-        var likedIdx = 0
-
-        while (result.size < limit && (freshIdx < freshPool.size || likedIdx < minOf(2, recentLikedPool.size))) {
-            repeat(2) {
-                if (result.size < limit && freshIdx < freshPool.size) {
-                    val s = freshPool[freshIdx++]
-                    if (usedIds.add(s.id)) result.add(s)
-                }
-            }
-            if (result.size < limit && likedIdx < minOf(2, recentLikedPool.size)) {
-                val s = recentLikedPool[likedIdx++]
-                if (usedIds.add(s.id)) result.add(s)
-            }
-            if (freshIdx >= freshPool.size && likedIdx >= minOf(2, recentLikedPool.size)) break
-        }
-        return result
+        return recentLikedPool.take(limit)
     }
 
-    fun recordSessionSkip(song: SongItem) {
+    fun currentVibeTag(cfg: CustomAppConfig = configStore.current): String =
+        listOfNotNull(
+            cfg.waveMood.takeIf { it != WaveMood.ANY }?.name,
+            cfg.waveLanguage.takeIf { it != WaveLanguage.ANY }?.name,
+            cfg.waveEra.takeIf { it != WaveEra.ANY }?.name,
+        ).joinToString("_").ifBlank { "DEFAULT" }
+
+    fun recordSessionSkip(
+        song: SongItem,
+        isQuickSkip: Boolean = true,
+    ) {
         val artist = song.artists.joinToString(", ") { it.name }.trim()
         val key = CustomConfigStore.buildTrackKey(artist, song.title)
-        if (key.isBlank()) return
-        sessionSkippedUntilMs[key] = System.currentTimeMillis() + SESSION_SKIP_COOLDOWN_MS
-        sessionSkippedLabels[key] = if (artist.isNotBlank()) "$artist — ${song.title}" else song.title
-        if (sessionSkippedLabels.size > 20) {
-            val firstKey = sessionSkippedLabels.keys.firstOrNull()
-            if (firstKey != null) sessionSkippedLabels.remove(firstKey)
+        if (key.isNotBlank()) {
+            sessionSkippedUntilMs[key] = System.currentTimeMillis() + SESSION_SKIP_COOLDOWN_MS
+            sessionSkippedLabels[key] = if (artist.isNotBlank()) "$artist — ${song.title}" else song.title
+            if (sessionSkippedLabels.size > 20) {
+                val firstKey = sessionSkippedLabels.keys.firstOrNull()
+                if (firstKey != null) sessionSkippedLabels.remove(firstKey)
+            }
         }
+        if (isQuickSkip) {
+            consecutiveQuickSkips += 1
+        }
+    }
+
+    /** Вызывается при дослушивании >75% трека или повторе — работает как скрытый «мини-лайк» текущей сессии. */
+    fun recordTrackCompletion(
+        song: SongItem,
+        completed: Boolean = true,
+    ) {
+        val artist = song.artists.joinToString(", ") { it.name }.trim()
+        configStore.recordTrackPlayed(artist = artist, title = song.title, completed = completed)
+        if (completed) {
+            consecutiveQuickSkips = 0
+            val label = if (artist.isNotBlank()) "$artist — ${song.title}" else song.title
+            if (label.isNotBlank()) {
+                synchronized(sessionLock) {
+                    sessionPositiveLabels.remove(label)
+                    sessionPositiveLabels.addFirst(label)
+                    while (sessionPositiveLabels.size > 8) {
+                        sessionPositiveLabels.removeLast()
+                    }
+                }
+            }
+        }
+    }
+
+    fun shouldTriggerAutoPivot(): Boolean {
+        if (consecutiveQuickSkips < AUTO_PIVOT_SKIP_THRESHOLD) return false
+        val now = System.currentTimeMillis()
+        return (now - lastAutoPivotMs) >= AUTO_PIVOT_COOLDOWN_MS
+    }
+
+    fun markAutoPivotTriggered() {
+        consecutiveQuickSkips = 0
+        lastAutoPivotMs = System.currentTimeMillis()
     }
 
     fun recordDislike(song: SongItem) {
         val artist = song.artists.joinToString(", ") { it.name }.trim()
         configStore.dislikeTrack(artist = artist, title = song.title)
-        recordSessionSkip(song)
+        recordSessionSkip(song, isQuickSkip = true)
     }
 
     fun recordLike(song: SongItem) {
         val artist = song.artists.joinToString(", ") { it.name }.trim()
         val realThumb = song.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri }
         configStore.likeTrack(artist = artist, title = song.title, songId = song.id, thumbnail = realThumb)
+        consecutiveQuickSkips = 0
         val key = CustomConfigStore.buildTrackKey(artist, song.title)
         sessionSkippedUntilMs.remove(key)
         sessionSkippedLabels.remove(key)
+        val label = if (artist.isNotBlank()) "$artist — ${song.title}" else song.title
+        if (label.isNotBlank()) {
+            synchronized(sessionLock) {
+                sessionPositiveLabels.remove(label)
+                sessionPositiveLabels.addFirst(label)
+                while (sessionPositiveLabels.size > 8) {
+                    sessionPositiveLabels.removeLast()
+                }
+            }
+        }
     }
 
     private fun isSessionSkipped(
@@ -147,55 +218,134 @@ class AiWaveEngine(
         return true
     }
 
+    /**
+     * Генерация адаптивной пачки волны (12–15 треков):
+     * - Gemini по локальному профилю вкуса + сигналам сессии;
+     * - Резерв Last.fm при 429 / отсутствии ключа;
+     * - Бесшовный офлайн-фолбэк из 4 ГБ кэша при отсутствии интернета.
+     */
     suspend fun generateWaveSongs(
         seedSong: SongItem? = null,
-        count: Int = maxOf(configStore.current.aiPlaylistSize, 40),
+        count: Int = DEFAULT_WAVE_BATCH_SIZE,
         backgroundLabel: Boolean = false,
+        pivotVibe: Boolean = false,
+        excludeIds: Set<String> = emptySet(),
     ): Result<List<SongItem>> =
         waveMutex.withLock {
             _isGeneratingWave.value = true
             _statusText.value =
                 when {
+                    pivotVibe -> "Меняю настрой волны…"
                     seedSong != null -> "Собираю волну от «${seedSong.title}»…"
-                    backgroundLabel -> "Подбираю свежую волну в фоне…"
+                    backgroundLabel -> "Подбираю следующую пачку…"
                     else -> "Подбираю волну…"
                 }
             try {
                 val cfg = configStore.current
                 val profile = collectStructuredTasteProfile(cfg)
-                val targetCount = count.coerceIn(35, 50)
-                val prompt = buildWavePrompt(cfg = cfg, seedSong = seedSong, profile = profile)
+                val targetCount = count.coerceIn(MIN_WAVE_BATCH_SIZE, MAX_WAVE_BATCH_SIZE)
+                // Просим у Gemini на пару треков больше с запасом на строгий отсев
+                val requestCount = (targetCount + 4).coerceAtMost(20)
 
-                geminiClient
-                    .generateTrackList(prompt = prompt, count = targetCount)
-                    .mapCatching { suggestions ->
-                        val filtered = filterSuggestionsByFeedback(suggestions)
-                        val resolved = resolveSuggestionsToSongs(filtered, maxResults = targetCount)
-                        val cleanResolved =
-                            diversifyWaveSongs(
-                                songs = filterSongsByFeedback(resolved).map(::withFallbackCover),
-                                cfg = cfg,
-                            )
-                        check(cleanResolved.isNotEmpty()) { "Не удалось найти ни одного трека в каталоге" }
+                val prompt =
+                    buildWavePrompt(
+                        cfg = cfg,
+                        seedSong = seedSong,
+                        profile = profile,
+                        pivotVibe = pivotVibe,
+                    )
 
-                        rememberGeneratedTracks(cleanResolved)
-
-                        val savedWave =
-                            cleanResolved.map { song ->
-                                LikedTrackBackup(
-                                    id = song.id,
-                                    artist = song.artists.joinToString(", ") { it.name }.trim(),
-                                    title = song.title,
-                                    thumbnail = song.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri },
-                                )
-                            }
-                        configStore.saveLastWaveTracks(savedWave)
-                        cleanResolved
-                    }.onSuccess {
-                        _statusText.value = null
-                    }.onFailure { err ->
-                        _statusText.value = if (backgroundLabel) null else (err.message ?: "Ошибка генерации волны")
+                val geminiResult =
+                    if (cfg.geminiApiKey.isNotBlank()) {
+                        geminiClient.generateTrackList(prompt = prompt, count = requestCount)
+                    } else {
+                        Result.failure(IllegalStateException("Gemini API ключ не указан"))
                     }
+
+                val resolvedOnline =
+                    geminiResult.fold(
+                        onSuccess = { suggestions ->
+                            val filtered = filterSuggestionsByFeedback(suggestions, respectPlayedCooldown = true)
+                            val found = resolveSuggestionsToSongs(filtered, maxResults = targetCount)
+                            val clean =
+                                diversifyWaveSongs(
+                                    songs =
+                                        filterSongsByFeedback(
+                                            found,
+                                            respectSessionSkips = true,
+                                            respectPlayedCooldown = true,
+                                        ).filter { it.id !in excludeIds }.map(::withFallbackCover),
+                                    cfg = cfg,
+                                )
+                            clean
+                        },
+                        onFailure = { err ->
+                            Log.w(TAG, "Gemini wave generation failed (${err.message}), trying Last.fm fallback")
+                            emptyList()
+                        },
+                    )
+
+                val finalSongs =
+                    when {
+                        resolvedOnline.isNotEmpty() -> resolvedOnline
+                        else -> {
+                            // Резерв 1: Last.fm (при 429 от Gemini или пустом ключе)
+                            val lastFmSongs =
+                                generateLastFmFallbackSongs(
+                                    cfg = cfg,
+                                    seedSong = seedSong,
+                                    profile = profile,
+                                    excludeIds = excludeIds,
+                                    limit = targetCount,
+                                )
+                            if (lastFmSongs.isNotEmpty()) {
+                                lastFmSongs
+                            } else {
+                                // Резерв 2: Умный офлайн-фолбэк из 4 ГБ кэша и скачанных лайков
+                                CustomMediaCacheManager
+                                    .getOfflineCachedSongs(
+                                        preferredVibe = currentVibeTag(cfg),
+                                        preferredArtists = profile.topArtists.toSet(),
+                                        excludeIds = excludeIds,
+                                        limit = targetCount,
+                                    ).let { filterSongsByFeedback(it, respectSessionSkips = true, respectPlayedCooldown = false) }
+                                    .map(::withFallbackCover)
+                            }
+                        }
+                    }
+
+                if (finalSongs.isEmpty()) {
+                    val err = geminiResult.exceptionOrNull() ?: IllegalStateException("Не удалось подобрать треки")
+                    _statusText.value = if (backgroundLabel) null else (err.message ?: "Ошибка генерации волны")
+                    return@withLock Result.failure(err)
+                }
+
+                if (pivotVibe) {
+                    markAutoPivotTriggered()
+                }
+
+                // Сохраняем свежую очередь (если это основная волна, а не разовая волна по треку)
+                if (seedSong == null) {
+                    val savedWave =
+                        finalSongs.map { song ->
+                            LikedTrackBackup(
+                                id = song.id,
+                                artist = song.artists.joinToString(", ") { it.name }.trim(),
+                                title = song.title,
+                                thumbnail = song.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri },
+                            )
+                        }
+                    configStore.saveLastWaveTracks(savedWave)
+                }
+
+                // Фоновая предзагрузка первых треков новой пачки в 4 ГБ кэш
+                CustomMediaCacheManager.preloadUpcomingTracks(
+                    songs = finalSongs,
+                    vibeTag = currentVibeTag(cfg),
+                )
+
+                _statusText.value = null
+                Result.success(finalSongs)
             } finally {
                 _isGeneratingWave.value = false
             }
@@ -263,9 +413,11 @@ class AiWaveEngine(
             return Result.failure(lastError ?: IllegalStateException("Не удалось подобрать треки по запросу"))
         }
 
-        val filtered = filterSuggestionsByFeedback(allSuggestions, respectSessionSkips = false)
+        val filtered = filterSuggestionsByFeedback(allSuggestions, respectSessionSkips = false, respectPlayedCooldown = false)
         val resolved = resolveSuggestionsToSongs(filtered, maxResults = targetCount)
-        val cleanResolved = filterSongsByFeedback(resolved, respectSessionSkips = false).map(::withFallbackCover)
+        val cleanResolved =
+            filterSongsByFeedback(resolved, respectSessionSkips = false, respectPlayedCooldown = false)
+                .map(::withFallbackCover)
         if (cleanResolved.isEmpty()) {
             return Result.failure(IllegalStateException("Не удалось найти треки в каталоге"))
         }
@@ -288,19 +440,140 @@ class AiWaveEngine(
         )
     }
 
-    private fun rememberGeneratedTracks(songs: List<SongItem>) {
-        synchronized(recentGeneratedKeys) {
-            songs.forEach { song ->
-                val art = song.artists.joinToString(", ") { it.name }.trim()
-                val key = CustomConfigStore.buildTrackKey(art, song.title)
-                if (key.isNotBlank()) recentGeneratedKeys.add(key)
+    /** Резервная дозагрузка похожих треков через Last.fm (при 429 от Gemini). */
+    private suspend fun generateLastFmFallbackSongs(
+        cfg: CustomAppConfig,
+        seedSong: SongItem?,
+        profile: StructuredTasteProfile,
+        excludeIds: Set<String>,
+        limit: Int,
+    ): List<SongItem> =
+        withContext(Dispatchers.IO) {
+            val apiKey = cfg.lastFmApiKey.trim()
+            if (apiKey.isBlank()) return@withContext emptyList()
+
+            val suggestions = mutableListOf<AiTrackSuggestion>()
+            val seen = HashSet<String>()
+
+            fun addSuggestion(
+                artist: String,
+                title: String,
+            ) {
+                val a = artist.trim()
+                val t = title.trim()
+                if (a.isBlank() || t.isBlank()) return
+                val k = CustomConfigStore.buildTrackKey(a, t)
+                if (k.isNotBlank() && seen.add(k)) {
+                    suggestions.add(AiTrackSuggestion(artist = a, title = t))
+                }
             }
-            while (recentGeneratedKeys.size > 120) {
-                val first = recentGeneratedKeys.firstOrNull() ?: break
-                recentGeneratedKeys.remove(first)
+
+            // 1. Похожие на seedSong
+            if (seedSong != null) {
+                val seedArtist = seedSong.artists.joinToString(", ") { it.name }.trim()
+                fetchLastFmSimilarTracks(apiKey, seedArtist, seedSong.title, limit = 16).forEach {
+                    addSuggestion(it.artist, it.title)
+                }
             }
+
+            // 2. Похожие артисты и их топ-треки по локальному топу
+            val anchorArtists =
+                buildList {
+                    seedSong?.artists?.firstOrNull()?.name?.takeIf { it.isNotBlank() }?.let(::add)
+                    addAll(profile.topArtists.shuffled().take(4))
+                }.distinct().take(4)
+
+            for (artist in anchorArtists) {
+                if (suggestions.size >= limit + 6) break
+                val similarArtists = fetchLastFmSimilarArtists(apiKey, artist, limit = 4)
+                for (sim in similarArtists.shuffled().take(3)) {
+                    fetchLastFmArtistTopTracks(apiKey, sim, limit = 3).forEach {
+                        addSuggestion(it.artist, it.title)
+                    }
+                    if (suggestions.size >= limit + 6) break
+                }
+            }
+
+            if (suggestions.isEmpty()) return@withContext emptyList()
+            val filtered = filterSuggestionsByFeedback(suggestions.shuffled(), respectPlayedCooldown = true)
+            val resolved = resolveSuggestionsToSongs(filtered, maxResults = limit)
+            diversifyWaveSongs(
+                songs =
+                    filterSongsByFeedback(resolved, respectSessionSkips = true, respectPlayedCooldown = true)
+                        .filter { it.id !in excludeIds }
+                        .map(::withFallbackCover),
+                cfg = cfg,
+            )
         }
-    }
+
+    private suspend fun fetchLastFmSimilarTracks(
+        apiKey: String,
+        artist: String,
+        title: String,
+        limit: Int,
+    ): List<AiTrackSuggestion> =
+        runCatching {
+            val url =
+                "https://ws.audioscrobbler.com/2.0/?method=track.getsimilar" +
+                    "&artist=${CustomHttp.urlEncode(artist)}" +
+                    "&track=${CustomHttp.urlEncode(title)}" +
+                    "&limit=$limit&api_key=${CustomHttp.urlEncode(apiKey)}&format=json"
+            val resp = CustomHttp.get(url, timeoutMs = 6_000)
+            if (!resp.isSuccess) return@runCatching emptyList<AiTrackSuggestion>()
+            val arr = JSONObject(resp.body).optJSONObject("similartracks")?.optJSONArray("track") ?: return@runCatching emptyList()
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val t = o.optString("name").trim()
+                    val a = o.optJSONObject("artist")?.optString("name").orEmpty().trim()
+                    if (a.isNotBlank() && t.isNotBlank()) add(AiTrackSuggestion(a, t))
+                }
+            }
+        }.getOrDefault(emptyList())
+
+    private suspend fun fetchLastFmSimilarArtists(
+        apiKey: String,
+        artist: String,
+        limit: Int,
+    ): List<String> =
+        runCatching {
+            val url =
+                "https://ws.audioscrobbler.com/2.0/?method=artist.getsimilar" +
+                    "&artist=${CustomHttp.urlEncode(artist)}" +
+                    "&limit=$limit&api_key=${CustomHttp.urlEncode(apiKey)}&format=json"
+            val resp = CustomHttp.get(url, timeoutMs = 6_000)
+            if (!resp.isSuccess) return@runCatching emptyList<String>()
+            val arr = JSONObject(resp.body).optJSONObject("similarartists")?.optJSONArray("artist") ?: return@runCatching emptyList()
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val name = arr.optJSONObject(i)?.optString("name")?.trim().orEmpty()
+                    if (name.isNotBlank()) add(name)
+                }
+            }
+        }.getOrDefault(emptyList())
+
+    private suspend fun fetchLastFmArtistTopTracks(
+        apiKey: String,
+        artist: String,
+        limit: Int,
+    ): List<AiTrackSuggestion> =
+        runCatching {
+            val url =
+                "https://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks" +
+                    "&artist=${CustomHttp.urlEncode(artist)}" +
+                    "&limit=$limit&api_key=${CustomHttp.urlEncode(apiKey)}&format=json"
+            val resp = CustomHttp.get(url, timeoutMs = 6_000)
+            if (!resp.isSuccess) return@runCatching emptyList<AiTrackSuggestion>()
+            val arr = JSONObject(resp.body).optJSONObject("toptracks")?.optJSONArray("track") ?: return@runCatching emptyList()
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val t = o.optString("name").trim()
+                    val a = o.optJSONObject("artist")?.optString("name").orEmpty().trim().ifBlank { artist }
+                    if (t.isNotBlank()) add(AiTrackSuggestion(a, t))
+                }
+            }
+        }.getOrDefault(emptyList())
 
     private fun SongItem.primaryArtistKey(): String =
         CustomConfigStore.buildArtistKey(artists.joinToString(", ") { it.name }.trim())
@@ -315,30 +588,24 @@ class AiWaveEngine(
         val likedKeys =
             cfg.likedTracksBackup
                 .mapTo(HashSet()) { CustomConfigStore.buildTrackKey(it.artist, it.title) }
-        val recentSet = synchronized(recentGeneratedKeys) { HashSet(recentGeneratedKeys) }
 
         val fresh = mutableListOf<SongItem>()
-        val recentRepeats = mutableListOf<SongItem>()
         val familiar = mutableListOf<SongItem>()
 
         for (song in songs) {
             val artistStr = song.artists.joinToString(", ") { it.name }.trim()
             val tKey = CustomConfigStore.buildTrackKey(artistStr, song.title)
             val isLiked = song.id in likedIds || (tKey.isNotBlank() && tKey in likedKeys)
-            when {
-                isLiked -> familiar.add(song)
-                tKey.isNotBlank() && tKey in recentSet -> recentRepeats.add(song)
-                else -> fresh.add(song)
-            }
+            if (isLiked) familiar.add(song) else fresh.add(song)
         }
 
-        val orderedFresh = (fresh.shuffled() + recentRepeats.shuffled()).toMutableList()
+        val orderedFresh = fresh.shuffled().toMutableList()
 
         val maxFamiliar =
             when (cfg.waveCharacter) {
-                WaveCharacter.FAVORITE -> maxOf(4, songs.size / 2)
+                WaveCharacter.FAVORITE -> maxOf(3, songs.size / 2)
                 WaveCharacter.DISCOVERY -> 0
-                else -> maxOf(2, songs.size / 5)
+                else -> maxOf(1, songs.size / 5)
             }
         val familiarPool = familiar.shuffled().take(maxFamiliar).toMutableList()
 
@@ -351,8 +618,8 @@ class AiWaveEngine(
             val key = song.primaryArtistKey()
             if (key.isBlank()) return true
             if (forbidConsecutive && result.lastOrNull()?.primaryArtistKey() == key) return false
-            val recentNine = result.takeLast(9)
-            return recentNine.count { it.primaryArtistKey() == key } < 2
+            val recentWindow = result.takeLast(8)
+            return recentWindow.count { it.primaryArtistKey() == key } < 2
         }
 
         fun pickNext(pool: MutableList<SongItem>): SongItem? {
@@ -383,17 +650,17 @@ class AiWaveEngine(
 
     private fun youtubeFallbackThumbnail(videoId: String): String? {
         if (videoId.length != 11) return null
-        if (videoId.startsWith("ym_") || videoId.startsWith("vk_") || videoId.startsWith("local_")) return null
+        if (videoId.startsWith("ym_") || videoId.startsWith("vk_") || videoId.startsWith("dz_") || videoId.startsWith("local_")) return null
         if (!videoId.all { it.isLetterOrDigit() || it == '-' || it == '_' }) return null
         return "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
     }
 
     private fun withFallbackCover(song: SongItem): SongItem {
+        val cachedHd = ResolverDiagnostics.hdCoverFor(song.id)
+        if (!cachedHd.isNullOrBlank()) return song.copy(thumbnail = cachedHd)
         if (!song.thumbnail.isNullOrBlank() && song.thumbnail != CustomMascotAssets.fallbackCoverUri) return song
-        val realCover =
-            ResolverDiagnostics.hdCoverFor(song.id)
-                ?: youtubeFallbackThumbnail(song.id)
-        if (!realCover.isNullOrBlank()) return song.copy(thumbnail = realCover)
+        val ytThumb = youtubeFallbackThumbnail(song.id)
+        if (!ytThumb.isNullOrBlank()) return song.copy(thumbnail = ytThumb)
         val fallback = CustomMascotAssets.fallbackCoverUri ?: return song
         return song.copy(thumbnail = fallback)
     }
@@ -428,6 +695,7 @@ class AiWaveEngine(
         cfg: CustomAppConfig,
         seedSong: SongItem?,
         profile: StructuredTasteProfile,
+        pivotVibe: Boolean,
     ): String =
         buildString {
             if (seedSong != null) {
@@ -442,11 +710,21 @@ class AiWaveEngine(
                 appendLine("Настроение: ${cfg.waveMood.promptHint}.")
             }
 
+            if (pivotVibe) {
+                appendLine()
+                appendLine("ВАЖНЫЙ ПОВОРОТ НАСТРОЕНИЯ: пользователь только что пропустил несколько треков подряд. Смени темп, энергетику и поджанр на ДРУГОЙ срез вкуса пользователя из его профиля (сохраняя заданные фильтры языка/настроения).")
+            }
+
+            if (profile.sessionPositiveTracks.isNotEmpty() && !pivotVibe) {
+                appendLine()
+                appendLine("ПРЯМО СЕЙЧАС В ЭТОЙ СЕССИИ ПОЛЬЗОВАТЕЛЮ ЗАШЛИ (держи похожий вайб, плотность баса и подачу): ${profile.sessionPositiveTracks.joinToString("; ")}.")
+            }
+
             if (profile.isNotEmpty) {
                 appendLine()
-                appendLine("АКТУАЛЬНЫЙ ПРОФИЛЬ ВКУСА (используй как точный эталон поджанра, продакшена, баса и энергии, НЕ копируй эти треки обратно):")
+                appendLine("АКТУАЛЬНЫЙ ПРОФИЛЬ ВКУСА (используй как точный эталон поджанра, продакшена и энергии, НЕ копируй эти треки обратно):")
                 if (profile.coreRecentTracks.isNotEmpty()) {
-                    appendLine("• Свежие любимые и недавние треки (ГЛАВНЫЙ ориентир): ${profile.coreRecentTracks.joinToString("; ")}.")
+                    appendLine("• Свежие любимые и недавние треки: ${profile.coreRecentTracks.joinToString("; ")}.")
                 }
                 if (profile.topArtists.isNotEmpty()) {
                     appendLine("• Ядро любимых артистов: ${profile.topArtists.joinToString(", ")}.")
@@ -475,7 +753,7 @@ class AiWaveEngine(
 
             appendLine("Не добавляй случайную попсу или треки из несовместимых жанров. Каждый трек должен органично переходить в следующий.")
             appendLine("Только реальные существующие студийные треки — БЕЗ slowed/reverb, sped up, nightcore, tiktok-ремиксов, 8D, каверов и караоке.")
-            appendLine("Допускается до 2 треков одного артиста на каждые 10 треков подборки, но не ставь одного артиста подряд.")
+            appendLine("Не ставь одного артиста подряд и максимум 2 трека одного артиста в пачке.")
             appendFeedbackHints(cfg, includeSessionSkips = true)
         }
 
@@ -508,52 +786,56 @@ class AiWaveEngine(
     private fun filterSuggestionsByFeedback(
         suggestions: List<AiTrackSuggestion>,
         respectSessionSkips: Boolean = true,
+        respectPlayedCooldown: Boolean = true,
     ): List<AiTrackSuggestion> =
         suggestions.filter { item ->
             !configStore.isTrackDisliked(item.artist, item.title) &&
                 !configStore.isArtistAutoMuted(item.artist) &&
-                (!respectSessionSkips || !isSessionSkipped(item.artist, item.title))
+                (!respectSessionSkips || !isSessionSkipped(item.artist, item.title)) &&
+                (!respectPlayedCooldown || !configStore.isTrackInRecentCooldown(item.artist, item.title))
         }
 
     private fun filterSongsByFeedback(
         songs: List<SongItem>,
         respectSessionSkips: Boolean = true,
+        respectPlayedCooldown: Boolean = false,
     ): List<SongItem> =
         songs.filter { song ->
             val artist = song.artists.joinToString(", ") { it.name }.trim()
             !configStore.isTrackDisliked(artist, song.title) &&
                 !configStore.isArtistAutoMuted(artist) &&
-                (!respectSessionSkips || !isSessionSkipped(artist, song.title))
+                (!respectSessionSkips || !isSessionSkipped(artist, song.title)) &&
+                (!respectPlayedCooldown || !configStore.isTrackInRecentCooldown(artist, song.title))
         }
 
+    /**
+     * Единая модель вкуса строго на локальной базе (без истории YouTube):
+     * локальные лайки + локальный топ артистов + сигналы текущей сессии + фоновый externalTasteProfile + Last.fm.
+     */
     private suspend fun collectStructuredTasteProfile(cfg: CustomAppConfig): StructuredTasteProfile =
         withContext(Dispatchers.IO) {
             val coreRecent = LinkedHashSet<String>()
-            val artistScores = HashMap<String, Int>()
+            val artistScores = HashMap<String, Double>()
             val artistDisplayNames = HashMap<String, String>()
 
             fun bumpArtist(
                 rawArtist: String,
-                weight: Int,
+                weight: Double,
             ) {
-                rawArtist
-                    .split(",", "&", "feat.", "ft.")
-                    .map { it.trim() }
-                    .filter { it.length >= 2 }
-                    .forEach { single ->
-                        val norm = CustomConfigStore.buildArtistKey(single)
-                        if (norm.isBlank()) return@forEach
-                        val rep = cfg.artistReputation[norm]
-                        if (rep?.isAutoMuted == true || rep?.isLowWeight == true) return@forEach
-                        artistScores[norm] = (artistScores[norm] ?: 0) + weight
-                        artistDisplayNames.putIfAbsent(norm, single)
-                    }
+                CustomConfigStore.splitArtistNames(rawArtist).forEach { single ->
+                    val norm = CustomConfigStore.buildArtistKey(single)
+                    if (norm.isBlank()) return@forEach
+                    val rep = cfg.artistReputation[norm]
+                    if (rep?.isAutoMuted == true || rep?.isLowWeight == true) return@forEach
+                    artistScores[norm] = (artistScores[norm] ?: 0.0) + weight
+                    artistDisplayNames.putIfAbsent(norm, single)
+                }
             }
 
             fun addCore(
                 artist: String,
                 title: String,
-                artistWeight: Int,
+                artistWeight: Double,
             ) {
                 val cleanTitle = title.trim()
                 val cleanArtist = artist.trim()
@@ -561,22 +843,33 @@ class AiWaveEngine(
                 if (configStore.isTrackDisliked(cleanArtist, cleanTitle)) return
                 if (cleanArtist.isNotBlank() && configStore.isArtistAutoMuted(cleanArtist)) return
                 val label = if (cleanArtist.isNotBlank()) "$cleanArtist - $cleanTitle" else cleanTitle
-                if (coreRecent.size < 16) coreRecent.add(label)
+                if (coreRecent.size < 14) coreRecent.add(label)
                 if (cleanArtist.isNotBlank()) bumpArtist(cleanArtist, artistWeight)
             }
 
+            // 1. Локальная статистика прослушиваний и топ артистов (главный источник после полного перехода)
+            val now = System.currentTimeMillis()
+            cfg.localArtistStats.forEach { (norm, stat) ->
+                val rep = cfg.artistReputation[norm]
+                if (rep?.isAutoMuted == true || rep?.isLowWeight == true) return@forEach
+                artistScores[norm] = (artistScores[norm] ?: 0.0) + stat.rankScore(now)
+                artistDisplayNames.putIfAbsent(norm, stat.displayName)
+            }
+
+            // 2. Свежие локальные лайки
             val recentLocalLikes =
                 SongLikeState.likedSongs
                     .sortedByDescending { it.libraryAddedAt ?: 0L }
             recentLocalLikes.take(12).forEach { song ->
                 val art = song.artists.joinToString(", ") { it.name }.trim()
-                addCore(art, song.title, artistWeight = 5)
+                addCore(art, song.title, artistWeight = 5.0)
             }
-            recentLocalLikes.drop(12).take(60).forEach { song ->
+            recentLocalLikes.drop(12).take(80).forEach { song ->
                 val art = song.artists.joinToString(", ") { it.name }.trim()
-                if (art.isNotBlank()) bumpArtist(art, weight = 2)
+                if (art.isNotBlank()) bumpArtist(art, weight = 2.0)
             }
 
+            // 3. Last.fm (если настроен)
             if (cfg.lastFmUsername.isNotBlank() && LastFM.apiKeyConfigured()) {
                 runCatching {
                     val recent = LastFM.getRecentTracks(GlobalYouTube.client, cfg.lastFmUsername.trim(), limit = 10).getOrNull()
@@ -588,7 +881,7 @@ class AiWaveEngine(
                                 val obj = trackArr.optJSONObject(i) ?: continue
                                 val name = obj.optString("name").trim()
                                 val art = obj.optJSONObject("artist")?.optString("#text").orEmpty().trim()
-                                addCore(art, name, artistWeight = 4)
+                                addCore(art, name, artistWeight = 4.0)
                             }
                         }
                     }
@@ -596,33 +889,32 @@ class AiWaveEngine(
                     top?.forEach { t ->
                         val art = t.artist?.name?.trim().orEmpty()
                         val name = t.name.trim()
-                        if (art.isNotBlank()) bumpArtist(art, weight = 4)
-                        if (coreRecent.size < 16) addCore(art, name, artistWeight = 2)
+                        if (art.isNotBlank()) bumpArtist(art, weight = 4.0)
+                        if (coreRecent.size < 14) addCore(art, name, artistWeight = 2.0)
                     }
                 }
             }
 
-            if (GlobalYouTubeRepository.instance.isYouTubeHistoryAvailable()) {
-                runCatching {
-                    GlobalYouTubeRepository.instance.getHistory().take(12).forEach { entry ->
-                        val art = entry.song.artists.joinToString(", ") { it.name }.trim()
-                        addCore(art, entry.song.title, artistWeight = 3)
-                    }
-                }
-            }
-
+            // 4. Полный бэкап локальных лайков
             cfg.likedTracksBackup.take(15).forEach { liked ->
-                addCore(liked.artist, liked.title, artistWeight = 3)
+                addCore(liked.artist, liked.title, artistWeight = 3.0)
             }
-            cfg.likedTracksBackup.take(180).forEach { liked ->
-                if (liked.artist.isNotBlank()) bumpArtist(liked.artist, weight = 1)
+            cfg.likedTracksBackup.take(220).forEach { liked ->
+                if (liked.artist.isNotBlank()) bumpArtist(liked.artist, weight = 1.0)
             }
 
+            // 5. Фоновый скан вкуса (ВК/Яндекс/YouTube — только для вычисления жанров и артистов)
+            cfg.externalTasteProfile.take(250).forEach { ext ->
+                if (ext.artist.isNotBlank()) bumpArtist(ext.artist, weight = 0.8)
+                if (coreRecent.size < 10) addCore(ext.artist, ext.title, artistWeight = 0.5)
+            }
+
+            // 6. Репутация артистов
             cfg.artistReputation.forEach { (normArtist, rep) ->
                 if (!rep.isAutoMuted && !rep.isLowWeight && rep.likes > 0) {
-                    val delta = (rep.likes * 3 - rep.dislikes * 2).coerceAtLeast(0)
-                    if (delta > 0) {
-                        artistScores[normArtist] = (artistScores[normArtist] ?: 0) + delta
+                    val delta = (rep.likes * 3.0 - rep.dislikes * 2.0).coerceAtLeast(0.0)
+                    if (delta > 0.0) {
+                        artistScores[normArtist] = (artistScores[normArtist] ?: 0.0) + delta
                         artistDisplayNames.putIfAbsent(normArtist, normArtist)
                     }
                 }
@@ -631,12 +923,11 @@ class AiWaveEngine(
             val topArtists =
                 artistScores.entries
                     .sortedByDescending { it.value }
-                    .take(12)
+                    .take(14)
                     .mapNotNull { artistDisplayNames[it.key] }
 
-            val extraContext =
-                cfg.likedTracksBackup
-                    .drop(15)
+            val extraContextPool =
+                (cfg.likedTracksBackup.drop(15) + cfg.externalTasteProfile)
                     .shuffled()
                     .asSequence()
                     .filter { it.title.isNotBlank() && !configStore.isTrackDisliked(it.artist, it.title) }
@@ -646,43 +937,156 @@ class AiWaveEngine(
                     .take(6)
                     .toList()
 
+            val sessionPositives = synchronized(sessionLock) { sessionPositiveLabels.take(5) }
+
             StructuredTasteProfile(
                 coreRecentTracks = coreRecent.take(14),
                 topArtists = topArtists,
-                extraContextTracks = extraContext,
+                extraContextTracks = extraContextPool,
+                sessionPositiveTracks = sessionPositives,
             )
         }
 
+    /**
+     * Строгий каскадный резолв рекомендаций без мусорного `firstOrNull()`:
+     * - Зарубежные: Deezer → YTM → VK → Яндекс
+     * - Русские без цензуры: Яндекс → VK → Deezer → YTM
+     * - Русские цензура/Explicit: VK → Яндекс → Deezer → YTM
+     */
     private suspend fun resolveSuggestionsToSongs(
         suggestions: List<AiTrackSuggestion>,
-        maxResults: Int = 50,
+        maxResults: Int = DEFAULT_WAVE_BATCH_SIZE,
     ): List<SongItem> =
         coroutineScope {
             val found =
-                suggestions.take(maxResults).chunked(6).flatMap { batch ->
+                suggestions.take(maxResults + 6).chunked(5).flatMap { batch ->
                     batch.map { item ->
                         async(Dispatchers.IO) {
-                            runCatching {
-                                val q = "${item.artist} ${item.title}".trim()
-                                val page =
-                                    GlobalYouTubeRepository.instance.searchFiltered(
-                                        query = q,
-                                        filter = SearchFilter.SONG,
-                                        allowOfflineFallback = false,
-                                    )
-                                pickBestSong(page.items.filterIsInstance<SongItem>(), item)
-                            }.onFailure { err ->
-                                Log.d(TAG, "Search failed for ${item.artist} - ${item.title}: ${err.message}")
-                            }.getOrNull()
+                            resolveSingleSuggestionCascade(item)
                         }
                     }.awaitAll()
                 }
-            found.filterNotNull().distinctBy { it.id }
+            found
+                .filterNotNull()
+                .distinctBy { song ->
+                    val art = song.artists.joinToString(", ") { it.name }.trim()
+                    CustomConfigStore.buildTrackKey(art, song.title).ifBlank { song.id }
+                }.take(maxResults)
         }
 
-    private fun pickBestSong(
+    private suspend fun resolveSingleSuggestionCascade(item: AiTrackSuggestion): SongItem? {
+        val artist = item.artist.trim()
+        val title = item.title.trim()
+        if (title.isBlank()) return null
+
+        val cfg = configStore.current
+        val deezer = HybridStreamResolver.getDeezerClient()
+        val yandex = HybridStreamResolver.getYandexProvider()
+        val vk = HybridStreamResolver.getVkProvider()
+
+        val isRu = LocalCensorshipAdvisor.isRussianTrack(artist, title)
+        val isCensored =
+            cfg.preferVkForExplicit &&
+                (
+                    configStore.getCachedCensorship(artist, title) == true ||
+                        configStore.isArtistLearnedCensored(artist) ||
+                        LocalCensorshipAdvisor.isLikelyCensoredOnYandex(artist, title)
+                )
+
+        // Сначала забираем эталон Deezer (обложка + длительность + Explicit)
+        val deezerTrack = runCatching { deezer?.searchCatalogTrack(artist, title) }.getOrNull()
+        val effectiveRuCensored =
+            isCensored || (isRu && cfg.preferVkForExplicit && deezerTrack?.isExplicit == true)
+        val targetDur = deezerTrack?.durationSec
+        val hdCover = deezerTrack?.coverUrl
+
+        val cascade: List<String> =
+            when {
+                !isRu -> listOf("ytm", "deezer", "vk", "yandex")
+                effectiveRuCensored -> listOf("vk", "yandex", "deezer", "ytm")
+                else -> listOf("yandex", "vk", "deezer", "ytm")
+            }
+
+        for (source in cascade) {
+            val song: SongItem? =
+                when (source) {
+                    "deezer" -> {
+                        deezerTrack?.toSongItem()
+                    }
+                    "yandex" -> {
+                        if (cfg.yandexToken.isBlank() || yandex == null) {
+                            null
+                        } else {
+                            runCatching {
+                                yandex.searchCatalogTrack(
+                                    artist = artist,
+                                    title = title,
+                                    targetDurationSec = targetDur,
+                                    rejectSuspectedCensored = !effectiveRuCensored && cfg.vkToken.isNotBlank(),
+                                )?.toSongItem()
+                            }.getOrNull()
+                        }
+                    }
+                    "vk" -> {
+                        if (cfg.vkToken.isBlank() || vk == null) {
+                            null
+                        } else {
+                            runCatching {
+                                vk.searchCatalogTrack(
+                                    artist = artist,
+                                    title = title,
+                                    targetDurationSec = targetDur,
+                                )?.toSongItem()
+                            }.getOrNull()
+                        }
+                    }
+                    "ytm" -> {
+                        searchYouTubeStrict(item, targetDurationSec = targetDur)
+                    }
+                    else -> null
+                }
+
+            if (song != null) {
+                val bestCover = hdCover ?: song.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri }
+                TrackBindingCache.put(song.id, artist, title) { prev ->
+                    prev.copy(
+                        deezerId = deezerTrack?.externalId?.removePrefix("dz_") ?: prev.deezerId,
+                        yandexId = if (song.id.startsWith("ym_")) song.id.removePrefix("ym_") else prev.yandexId,
+                        vkAudioKey = if (song.id.startsWith("vk_")) song.id.removePrefix("vk_") else prev.vkAudioKey,
+                        youtubeId = if (!song.id.startsWith("ym_") && !song.id.startsWith("vk_") && !song.id.startsWith("dz_")) song.id else prev.youtubeId,
+                        hdCoverUrl = bestCover ?: prev.hdCoverUrl,
+                        durationSec = targetDur ?: song.duration?.toLong() ?: prev.durationSec,
+                        isExplicit = (deezerTrack?.isExplicit == true) || song.isExplicit || prev.isExplicit,
+                    )
+                }
+                return if (!bestCover.isNullOrBlank()) song.copy(thumbnail = bestCover) else song
+            }
+        }
+        return null
+    }
+
+    private suspend fun searchYouTubeStrict(
+        suggestion: AiTrackSuggestion,
+        targetDurationSec: Long? = null,
+    ): SongItem? =
+        runCatching {
+            val q = "${suggestion.artist} ${suggestion.title}".trim()
+            val page =
+                GlobalYouTubeRepository.instance.searchFiltered(
+                    query = q,
+                    filter = SearchFilter.SONG,
+                    allowOfflineFallback = false,
+                )
+            pickBestSongStrict(page.items.filterIsInstance<SongItem>(), suggestion, targetDurationSec)
+        }.onFailure { err ->
+            Log.d(TAG, "YTM search failed for ${suggestion.artist} - ${suggestion.title}: ${err.message}")
+        }.getOrNull()
+
+    /** Строгий отбор без `firstOrNull()` — если трек не совпал, отбрасываем его. */
+    private fun pickBestSongStrict(
         candidates: List<SongItem>,
         suggestion: AiTrackSuggestion,
+        targetDurationSec: Long? = null,
     ): SongItem? {
         val playable = candidates.filter { !it.isUnavailable && it.id.isNotBlank() }
         if (playable.isEmpty()) return null
@@ -691,39 +1095,42 @@ class AiWaveEngine(
         return playable
             .mapNotNull { song ->
                 val art = song.artists.joinToString(", ") { it.name }
-                var score =
-                    TrackMatcher.matchScore(
-                        targetArtist = suggestion.artist,
-                        targetTitle = suggestion.title,
-                        targetDurationSec = null,
-                        candidateArtist = art,
-                        candidateTitle = song.title,
-                        candidateDurationSec = song.duration,
-                    )
-
                 val candLower = "$art ${song.title}".lowercase()
-                for (badTag in UNWANTED_VERSION_TAGS) {
-                    if (candLower.contains(badTag) && !targetLower.contains(badTag)) {
-                        score -= 40
-                    }
+                if (UNWANTED_VERSION_TAGS.any { badTag -> candLower.contains(badTag) && !targetLower.contains(badTag) }) {
+                    return@mapNotNull null
                 }
                 val durationSec = song.duration?.toLong()
                 if (durationSec != null && durationSec in 1L..45L) {
-                    score -= 35
+                    return@mapNotNull null
+                }
+                if (targetDurationSec != null && durationSec != null &&
+                    !TrackMatcher.isDurationAcceptable(targetDurationSec, durationSec, toleranceSec = 8L)
+                ) {
+                    return@mapNotNull null
                 }
 
-                if (score >= 45) song to score else null
-            }.maxByOrNull { it.second }?.first
-            ?: playable.firstOrNull { song ->
-                val candLower = song.title.lowercase()
-                UNWANTED_VERSION_TAGS.none { tag -> candLower.contains(tag) && !targetLower.contains(tag) }
-            }
-            ?: playable.firstOrNull()
+                val score =
+                    TrackMatcher.matchScore(
+                        targetArtist = suggestion.artist,
+                        targetTitle = suggestion.title,
+                        targetDurationSec = targetDurationSec,
+                        candidateArtist = art,
+                        candidateTitle = song.title,
+                        candidateDurationSec = durationSec,
+                    )
+                if (score >= 54) song to score else null
+            }.maxByOrNull { it.second }
+            ?.first
     }
 
     companion object {
         private const val TAG = "AiWaveEngine"
-        private const val SESSION_SKIP_COOLDOWN_MS = 3 * 60 * 60 * 1_000L
+        const val DEFAULT_WAVE_BATCH_SIZE = 14
+        private const val MIN_WAVE_BATCH_SIZE = 12
+        private const val MAX_WAVE_BATCH_SIZE = 18
+        private const val SESSION_SKIP_COOLDOWN_MS = 210 * 60 * 1_000L // 3.5 часа
+        private const val AUTO_PIVOT_SKIP_THRESHOLD = 3
+        private const val AUTO_PIVOT_COOLDOWN_MS = 75_000L
 
         private val UNWANTED_VERSION_TAGS =
             listOf(
