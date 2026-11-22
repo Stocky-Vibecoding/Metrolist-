@@ -2,11 +2,14 @@ package com.metrolist.android.custom
 
 import android.util.Log
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
 
 private data class VkAudioCandidate(
+    val audioKey: String,
     val artist: String,
     val title: String,
     val rawTitle: String,
@@ -15,6 +18,7 @@ private data class VkAudioCandidate(
     val url: String,
     val isExplicit: Boolean,
     val isOfficial: Boolean,
+    val coverUrl: String? = null,
 )
 
 private enum class VkSearchEndpoint(val label: String) {
@@ -37,6 +41,11 @@ class VkMusicProvider(
 
     @Volatile
     private var floodCooldownUntilMs: Long = 0L
+
+    private val tokenRefreshMutex = Mutex()
+
+    @Volatile
+    private var lastAutoRefreshAttemptMs: Long = 0L
 
     suspend fun checkToken(
         token: String = configStore.current.vkToken,
@@ -68,7 +77,7 @@ class VkMusicProvider(
                 )
             }
             if (errMsg.contains("#5")) {
-                return Result.failure(IllegalStateException("Токен ВК истёк или невалиден (#5) — обнови через Kate Mobile"))
+                return Result.failure(IllegalStateException("Токен ВК истёк или невалиден (#5) — нажми «Войти в ВК»"))
             }
             notes.add("${profile.label}/${profile.endpoint.label}: $errMsg")
         }
@@ -79,9 +88,94 @@ class VkMusicProvider(
     suspend fun resolve(reference: TrackReference): ResolvedCustomStream? =
         resolveWithVariant(reference, variantIndex = 0)?.first
 
+    /**
+     * Прямой резолв по сохранённому `vk_ownerId_audioId` (или `ownerId_audioId`) через `audio.getById`
+     * без лишнего вызова поиска — быстрее и защищает от flood control (#9).
+     */
+    suspend fun resolveDirectById(
+        vkTrackId: String,
+        allowAutoRefresh: Boolean = true,
+    ): ResolvedCustomStream? {
+        if (System.currentTimeMillis() < floodCooldownUntilMs) return null
+        val audioKey = vkTrackId.removePrefix("vk_").trim()
+        if (audioKey.isBlank() || !audioKey.contains('_')) return null
+        if (configStore.isVkAudioBlacklisted(audioKey)) return null
+
+        val token = sanitizeToken(configStore.current.vkToken)
+        if (token.isBlank()) return null
+
+        val profilesToTry = (listOf(activeProfile) + CLIENT_PROFILES).distinctBy { "${it.userAgent}_${it.apiVersion}" }
+        for (profile in profilesToTry) {
+            if (System.currentTimeMillis() < floodCooldownUntilMs) return null
+            val outcome =
+                runCatching {
+                    val url =
+                        "${apiBaseUrl()}/audio.getById" +
+                            "?audios=${CustomHttp.urlEncode(audioKey)}" +
+                            "&access_token=${CustomHttp.urlEncode(token)}" +
+                            "&v=${profile.apiVersion}"
+                    val response =
+                        CustomHttp.get(
+                            url = url,
+                            headers = mapOf("User-Agent" to profile.userAgent),
+                            timeoutMs = 6_000,
+                        )
+                    if (!response.isSuccess) return@runCatching DirectLookupResult.RetryNext
+                    val root = JSONObject(response.body)
+                    if (root.has("error")) {
+                        val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
+                        return@runCatching when (code) {
+                            9 -> {
+                                floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
+                                DirectLookupResult.Stop
+                            }
+                            5 -> DirectLookupResult.TokenExpired
+                            else -> DirectLookupResult.RetryNext
+                        }
+                    }
+                    val arr = root.optJSONArray("response") ?: return@runCatching DirectLookupResult.RetryNext
+                    val candidate = parseAudioArray(arr).firstOrNull() ?: return@runCatching DirectLookupResult.Stop
+                    activeProfile = profile
+                    DirectLookupResult.Found(candidate)
+                }.getOrDefault(DirectLookupResult.RetryNext)
+
+            when (outcome) {
+                is DirectLookupResult.Found -> {
+                    val best = outcome.candidate
+                    val isHls = best.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)
+                    Log.d(TAG, "Direct VK hit (${best.audioKey}, ${if (isHls) "HLS" else "MP3"}): ${best.artist} - ${best.title}")
+                    return ResolvedCustomStream(
+                        url = best.url,
+                        headers = mapOf("User-Agent" to activeProfile.userAgent),
+                        mimeType = if (isHls) "application/x-mpegURL" else "audio/mpeg",
+                        bitrate = null,
+                        durationSec = best.durationSec.takeIf { it > 0L },
+                        clientName = "vk",
+                        isHls = isHls,
+                        sourceTrackId = best.audioKey.takeIf { it.isNotBlank() },
+                        coverUrl = best.coverUrl,
+                    )
+                }
+                DirectLookupResult.TokenExpired -> {
+                    if (allowAutoRefresh) {
+                        val refreshed = tryRefreshExpiredToken(token)
+                        if (!refreshed.isNullOrBlank()) {
+                            return resolveDirectById(vkTrackId, allowAutoRefresh = false)
+                        }
+                    }
+                    return null
+                }
+                DirectLookupResult.Stop -> return null
+                DirectLookupResult.RetryNext -> Unit
+            }
+        }
+        return null
+    }
+
     suspend fun resolveWithVariant(
         reference: TrackReference,
         variantIndex: Int = 0,
+        excludedAudioKeys: Set<String> = emptySet(),
     ): Pair<ResolvedCustomStream, String?>? {
         if (System.currentTimeMillis() < floodCooldownUntilMs) return null
         val token = sanitizeToken(configStore.current.vkToken)
@@ -90,14 +184,20 @@ class VkMusicProvider(
         val query = listOf(reference.artist, reference.title).filter { it.isNotBlank() }.joinToString(" ")
         if (query.isBlank()) return null
 
-        val candidates = searchAudio(token, query)
-        val strict = rankMatches(candidates, reference, relaxed = false)
+        val candidates = searchAudio(token, query, allowAutoRefresh = true)
+        val nonBlacklisted =
+            candidates.filter { cand ->
+                cand.audioKey.isBlank() ||
+                    (!configStore.isVkAudioBlacklisted(cand.audioKey) && cand.audioKey !in excludedAudioKeys)
+            }
+
+        val strict = rankMatches(nonBlacklisted, reference, relaxed = false)
         val ranked =
             if (variantIndex > 0) {
-                (strict + rankMatches(candidates, reference, relaxed = true))
-                    .distinctBy { it.url.substringBefore('?') }
+                (strict + rankMatches(nonBlacklisted, reference, relaxed = true))
+                    .distinctBy { it.audioKey.ifBlank { it.url.substringBefore('?') } }
             } else {
-                strict.ifEmpty { rankMatches(candidates, reference, relaxed = true) }
+                strict.ifEmpty { rankMatches(nonBlacklisted, reference, relaxed = true) }
             }
         if (ranked.isEmpty()) return null
 
@@ -108,7 +208,7 @@ class VkMusicProvider(
         val isHls = best.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)
         Log.d(
             TAG,
-            "Resolved via VK (${if (isHls) "HLS" else "MP3"} ${variantTag ?: "#1"}, official=${best.isOfficial}, dur=${best.durationSec}s): ${best.artist} - ${best.title}",
+            "Resolved via VK (${if (isHls) "HLS" else "MP3"} ${variantTag ?: "#1"}, key=${best.audioKey}, official=${best.isOfficial}, dur=${best.durationSec}s): ${best.artist} - ${best.title}",
         )
 
         val stream =
@@ -120,9 +220,71 @@ class VkMusicProvider(
                 durationSec = best.durationSec.takeIf { it > 0L },
                 clientName = "vk",
                 isHls = isHls,
+                sourceTrackId = best.audioKey.takeIf { it.isNotBlank() },
+                coverUrl = best.coverUrl,
             )
         return stream to variantTag
     }
+
+    /** Строгий поиск карточки в VK для каскада волны (удалённые/цензурные треки без мусора). */
+    suspend fun searchCatalogTrack(
+        artist: String,
+        title: String,
+        targetDurationSec: Long? = null,
+    ): ExternalCatalogTrack? {
+        if (System.currentTimeMillis() < floodCooldownUntilMs) return null
+        val token = sanitizeToken(configStore.current.vkToken)
+        if (token.isBlank()) return null
+
+        val cleanArtist = TrackMatcher.cleanSearchTerm(artist)
+        val cleanTitle = TrackMatcher.cleanSearchTerm(title)
+        val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
+        if (query.isBlank()) return null
+
+        val candidates =
+            searchAudio(token, query, allowAutoRefresh = true)
+                .filter { it.audioKey.isBlank() || !configStore.isVkAudioBlacklisted(it.audioKey) }
+        if (candidates.isEmpty()) return null
+
+        val reference =
+            TrackReference(
+                title = cleanTitle,
+                artist = cleanArtist,
+                durationSec = targetDurationSec,
+                isExplicit = false,
+                fromDeezer = targetDurationSec != null,
+            )
+        val best = rankMatches(candidates, reference, relaxed = false).firstOrNull() ?: return null
+        val extId = if (best.audioKey.isNotBlank()) "vk_${best.audioKey}" else ""
+        return ExternalCatalogTrack(
+            source = "vk",
+            externalId = extId,
+            artist = best.artist.ifBlank { cleanArtist },
+            title = stripUncensoredMarkers(best.title).ifBlank { cleanTitle },
+            durationSec = best.durationSec.takeIf { it > 0L },
+            coverUrl = best.coverUrl,
+            isExplicit = best.isExplicit,
+        )
+    }
+
+    private suspend fun tryRefreshExpiredToken(failedToken: String): String? =
+        tokenRefreshMutex.withLock {
+            val currentToken = sanitizeToken(configStore.current.vkToken)
+            if (currentToken.isNotBlank() && currentToken != failedToken) {
+                return@withLock currentToken
+            }
+            val now = System.currentTimeMillis()
+            if (now - lastAutoRefreshAttemptMs < AUTO_REFRESH_COOLDOWN_MS) return@withLock null
+            lastAutoRefreshAttemptMs = now
+
+            val hook = onTokenExpiredRefreshHook ?: return@withLock null
+            val fresh = runCatching { hook() }.getOrNull()?.let(::sanitizeToken)?.takeIf { it.isNotBlank() }
+            if (fresh != null) {
+                Log.i(TAG, "VK token auto-refreshed silently via WebView cookies")
+                configStore.update { it.copy(vkToken = fresh) }
+            }
+            fresh
+        }
 
     private suspend fun testSearchProfile(
         token: String,
@@ -159,12 +321,13 @@ class VkMusicProvider(
     private suspend fun searchAudio(
         token: String,
         query: String,
+        allowAutoRefresh: Boolean,
     ): List<VkAudioCandidate> {
         val profilesToTry = (listOf(activeProfile) + CLIENT_PROFILES).distinct()
         for (profile in profilesToTry) {
             if (System.currentTimeMillis() < floodCooldownUntilMs) return emptyList()
-            val result: List<VkAudioCandidate>? =
-                runCatching<List<VkAudioCandidate>?> {
+            val outcome =
+                runCatching {
                     val url = buildSearchUrl(token = token, query = query, count = 35, profile = profile)
                     val response =
                         CustomHttp.get(
@@ -172,28 +335,44 @@ class VkMusicProvider(
                             headers = mapOf("User-Agent" to profile.userAgent),
                             timeoutMs = 6_000,
                         )
-                    if (!response.isSuccess) return@runCatching null
+                    if (!response.isSuccess) return@runCatching SearchOutcome.RetryNext
                     val root = JSONObject(response.body)
                     if (root.has("error")) {
                         val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
                         Log.w(TAG, "VK ${profile.label}/${profile.endpoint.label} error #$code")
-                        if (code == 9) {
-                            floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
-                            return@runCatching emptyList<VkAudioCandidate>()
+                        return@runCatching when (code) {
+                            9 -> {
+                                floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
+                                SearchOutcome.Empty
+                            }
+                            5 -> SearchOutcome.TokenExpired
+                            else -> SearchOutcome.RetryNext
                         }
-                        return@runCatching null
                     }
                     activeProfile = profile
-                    val respObj = root.optJSONObject("response") ?: return@runCatching emptyList<VkAudioCandidate>()
+                    val respObj = root.optJSONObject("response") ?: return@runCatching SearchOutcome.Empty
                     val array =
                         when (profile.endpoint) {
                             VkSearchEndpoint.CATALOG -> respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
                             VkSearchEndpoint.LEGACY -> respObj.optJSONArray("items") ?: respObj.optJSONArray("audios")
                         }
-                    parseAudioArray(array)
-                }.getOrNull()
+                    SearchOutcome.Success(parseAudioArray(array))
+                }.getOrDefault(SearchOutcome.RetryNext)
 
-            if (result != null) return result
+            when (outcome) {
+                is SearchOutcome.Success -> return outcome.items
+                SearchOutcome.Empty -> return emptyList()
+                SearchOutcome.TokenExpired -> {
+                    if (allowAutoRefresh) {
+                        val refreshed = tryRefreshExpiredToken(token)
+                        if (!refreshed.isNullOrBlank()) {
+                            return searchAudio(refreshed, query, allowAutoRefresh = false)
+                        }
+                    }
+                    return emptyList()
+                }
+                SearchOutcome.RetryNext -> Unit
+            }
         }
         return emptyList()
     }
@@ -234,15 +413,26 @@ class VkMusicProvider(
                 val item = items.optJSONObject(i) ?: continue
                 val streamUrl = item.optString("url").trim()
                 if (streamUrl.isBlank()) continue
+                val ownerId = item.optLong("owner_id", 0L)
+                val id = item.optLong("id", 0L)
+                val audioKey = if (id != 0L) "${ownerId}_$id" else ""
                 val rawTitle = item.optString("title").trim()
                 val subtitle = item.optString("subtitle").trim()
                 val fullTitle = if (subtitle.isNotBlank()) "$rawTitle ($subtitle)" else rawTitle
+                val albumObj = item.optJSONObject("album")
+                val coverUrl =
+                    albumObj?.optJSONObject("thumb")?.let { thumb ->
+                        thumb.optString("photo_1200")
+                            .ifBlank { thumb.optString("photo_600") }
+                            .ifBlank { thumb.optString("photo_300") }
+                    }?.takeIf { it.isNotBlank() }
                 val isOfficial =
-                    item.optJSONObject("album") != null ||
+                    albumObj != null ||
                         item.optBoolean("is_licensed", false) ||
                         (item.optJSONArray("main_artists")?.length() ?: 0) > 0
                 add(
                     VkAudioCandidate(
+                        audioKey = audioKey,
                         artist = item.optString("artist").trim(),
                         title = fullTitle,
                         rawTitle = rawTitle,
@@ -251,6 +441,7 @@ class VkMusicProvider(
                         url = streamUrl,
                         isExplicit = item.optBoolean("is_explicit", false),
                         isOfficial = isOfficial,
+                        coverUrl = coverUrl,
                     ),
                 )
             }
@@ -272,36 +463,44 @@ class VkMusicProvider(
             configStore.current.preferVkForExplicit &&
                 (
                     LocalCensorshipAdvisor.isLikelyCensoredOnYandex(reference.artist, reference.title) ||
+                        configStore.isArtistLearnedCensored(reference.artist) ||
                         (reference.isExplicit && isRuTrack)
                 )
 
-        // Если Deezer/YouTube не дал длительность, вычисляем медианную длительность чистых совпадений
+        // Эталонная длительность из Deezer/YTM либо медианная по чистым кандидатам
         val effectiveDurationSec =
             reference.durationSec?.takeIf { it > 30L }
                 ?: inferConsensusDuration(candidates, reference, targetLower)
 
-        val tolerance = if (relaxed) 10L else 4L
-        val minScore = if (relaxed) 52 else 62
+        // Жёсткий допуск 3 сек при наличии эталона — отсекает ускоренные/замедленные обходы АП с питчем
+        val tolerance =
+            when {
+                relaxed -> 8L
+                reference.fromDeezer && reference.durationSec != null -> 3L
+                else -> 4L
+            }
+        val minScore = if (relaxed) 54 else 64
+        val targetHasSpacedLetters = SPACED_OBFUSCATION_REGEX.containsMatchIn(targetLower)
 
         return candidates
             .mapNotNull { candidate ->
                 val fullCandLower = "${candidate.artist} ${candidate.title}".lowercase()
 
-                // 1. Жёстко отсекаем цензурные / clean / radio версии, если они явно помечены
+                // 1. Жёстко отсекаем цензурные / clean / radio версии
                 if (hasCensoredMarker(fullCandLower, targetLower)) return@mapNotNull null
 
-                // 2. Отсекаем замедленные, ускоренные, ремиксы, каверы, лайвы, тикток-эдиты
+                // 2. Отсекаем slowed, sped up, pitch, ремиксы, каверы, лайвы, обходы АП
                 if (hasUnwantedVersionTag(fullCandLower, targetLower)) return@mapNotNull null
+                if (!relaxed && hasAntiApPitchMarker(fullCandLower, targetLower)) return@mapNotNull null
 
-                // Убираем позитивные пометки "(без цензуры)" / "(uncensored)" перед сравнением названий,
-                // чтобы они не занижали matchScore и не блокировались TrackMatcher'ом
+                // Убираем позитивные пометки "(без цензуры)" перед сравнением названий
                 val isMarkedUncensored = hasUncensoredMarker(fullCandLower)
                 val cleanTitleForMatch = stripUncensoredMarkers(candidate.title)
                 if (TrackMatcher.hasForbiddenStopWord(reference.title, cleanTitleForMatch)) {
                     return@mapNotNull null
                 }
 
-                // 3. Проверка длительности (отсекает sped up / slowed даже без пометки в названии)
+                // 3. Проверка длительности (отсекает скрытый +5%/-5% питч со сдвигом скорости)
                 if (candidate.durationSec in 1L..35L && (effectiveDurationSec == null || effectiveDurationSec > 50L)) {
                     return@mapNotNull null
                 }
@@ -325,39 +524,45 @@ class VkMusicProvider(
 
                 var bonus = 0
 
-                // Бонус за точнейшее совпадение длительности (главная защита от +5%/-5% питча)
+                // Бонус/штраф за точное совпадение длительности (главная защита от питча)
                 if (effectiveDurationSec != null && candidate.durationSec > 0L) {
                     val diff = abs(effectiveDurationSec - candidate.durationSec)
                     bonus +=
                         when {
-                            diff <= 1L -> 18
-                            diff <= 2L -> 12
-                            diff <= 4L -> 5
-                            diff >= 7L -> -18
-                            else -> 0
+                            diff <= 1L -> 22
+                            diff <= 2L -> 14
+                            diff <= 3L -> 4
+                            diff >= 5L -> -24
+                            else -> -8
                         }
                 }
 
-                // Штраф за непонятные приписки в скобках (если их нет в оригинале и это не feat/без цензуры)
+                // Штраф за обфускацию названия пробелами/символами (типичный признак пиратского питч-обхода АП)
+                if (!targetHasSpacedLetters && SPACED_OBFUSCATION_REGEX.containsMatchIn(fullCandLower)) {
+                    bonus -= 24
+                }
+                if (hasAntiApPitchMarker(fullCandLower, targetLower)) {
+                    bonus -= 30
+                }
+
+                // Штраф за непонятные приписки в скобках
                 if (hasUnexpectedBracketJunk(candidate.title, reference.title)) {
-                    bonus -= 14
+                    bonus -= 16
                 }
 
                 // Логика выбора: антицензура РФ vs обычный трек
                 if (preferUncensoredUpload) {
                     if (isMarkedUncensored) bonus += 35
                     if (!candidate.isOfficial) {
-                        // Пользовательские заливки с точным хронометражом для РФ-рэпа чаще без цензуры, чем лейбл-релизы ВК
-                        bonus += 10
+                        bonus += 8
                     } else if (!candidate.isExplicit) {
-                        // Официальный трек без плашки Explicit у цензурируемого артиста — почти наверняка Clean-версия
                         bonus -= 28
                     } else {
-                        bonus += 4
+                        bonus += 6
                     }
                 } else {
                     if (isMarkedUncensored && reference.isExplicit) bonus += 16
-                    if (candidate.isOfficial) bonus += 10
+                    if (candidate.isOfficial) bonus += 12
                     if (reference.isExplicit && candidate.isExplicit) bonus += 10
                 }
 
@@ -369,7 +574,7 @@ class VkMusicProvider(
                 candidate to (baseScore + bonus)
             }.sortedByDescending { it.second }
             .map { it.first }
-            .distinctBy { it.url.substringBefore('?') }
+            .distinctBy { it.audioKey.ifBlank { it.url.substringBefore('?') } }
     }
 
     private fun inferConsensusDuration(
@@ -383,7 +588,9 @@ class VkMusicProvider(
                 .filter { it.durationSec > 45L }
                 .filter { cand ->
                     val lower = "${cand.artist} ${cand.title}".lowercase()
-                    !hasUnwantedVersionTag(lower, targetLower) && !hasCensoredMarker(lower, targetLower)
+                    !hasUnwantedVersionTag(lower, targetLower) &&
+                        !hasCensoredMarker(lower, targetLower) &&
+                        !hasAntiApPitchMarker(lower, targetLower)
                 }.filter { cand ->
                     val cleanTitle = stripUncensoredMarkers(cand.title)
                     TrackMatcher.matchScore(
@@ -441,6 +648,18 @@ class VkMusicProvider(
         }
     }
 
+    private fun hasAntiApPitchMarker(
+        candLower: String,
+        targetLower: String,
+    ): Boolean {
+        if (ANTI_AP_SUBSTRINGS.any { tag -> candLower.contains(tag) && !targetLower.contains(tag) }) {
+            return true
+        }
+        return ANTI_AP_WORD_REGEXES.any { (key, regex) ->
+            regex.containsMatchIn(candLower) && !targetLower.contains(key)
+        }
+    }
+
     private fun hasUnexpectedBracketJunk(
         candTitle: String,
         targetTitle: String,
@@ -469,9 +688,28 @@ class VkMusicProvider(
         return afterParam.trim()
     }
 
+    private sealed interface SearchOutcome {
+        data class Success(val items: List<VkAudioCandidate>) : SearchOutcome
+        data object Empty : SearchOutcome
+        data object TokenExpired : SearchOutcome
+        data object RetryNext : SearchOutcome
+    }
+
+    private sealed interface DirectLookupResult {
+        data class Found(val candidate: VkAudioCandidate) : DirectLookupResult
+        data object TokenExpired : DirectLookupResult
+        data object Stop : DirectLookupResult
+        data object RetryNext : DirectLookupResult
+    }
+
     companion object {
         private const val TAG = "VkProvider"
         private const val FLOOD_COOLDOWN_MS = 3 * 60 * 1_000L
+        private const val AUTO_REFRESH_COOLDOWN_MS = 30_000L
+
+        /** Вешается на Этапе 2 встроенным WebView-менеджером для тихого перевыпуска токена при #5. */
+        @Volatile
+        var onTokenExpiredRefreshHook: (suspend () -> String?)? = null
 
         private const val KATE_UA =
             "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
@@ -481,6 +719,7 @@ class VkMusicProvider(
         private val MULTI_SPACE_REGEX = Regex("\\s+")
         private val EMPTY_BRACKETS_REGEX = Regex("[(\\[{]\\s*[)\\]}]")
         private val BRACKET_CONTENT_REGEX = Regex("[(\\[]([^)\\]]+)[)\\]]")
+        private val SPACED_OBFUSCATION_REGEX = Regex("(?:(?<![a-zа-яё])[a-zа-яё]\\s+){4,}[a-zа-яё](?![a-zа-яё])")
 
         private val ALLOWED_BRACKET_PREFIXES =
             listOf("feat", "ft.", "ft ", "prod", "при уч", "explicit")
@@ -519,6 +758,37 @@ class VkMusicProvider(
             listOf(
                 "clean" to Regex("(?<![a-zа-яё0-9])clean(?![a-zа-яё0-9])"),
             )
+
+        private val ANTI_AP_SUBSTRINGS =
+            listOf(
+                "без ап",
+                "анти ап",
+                "антиап",
+                "no ap",
+                "anti ap",
+                "antiap",
+                "обход ап",
+                "обход",
+                "питч",
+                "pitch+",
+                "pitch-",
+                "pitch ",
+                "тональност",
+                "повышен",
+                "понижен",
+            )
+
+        private val ANTI_AP_WORD_REGEXES =
+            listOf(
+                "слив",
+                "fix",
+                "фикс",
+                "pitched",
+                "pitch",
+                "перезалив",
+            ).map { word ->
+                word to Regex("(?<![a-zа-яё0-9])${Regex.escape(word)}(?![a-zа-яё0-9])")
+            }
 
         private val UNWANTED_SUBSTRINGS =
             listOf(
@@ -585,8 +855,6 @@ class VkMusicProvider(
                 "лайв",
                 "минус",
                 "minus",
-                "pitch",
-                "pitched",
                 "8d",
                 "16d",
                 "vip",
