@@ -3,6 +3,8 @@ package com.metrolist.android.playback
 import android.content.Context
 import androidx.media3.common.Player
 import com.metrolist.android.R
+import com.metrolist.android.custom.AiWaveEngine
+import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.android.deviceconnect.AndroidDeviceConnect
 import com.metrolist.android.listentogether.AndroidListenTogetherManager
 import com.metrolist.android.models.PersistPlayerState
@@ -24,7 +26,6 @@ import com.metrolist.shared.model.selectRadioQueueChip
 import com.metrolist.shared.playback.MusicQueue
 import com.metrolist.shared.playback.MusicQueueSnapshot
 import com.metrolist.shared.playback.PlaybackSeekSource
-import com.metrolist.shared.playback.QUEUE_SOURCE_ADDED_MANUALLY
 import com.metrolist.shared.playback.QUEUE_SOURCE_AUTO_MIX
 import com.metrolist.shared.playback.QUEUE_SOURCE_RECOMMENDED
 import com.metrolist.shared.playback.isAutoMixQueueSource
@@ -38,7 +39,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -49,7 +49,6 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.jetbrains.compose.resources.getString
 import timber.log.Timber
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -67,6 +66,7 @@ internal class AndroidQueueCoordinator(
     companion object {
         private const val TAG = "MusicService"
         private const val MAX_RADIO_CONTINUATION_PAGES = 10
+        private const val WAVE_REFILL_REMAINING_THRESHOLD = 3
     }
 
     lateinit var transitions: AndroidQueueTransitions
@@ -99,6 +99,7 @@ internal class AndroidQueueCoordinator(
     var recommendationBootstrapJob: Job? = null
         private set
     private var autoLoadMoreJob: Job? = null
+    private var autoPivotJob: Job? = null
     private val _playlistPage = MutableStateFlow<PlaylistPage?>(null)
     val playlistPageState = _playlistPage.asStateFlow()
     var playlistPage: PlaylistPage?
@@ -115,6 +116,9 @@ internal class AndroidQueueCoordinator(
     private var pendingRestorePositionMs: Long? = null
     private var restoredSongId: String? = null
     private var remoteLoadGeneration = 0L
+
+    fun isMyWaveQueue(title: String? = queueTitleState.value): Boolean =
+        title?.startsWith("Моя волна", ignoreCase = true) == true
 
     fun saveShuffleMode() {
         val queue = player.queueSnapshots.value
@@ -135,6 +139,7 @@ internal class AndroidQueueCoordinator(
 
         val remote = castState().takeIf { it.isConnected }?.forQueueEntry(player.queueState.value)
         val playing = remote?.isPlaying ?: player.isPlaying.value
+        val isWave = isMyWaveQueue()
         return PersistPlayerState(
             playWhenReady = playing,
             currentMediaItemIndex = currentIndex,
@@ -146,20 +151,28 @@ internal class AndroidQueueCoordinator(
             volume = 1.0f,
             queueTitle = queueTitleState.value,
             radioQueueSeedSongId = recommendationSeedSongId,
-            radioQueueFinite = isFiniteQueue,
-            radioQueue = isRadioQueue,
-            queueSessionId = queueSessionId.takeIf { isRadioQueue },
+            radioQueueFinite = if (isWave) false else isFiniteQueue,
+            radioQueue = if (isWave) false else isRadioQueue,
+            queueSessionId = queueSessionId.takeIf { isRadioQueue && !isWave },
             radioQueueChips =
-                queueChipsState.value.map { chip ->
-                    PersistRadioQueueChip(chip.id, chip.title, chip.playlistId, chip.params, chip.isSelected)
+                if (isWave) {
+                    emptyList()
+                } else {
+                    queueChipsState.value.map { chip ->
+                        PersistRadioQueueChip(chip.id, chip.title, chip.playlistId, chip.params, chip.isSelected)
+                    }
                 },
             radioQueueSelectedChipId =
-                queueChipsState.value
-                    .firstOrNull { it.isSelected }
-                    ?.id,
-            radioQueueContinuation = radioQueueContinuation,
-            radioQueuePlaylistId = radioQueuePlaylistId,
-            radioQueueParams = radioQueueParams,
+                if (isWave) {
+                    null
+                } else {
+                    queueChipsState.value
+                        .firstOrNull { it.isSelected }
+                        ?.id
+                },
+            radioQueueContinuation = if (isWave) null else radioQueueContinuation,
+            radioQueuePlaylistId = if (isWave) null else radioQueuePlaylistId,
+            radioQueueParams = if (isWave) null else radioQueueParams,
         )
     }
 
@@ -176,30 +189,36 @@ internal class AndroidQueueCoordinator(
                 restoredQueue.originalItems.firstOrNull { !it.queueSourceTitle.isRecommendationGeneratedQueueSource() }
                     ?: restoredSongs.getOrNull(restoredQueue.currentIndex)
             val restoredMix = restoredQueue.originalItems.any { it.queueSourceTitle.isAutoMixQueueSource() }
+            val resolvedTitle =
+                state.queueTitle
+                    ?: restoredSeed?.title?.takeIf { restoredMix }?.let { context.getString(R.string.song_mix_title, it) }
+            val restoredIsWave = isMyWaveQueue(resolvedTitle)
             resetQueueSession(
                 seedSongId = state.radioQueueSeedSongId ?: restoredSeed?.id,
-                queueTitle =
-                    state.queueTitle
-                        ?: restoredSeed?.title?.takeIf { restoredMix }?.let { context.getString(R.string.song_mix_title, it) },
-                finite = state.radioQueueFinite ?: !restoredMix,
+                queueTitle = resolvedTitle,
+                finite = if (restoredIsWave) false else (state.radioQueueFinite ?: !restoredMix),
                 sessionId = state.queueSessionId,
             )
             val restoredPosition = state.currentPosition
             pendingRestorePositionMs = restoredPosition.takeIf { it > 0L }
             restoredSongId = restoredSongs.getOrNull(restoredQueue.currentIndex)?.id
-            isRadioQueue = state.radioQueue || restoredMix
-            radioQueueContinuation = state.radioQueueContinuation
-            radioQueuePlaylistId = state.radioQueuePlaylistId
-            radioQueueParams = state.radioQueueParams
+            isRadioQueue = !restoredIsWave && (state.radioQueue || restoredMix)
+            radioQueueContinuation = if (restoredIsWave) null else state.radioQueueContinuation
+            radioQueuePlaylistId = if (restoredIsWave) null else state.radioQueuePlaylistId
+            radioQueueParams = if (restoredIsWave) null else state.radioQueueParams
             queueChipsState.value =
-                state.radioQueueChips.map { chip ->
-                    RadioQueueChip(
-                        chip.id,
-                        chip.title,
-                        chip.playlistId,
-                        chip.params,
-                        state.radioQueueSelectedChipId?.let { it == chip.id } ?: chip.isSelected,
-                    )
+                if (restoredIsWave) {
+                    emptyList()
+                } else {
+                    state.radioQueueChips.map { chip ->
+                        RadioQueueChip(
+                            chip.id,
+                            chip.title,
+                            chip.playlistId,
+                            chip.params,
+                            state.radioQueueSelectedChipId?.let { it == chip.id } ?: chip.isSelected,
+                        )
+                    }
                 }
             queuedSongIds.addAll(restoredSongs.map(SongItem::id))
             player.setQueue(
@@ -226,6 +245,9 @@ internal class AndroidQueueCoordinator(
 
     fun setTitle(title: String?) {
         queueTitleState.value = title
+        if (isMyWaveQueue(title)) {
+            queueChipsState.value = emptyList()
+        }
     }
 
     fun resetQueueSession(
@@ -246,6 +268,8 @@ internal class AndroidQueueCoordinator(
         playlistPage = null
         autoLoadMoreJob?.cancel()
         autoLoadMoreJob = null
+        autoPivotJob?.cancel()
+        autoPivotJob = null
         lastAutoLoadedSongId = null
         transitions.cancelAndroidCrossfade()
         transitions.cancelNextTrackPreload()
@@ -255,7 +279,7 @@ internal class AndroidQueueCoordinator(
         recommendationSeedSongId = seedSongId
         queueTitleState.value = queueTitle
         queueChipsState.value = emptyList()
-        isFiniteQueue = finite
+        isFiniteQueue = if (isMyWaveQueue(queueTitle)) false else finite
         isRadioQueue = false
         radioQueueContinuation = null
         radioQueuePlaylistId = null
@@ -313,6 +337,8 @@ internal class AndroidQueueCoordinator(
     ) {
         val (playableSongs, adjustedStartIndex) =
             filteredQueueSelection(songs, startIndex, BlockedContent.snapshot()::isBlocked) ?: return
+        val isWave = isMyWaveQueue(queueTitle)
+        val effectiveFinite = if (isWave) false else (finite ?: true)
         val shuffleEnabled =
             newQueueShuffleEnabled(
                 requestedShuffle = shuffleModeEnabled,
@@ -326,7 +352,7 @@ internal class AndroidQueueCoordinator(
                     songs = playableSongs,
                     index = adjustedStartIndex,
                     title = queueTitle,
-                    finite = finite ?: true,
+                    finite = effectiveFinite,
                     enabled = shuffleEnabled,
                     preserveHistory = shuffleModeEnabled != true,
                     positionMs = startPositionMs,
@@ -335,7 +361,7 @@ internal class AndroidQueueCoordinator(
         ) {
             return
         }
-        replaceQueueSession(playableSongs, adjustedStartIndex, queueTitle, finite ?: true, playlistPage) {
+        replaceQueueSession(playableSongs, adjustedStartIndex, queueTitle, effectiveFinite, playlistPage) {
             if (startVideo && !fromRemote) onVideoSelected(playableSongs[adjustedStartIndex])
             player.setQueue(
                 songs = playableSongs,
@@ -345,7 +371,7 @@ internal class AndroidQueueCoordinator(
                 startPositionMs = startPositionMs,
                 recommendationsSongsOnly = songsOnly,
             )
-            if (shuffleEnabled) player.toggleShuffle(preserveHistory = shuffleModeEnabled != true)
+            if (shuffleEnabled && !isWave) player.toggleShuffle(preserveHistory = shuffleModeEnabled != true)
             _shuffleModeEnabled.value = player.isShuffleEnabled
         }
     }
@@ -429,7 +455,6 @@ internal class AndroidQueueCoordinator(
                         val additions = BlockedContent.filterPlayableSongs(next.songs.drop(previous.songs.size))
                         appendPlaylistSongs(additions)
                     } while (playlistPage?.hasMore == true &&
-                        // Shuffle can only mix songs that are already loaded, so it loads the whole playlist.
                         (player.isShuffleEnabled || shouldLoadPlaylistPage(player.currentMediaItemIndex.value, player.songQueue.value.size))
                     )
                 } catch (e: CancellationException) {
@@ -440,12 +465,19 @@ internal class AndroidQueueCoordinator(
             }
     }
 
+    /** Запуск волны по конкретному треку (из поиска, чарта или уведомления) — сразу через наш AiWaveEngine. */
     fun playMix(
         seed: SongItem,
         startPlaying: Boolean,
     ) {
         if (seed.isUnavailable || BlockedContent.isBlocked(seed)) return
-        val title = context.getString(R.string.song_mix_title, seed.title)
+        val waveEngine = AiWaveEngine.sharedInstance
+        val title =
+            if (waveEngine != null) {
+                "Моя волна • ${seed.title}"
+            } else {
+                context.getString(R.string.song_mix_title, seed.title)
+            }
         val current = player.currentSong.value?.takeIf { it.id == seed.id }
         if (AndroidDeviceConnect.intercept(
                 DcPlaybackCommand(
@@ -459,7 +491,6 @@ internal class AndroidQueueCoordinator(
                 ),
             )
         ) {
-            // The target keeps a retained seed's play state, so send the play intent separately.
             if (startPlaying) AndroidDeviceConnect.intercept(DcPlaybackCommand(DcPlaybackAction.PLAY))
             return
         }
@@ -469,7 +500,8 @@ internal class AndroidQueueCoordinator(
             replaceQueueSession(listOf(requireNotNull(current)), 0, title, finite = false) {
                 val queue = MusicQueue().apply { setQueue(listOf(current)) }
                 if (Settings.shared.persistentShuffleAcrossQueues &&
-                    player.isShuffleEnabled
+                    player.isShuffleEnabled &&
+                    waveEngine == null
                 ) {
                     queue.toggleShuffle(legacyShuffle = Settings.shared.useLegacyShuffle)
                 }
@@ -480,11 +512,68 @@ internal class AndroidQueueCoordinator(
         } else {
             playQueue(songs = listOf(seed), queueTitle = title, finite = false, fromRemote = true, startPlaying = startPlaying)
         }
-        isRadioQueue = true
-        radioQueuePlaylistId = "RDAMVM${seed.id}"
-        radioQueueParams = null
-        if (preserveCurrent) bootstrapRecommendations(seed.id)
+
+        if (waveEngine != null) {
+            isRadioQueue = false
+            queueChipsState.value = emptyList()
+            val sessionId = queueSessionId
+            scope.launch {
+                appendAiWaveBatch(sessionId = sessionId, seedSong = seed, promoteWaveTitle = false)
+            }
+        } else {
+            isRadioQueue = true
+            radioQueuePlaylistId = "RDAMVM${seed.id}"
+            radioQueueParams = null
+            if (preserveCurrent) bootstrapRecommendations(seed.id)
+        }
         onSave()
+    }
+
+    /**
+     * Фоновый авторазворот хвоста очереди «Моей волны» после 3 быстрых скипов подряд:
+     * текущий трек не прерывается, а предстоящие треки тихо заменяются под другой срез вкуса.
+     */
+    fun triggerAutoPivotInBackground() {
+        val engine = AiWaveEngine.sharedInstance ?: return
+        if (!isMyWaveQueue()) return
+        if (!engine.shouldTriggerAutoPivot()) return
+        if (autoPivotJob?.isActive == true) return
+        if (AndroidDeviceConnect.manager.remote.isFollowing || AndroidListenTogetherManager.isGuestPlaybackLocked) return
+
+        val sessionId = queueSessionId
+        autoPivotJob =
+            scope.launch {
+                try {
+                    val existingIds = player.songQueue.value.mapTo(HashSet(), SongItem::id)
+                    val result =
+                        engine.generateWaveSongs(
+                            seedSong = null,
+                            count = AiWaveEngine.DEFAULT_WAVE_BATCH_SIZE,
+                            backgroundLabel = true,
+                            pivotVibe = true,
+                            excludeIds = existingIds,
+                        )
+                    val pivoted = result.getOrNull().orEmpty()
+                    if (pivoted.isEmpty() || sessionId != queueSessionId || !isMyWaveQueue()) return@launch
+                    val filtered = BlockedContent.filterPlayableSongs(pivoted).filter { it.id !in existingIds }
+                    if (filtered.isEmpty()) return@launch
+
+                    transitions.cancelNextTrackPreload()
+                    player.replaceUpcomingQueue(filtered)
+                    queuedSongIds.clear()
+                    queuedSongIds.addAll(player.songQueue.value.map(SongItem::id))
+                    CustomMediaCacheManager.preloadUpcomingTracks(
+                        songs = filtered,
+                        vibeTag = engine.currentVibeTag(),
+                    )
+                    onSave()
+                    Timber.tag(TAG).d("Auto-pivoted wave tail with %d fresh tracks", filtered.size)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w("Wave auto-pivot failed: %s", e.message)
+                }
+            }
     }
 
     fun updatePendingRestorePosition(position: Long) {
@@ -494,6 +583,9 @@ internal class AndroidQueueCoordinator(
     }
 
     fun bootstrapRecommendations(seedSongId: String) {
+        // В «Моей волне» полностью отключаем перехват родного YTM-радио и его чипы
+        if (isMyWaveQueue()) return
+        if (AiWaveEngine.sharedInstance != null && player.songQueue.value.size <= 2) return
         if (!PlaybackNetworkStateStore.current.connected) return
         if (!canBootstrapRecommendations()) return
         if (AndroidDeviceConnect.manager.remote.isFollowing || AndroidListenTogetherManager.isGuestPlaybackLocked) return
@@ -516,12 +608,13 @@ internal class AndroidQueueCoordinator(
                             }
                         },
                         isCurrent = {
-                            isCurrentRecommendationRequest(
-                                sessionId,
-                                requestGeneration,
-                                queueSessionId,
-                                recommendationRequestGeneration,
-                            ) && PlaybackNetworkStateStore.current.connected && repeatMode.value == Player.REPEAT_MODE_OFF &&
+                            !isMyWaveQueue() &&
+                                isCurrentRecommendationRequest(
+                                    sessionId,
+                                    requestGeneration,
+                                    queueSessionId,
+                                    recommendationRequestGeneration,
+                                ) && PlaybackNetworkStateStore.current.connected && repeatMode.value == Player.REPEAT_MODE_OFF &&
                                 canBootstrapRecommendations() &&
                                 !AndroidDeviceConnect.manager.remote.isFollowing &&
                                 !AndroidListenTogetherManager.isGuestPlaybackLocked
@@ -575,9 +668,11 @@ internal class AndroidQueueCoordinator(
         )
 
     private fun canBootstrapRecommendations(): Boolean =
-        shouldBootstrapQueueRecommendations(isFiniteQueue, Settings.shared.autoLoadMore, playlistPage?.hasMore == true)
+        !isMyWaveQueue() &&
+            shouldBootstrapQueueRecommendations(isFiniteQueue, Settings.shared.autoLoadMore, playlistPage?.hasMore == true)
 
     fun selectQueueChip(chipId: String) {
+        if (isMyWaveQueue()) return
         if (AndroidDeviceConnect.manager.remote.isFollowing || AndroidListenTogetherManager.isGuestPlaybackLocked) return
         val chip = queueChipsState.value.firstOrNull { it.id == chipId } ?: return
         if (chip.isSelected) return
@@ -627,8 +722,11 @@ internal class AndroidQueueCoordinator(
         params: String? = null,
         limit: Int? = null,
     ): Boolean {
+        if (isMyWaveQueue()) return false
+
         fun isCurrent() =
-            PlaybackNetworkStateStore.current.connected &&
+            !isMyWaveQueue() &&
+                PlaybackNetworkStateStore.current.connected &&
                 repeatMode.value == Player.REPEAT_MODE_OFF &&
                 !AndroidDeviceConnect.manager.remote.isFollowing &&
                 !AndroidListenTogetherManager.isGuestPlaybackLocked &&
@@ -713,18 +811,33 @@ internal class AndroidQueueCoordinator(
                 player.songQueue,
                 repeatMode,
             ) { currentIndex, queue, repeatMode ->
+                val remaining = (queue.size - 1 - currentIndex).coerceAtLeast(0)
+                val shouldRefillWave =
+                    isMyWaveQueue() &&
+                        repeatMode == Player.REPEAT_MODE_OFF &&
+                        queue.isNotEmpty() &&
+                        remaining <= WAVE_REFILL_REMAINING_THRESHOLD
+                val shouldContinueSingleTrack =
+                    !isMyWaveQueue() &&
+                        playlistPage?.hasMore != true &&
+                        repeatMode == Player.REPEAT_MODE_OFF &&
+                        queue.size in 1..2 &&
+                        currentIndex == queue.lastIndex &&
+                        AiWaveEngine.sharedInstance != null
                 AutoLoadMoreTrigger(
                     sessionId = queueSessionId,
                     currentIndex = currentIndex,
                     queueSize = queue.size,
                     currentSongId = queue.getOrNull(currentIndex)?.id,
                     shouldLoadMore =
-                        shouldAutoLoadMore(
-                            currentIndex = currentIndex,
-                            queue = queue,
-                            autoLoadMore = Settings.shared.autoLoadMore,
-                            repeatMode = repeatMode,
-                        ),
+                        shouldRefillWave ||
+                            shouldContinueSingleTrack ||
+                            shouldAutoLoadMore(
+                                currentIndex = currentIndex,
+                                queue = queue,
+                                autoLoadMore = Settings.shared.autoLoadMore,
+                                repeatMode = repeatMode,
+                            ),
                 )
             }.distinctUntilChanged()
                 .collectLatest { trigger ->
@@ -738,10 +851,11 @@ internal class AndroidQueueCoordinator(
     }
 
     fun scheduleAutoLoadMore(trigger: AutoLoadMoreTrigger) {
-        if (!PlaybackNetworkStateStore.current.connected) return
+        // Для «Моей волны» разрешаем дозагрузку и без сети — AiWaveEngine подхватит локальный 4 ГБ кэш
+        if (!PlaybackNetworkStateStore.current.connected && !isMyWaveQueue()) return
         if (!trigger.shouldLoadMore) return
         val currentSongId = trigger.currentSongId ?: return
-        if (lastAutoLoadedSongId == currentSongId) return
+        if (lastAutoLoadedSongId == currentSongId && !isMyWaveQueue()) return
         if (autoLoadMoreJob?.isActive == true) return
         val sessionId = trigger.sessionId
         if (sessionId != queueSessionId) return
@@ -759,18 +873,89 @@ internal class AndroidQueueCoordinator(
             }
     }
 
+    private suspend fun appendAiWaveBatch(
+        sessionId: Long,
+        seedSong: SongItem?,
+        promoteWaveTitle: Boolean,
+    ): Boolean {
+        val engine = AiWaveEngine.sharedInstance ?: return false
+        if (sessionId != queueSessionId || repeatMode.value != Player.REPEAT_MODE_OFF) return false
+        if (AndroidDeviceConnect.manager.remote.isFollowing || AndroidListenTogetherManager.isGuestPlaybackLocked) return false
+
+        val currentQueue = player.songQueue.value
+        val existingIds = currentQueue.mapTo(HashSet(), SongItem::id)
+
+        val result =
+            withQueueLoading {
+                engine.generateWaveSongs(
+                    seedSong = seedSong,
+                    count = AiWaveEngine.DEFAULT_WAVE_BATCH_SIZE,
+                    backgroundLabel = true,
+                    pivotVibe = false,
+                    excludeIds = existingIds,
+                )
+            }
+        if (sessionId != queueSessionId || repeatMode.value != Player.REPEAT_MODE_OFF) return false
+
+        val fresh =
+            BlockedContent
+                .filterPlayableSongs(result.getOrNull().orEmpty())
+                .filter { it.id !in existingIds }
+        if (fresh.isEmpty()) return false
+
+        if (promoteWaveTitle && seedSong != null && !isMyWaveQueue()) {
+            queueTitleState.value = "Моя волна • ${seedSong.title}"
+            queueChipsState.value = emptyList()
+        }
+        player.addToQueue(fresh)
+        queuedSongIds.clear()
+        queuedSongIds.addAll(player.songQueue.value.map(SongItem::id))
+        isFiniteQueue = false
+        onSave()
+        return true
+    }
+
     private suspend fun performAutoLoadMore(
         sessionId: Long,
         seedSongId: String?,
     ): Boolean {
-        if (!PlaybackNetworkStateStore.current.connected) return false
-        recommendationBootstrapJob?.join()
-        if (!PlaybackNetworkStateStore.current.connected || sessionId != queueSessionId) return false
-        if (!Settings.shared.autoLoadMore || repeatMode.value != Player.REPEAT_MODE_OFF) return false
+        if (sessionId != queueSessionId) return false
+        if (repeatMode.value != Player.REPEAT_MODE_OFF) return false
+
+        // 1. Бесконечная «Моя волна» (работает и онлайн, и офлайн из 4 ГБ кэша)
+        if (isMyWaveQueue()) {
+            val isTrackWave = queueTitleState.value?.contains("•") == true
+            val seed = if (isTrackWave) player.currentSong.value else null
+            return appendAiWaveBatch(
+                sessionId = sessionId,
+                seedSong = seed,
+                promoteWaveTitle = false,
+            )
+        }
 
         val currentQueue = player.songQueue.value
         val currentIndex = player.currentMediaItemIndex.value
         if (currentIndex !in currentQueue.indices) return false
+
+        // 2. Умное доигрывание после одиночного трека (из поиска или чарта) — запускаем «Мою волну по этому треку»
+        val isSingleTrackContinuation = playlistPage?.hasMore != true && currentQueue.size <= 2 && currentIndex == currentQueue.lastIndex
+        if ((isSingleTrackContinuation || Settings.shared.autoLoadMore) && AiWaveEngine.sharedInstance != null) {
+            val seedSong = player.currentSong.value ?: currentQueue.getOrNull(currentIndex)
+            if (seedSong != null) {
+                val loadedWave =
+                    appendAiWaveBatch(
+                        sessionId = sessionId,
+                        seedSong = seedSong,
+                        promoteWaveTitle = true,
+                    )
+                if (loadedWave) return true
+            }
+        }
+
+        if (!PlaybackNetworkStateStore.current.connected) return false
+        recommendationBootstrapJob?.join()
+        if (!PlaybackNetworkStateStore.current.connected || sessionId != queueSessionId) return false
+        if (!Settings.shared.autoLoadMore || repeatMode.value != Player.REPEAT_MODE_OFF) return false
 
         val suggestedIndices =
             currentQueue.indices.filter { index ->
@@ -803,6 +988,7 @@ internal class AndroidQueueCoordinator(
         sessionId: Long,
         seedSongId: String?,
     ) {
+        if (isMyWaveQueue()) return
         if (!PlaybackNetworkStateStore.current.connected) return
         val continuation = radioQueueContinuation
         val seedId = seedSongId ?: recommendationSeedSongId ?: return
@@ -840,6 +1026,7 @@ internal class AndroidQueueCoordinator(
         seedSongId: String,
         promoteFirst: Boolean,
     ): Boolean {
+        if (isMyWaveQueue()) return false
         val continuation = radioQueueContinuation
 
         var page: RadioQueuePage? = null
@@ -894,7 +1081,8 @@ internal class AndroidQueueCoordinator(
         }
 
         page = freshRadioPage(page) {
-            PlaybackNetworkStateStore.current.connected && sessionId == queueSessionId &&
+            !isMyWaveQueue() &&
+                PlaybackNetworkStateStore.current.connected && sessionId == queueSessionId &&
                 repeatMode.value == Player.REPEAT_MODE_OFF && canBootstrapRecommendations() &&
                 !AndroidDeviceConnect.manager.remote.isFollowing && !AndroidListenTogetherManager.isGuestPlaybackLocked
         } ?: return false
@@ -999,7 +1187,13 @@ internal class AndroidQueueCoordinator(
             return
         }
 
-        if (isFiniteQueue && !Settings.shared.autoLoadMore) {
+        // Умное доигрывание: для «Моей волны» или после одиночного трека из поиска/чарта продолжаем волной
+        val shouldContinueWithWave =
+            isMyWaveQueue() ||
+                Settings.shared.autoLoadMore ||
+                (player.songQueue.value.size <= 2 && AiWaveEngine.sharedInstance != null)
+
+        if (isFiniteQueue && !shouldContinueWithWave) {
             player.skipToNext()
             return
         }
@@ -1010,7 +1204,7 @@ internal class AndroidQueueCoordinator(
             return
         }
 
-        if (Settings.shared.autoLoadMore) {
+        if (shouldContinueWithWave) {
             val sessionId = queueSessionId
             val loaded = performAutoLoadMore(sessionId, player.currentSong.value?.id)
             if (loaded && sessionId == queueSessionId && player.currentMediaItemIndex.value < player.songQueue.value.lastIndex) {
@@ -1023,8 +1217,14 @@ internal class AndroidQueueCoordinator(
     }
 
     suspend fun extendRadioQueue(shouldCommit: () -> Boolean): Boolean {
-        if (!PlaybackNetworkStateStore.current.connected) return false
         val sessionId = queueSessionId
+        if (isMyWaveQueue()) {
+            if (!shouldCommit()) return false
+            val appended = appendAiWaveBatch(sessionId = sessionId, seedSong = null, promoteWaveTitle = false)
+            return appended && shouldCommit() && sessionId == queueSessionId &&
+                player.currentMediaItemIndex.value < player.songQueue.value.lastIndex
+        }
+        if (!PlaybackNetworkStateStore.current.connected) return false
         if (playlistPage?.hasMore == true && shouldCommit()) {
             schedulePlaylistPage()
             playlistPageJob?.join()
