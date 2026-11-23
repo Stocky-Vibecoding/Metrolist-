@@ -105,6 +105,7 @@ import com.metrolist.innertubex.utils.YouTubeUrlParser
 import com.metrolist.shared.generated.resources.Res
 import com.metrolist.shared.generated.resources.album_link
 import com.metrolist.shared.generated.resources.artist_link
+import com.metrolist.shared.generated.resources.error_unknown
 import com.metrolist.shared.generated.resources.pin_to_speed_dial
 import com.metrolist.shared.generated.resources.play_playlist
 import com.metrolist.shared.generated.resources.playlist_link
@@ -146,7 +147,9 @@ import com.metrolist.shared.ui.screens.searchScreenText
 import com.metrolist.shared.utils.ShareUrls
 import com.metrolist.shared.utils.parseYouTubeUrl
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.jetbrains.compose.resources.getString
 import org.jetbrains.compose.resources.stringResource
 import org.koin.androidx.compose.koinViewModel
@@ -233,6 +236,18 @@ fun SearchScreen(
         }
     }
 
+    fun launchSafeAction(block: suspend () -> Unit) {
+        scope.launch {
+            try {
+                block()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                Toast.makeText(context, getString(Res.string.error_unknown), Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     val miniPlayerInset = LocalMiniPlayerBottomInset.current
     val isTv = LocalIsTv.current
     val density = LocalDensity.current
@@ -311,9 +326,15 @@ fun SearchScreen(
             is YouTubeUrlParser.ParsedUrl.Video -> {
                 scope.launch {
                     val info =
-                        runCatching {
-                            GlobalYouTubeRepository.instance.getSongPlayerInformation(parsed.id)
-                        }.getOrNull()
+                        try {
+                            withContext(Dispatchers.IO) {
+                                GlobalYouTubeRepository.instance.getSongPlayerInformation(parsed.id)
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            null
+                        }
                     val song =
                         SongItem(
                             id = parsed.id,
@@ -460,14 +481,11 @@ fun SearchScreen(
                         )
                     }
                 val trimmedQuery = effectiveUiState.query.trim()
-                val hasPlaylistWord =
-                    trimmedQuery.lowercase().let { q ->
-                        q.contains("плейлист") || q.contains("подборка") || q.contains("playlist")
-                    }
+                val isPlaylistLike = AiWaveEngine.isPlaylistLikeQuery(trimmedQuery)
                 val showAiPlaylistPanel =
-                    submitted && isResultsPage && AiWaveEngine.isPlaylistLikeQuery(trimmedQuery) && dismissedAiQuery != trimmedQuery
+                    submitted && isResultsPage && isPlaylistLike && dismissedAiQuery != trimmedQuery
                 val showAiQuickTrigger =
-                    !showAiPlaylistPanel && hasPlaylistWord && trimmedQuery.isNotBlank() && dismissedAiQuery != trimmedQuery
+                    !showAiPlaylistPanel && isPlaylistLike && trimmedQuery.isNotBlank() && dismissedAiQuery != trimmedQuery
 
                 Column(
                     modifier =
@@ -561,6 +579,13 @@ fun SearchScreen(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalAlignment = Alignment.End,
                         ) {
+                            TextButton(
+                                onClick = { dismissedAiQuery = trimmedQuery },
+                                modifier = Modifier.padding(end = 16.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                            ) {
+                                Text("Скрыть подборку")
+                            }
                             SearchAiPlaylistCard(
                                 query = trimmedQuery,
                                 aiWaveEngine = aiWaveEngine,
@@ -581,12 +606,6 @@ fun SearchScreen(
                                     addToPlaylist(songs)
                                 },
                             )
-                            TextButton(
-                                onClick = { dismissedAiQuery = trimmedQuery },
-                                modifier = Modifier.padding(end = 16.dp),
-                            ) {
-                                Text("Скрыть подборку")
-                            }
                         }
                     }
 
@@ -679,9 +698,13 @@ fun SearchScreen(
                         onShuffleClick = { item ->
                             dismissKeyboardAndFocus()
                             if (item is ArtistItem) {
-                                scope.launch {
-                                    GlobalYouTubeRepository.instance.getArtistSongs(item.id).takeIf { it.isNotEmpty() }?.let {
-                                        playerConnection?.shuffleQueue(it, item.title, songsOnly = true)
+                                launchSafeAction {
+                                    val songs =
+                                        withContext(Dispatchers.IO) {
+                                            GlobalYouTubeRepository.instance.getArtistSongs(item.id)
+                                        }
+                                    if (songs.isNotEmpty()) {
+                                        playerConnection?.shuffleQueue(songs, item.title, songsOnly = true)
                                     }
                                 }
                             }
@@ -689,9 +712,13 @@ fun SearchScreen(
                         onMixClick = { item ->
                             dismissKeyboardAndFocus()
                             if (item is ArtistItem) {
-                                scope.launch {
-                                    GlobalYouTubeRepository.instance.startArtistRadio(item.id).takeIf { it.isNotEmpty() }?.let {
-                                        playerConnection?.playQueue(it, 0, "${item.title} Radio")
+                                launchSafeAction {
+                                    val songs =
+                                        withContext(Dispatchers.IO) {
+                                            GlobalYouTubeRepository.instance.startArtistRadio(item.id)
+                                        }
+                                    if (songs.isNotEmpty()) {
+                                        playerConnection?.playQueue(songs, 0, "${item.title} Radio")
                                     }
                                 }
                             }
@@ -736,14 +763,22 @@ fun SearchScreen(
             song = song,
             isLiked = SongLikeState.isLiked(song.id),
             onDismiss = { showSongMenu = null },
+            onStartRadio = { playerConnection?.startRadio(song) },
             onPlayNext = { playerConnection?.addToQueue(song, playNext = true) },
             onAddToQueue = { playerConnection?.addToQueue(song) },
             onLike = { SongLikeState.toggleLike(song) },
             onShare = {
+                val shareText =
+                    if (song.id.startsWith("ym_") || song.id.startsWith("vk_") || song.id.startsWith("dz_")) {
+                        val artist = song.artists.joinToString(", ") { it.name }.trim()
+                        if (artist.isNotBlank()) "$artist — ${song.title}" else song.title
+                    } else {
+                        ShareUrls.song(song.id)
+                    }
                 val shareIntent =
                     Intent(Intent.ACTION_SEND).apply {
                         type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, ShareUrls.song(song.id))
+                        putExtra(Intent.EXTRA_TEXT, shareText)
                     }
                 val chooser = Intent.createChooser(shareIntent, shareSongText)
                 chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -764,13 +799,15 @@ fun SearchScreen(
             },
             onAddToQueue = {
                 showAlbumMenu = null
-                scope.launch {
-                    playerConnection?.addToQueue(
-                        GlobalYouTubeRepository.instance
-                            .getAlbum(album.id)
-                            ?.songs
-                            .orEmpty(),
-                    )
+                launchSafeAction {
+                    val songs =
+                        withContext(Dispatchers.IO) {
+                            GlobalYouTubeRepository.instance
+                                .getAlbum(album.id)
+                                ?.songs
+                                .orEmpty()
+                        }
+                    if (songs.isNotEmpty()) playerConnection?.addToQueue(songs)
                 }
             },
             onShare = {
@@ -786,9 +823,13 @@ fun SearchScreen(
             onDismiss = { showArtistMenu = null },
             onShuffleArtist = {
                 showArtistMenu = null
-                scope.launch {
-                    GlobalYouTubeRepository.instance.getArtistSongs(artist.id).takeIf { it.isNotEmpty() }?.let {
-                        playerConnection?.shuffleQueue(it, artist.title, songsOnly = true)
+                launchSafeAction {
+                    val songs =
+                        withContext(Dispatchers.IO) {
+                            GlobalYouTubeRepository.instance.getArtistSongs(artist.id)
+                        }
+                    if (songs.isNotEmpty()) {
+                        playerConnection?.shuffleQueue(songs, artist.title, songsOnly = true)
                     }
                 }
             },
