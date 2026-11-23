@@ -433,8 +433,10 @@ fun MetrolistApp(
     }
 
     LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            runCatching { UploadNotificationState.refreshOnAppOpen(GlobalYouTubeRepository.instance) }
+        if (Settings.shared.innerTubeCookie.isNotBlank()) {
+            withContext(Dispatchers.IO) {
+                runCatching { UploadNotificationState.refreshOnAppOpen(GlobalYouTubeRepository.instance) }
+            }
         }
     }
 
@@ -617,7 +619,6 @@ fun MetrolistApp(
         val downloadManager: SongDownloadManager = koinInject()
         val database: MusicDatabase = koinInject()
 
-        // Живые предпросмотры треков для карточек Библиотеки («Мой топ» и «Кэшированные»)
         LaunchedEffect(database) {
             database.dao().mostPlayedSongs(0L, limit = 30).collectLatest { entities ->
                 val played = BlockedContent.filterSongs(entities.map { it.toSongItem() })
@@ -638,8 +639,11 @@ fun MetrolistApp(
         }
         LaunchedEffect(Unit) {
             CustomMediaCacheManager.stats.collect {
-                CustomLibraryPreviewBridge.cachedSongs =
-                    BlockedContent.filterSongs(CustomMediaCacheManager.getOfflineCachedSongs(limit = 30))
+                val songs =
+                    withContext(Dispatchers.IO) {
+                        BlockedContent.filterSongs(CustomMediaCacheManager.getOfflineCachedSongs(limit = 30))
+                    }
+                CustomLibraryPreviewBridge.cachedSongs = songs
             }
         }
 
