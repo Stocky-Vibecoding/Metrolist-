@@ -3,6 +3,9 @@ package com.metrolist.android.playback
 import android.os.SystemClock
 import androidx.compose.runtime.snapshotFlow
 import androidx.media3.common.Player
+import com.metrolist.android.custom.AiWaveEngine
+import com.metrolist.android.custom.CustomMediaCacheManager
+import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.android.deviceconnect.AndroidDeviceConnect
 import com.metrolist.android.listentogether.AndroidListenTogetherManager
 import com.metrolist.shared.api.musicvideo.MusicVideoResolver
@@ -26,7 +29,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -66,9 +68,14 @@ internal class AndroidQueueTransitions(
         private const val TAG = "MusicService"
         private const val NEXT_RENDER_WAIT_TIMEOUT_MS = 5_000L
         private const val MANUAL_RENDER_WAIT_TIMEOUT_MS = 1_000L
+        private const val MAX_PRELOAD_RETRIES = 2
+        private const val PRELOAD_RETRY_BASE_DELAY_MS = 4_000L
     }
 
     private var nextTrackPreloadJob: Job? = null
+    private var nextTrackPreloadRetryJob: Job? = null
+    private var nextTrackPreloadRetryCount = 0
+    private var nextTrackPreloadRetryKey: String? = null
     private var nextTrackPreloadToken: AndroidPlaybackPlayer.PlaybackPreloadToken? = null
     private val nextTrackPreloadResourceState = MutableStateFlow<PlaybackResource?>(null)
     private var nextTrackPreloadResource: PlaybackResource?
@@ -125,6 +132,53 @@ internal class AndroidQueueTransitions(
                     cancelNextTrackPreload()
                 }
             }
+        }
+
+        // При восстановлении интернета сбрасываем неудачную попытку предзагрузки, чтобы сразу подтянуть следующий трек
+        scope.launch {
+            var wasConnected = PlaybackNetworkStateStore.current.connected
+            PlaybackNetworkStateStore.state.collect { state ->
+                val reconnected = !wasConnected && state.connected
+                wasConnected = state.connected
+                if (reconnected) {
+                    if (nextTrackPreloadToken == null && nextTrackPreloadAttempt != null) {
+                        nextTrackPreloadAttempt = null
+                        nextTrackPreloadRetryCount = 0
+                        nextTrackPreloadInvalidation.value++
+                    }
+                    triggerCustomUpcomingPreload()
+                }
+            }
+        }
+
+        // Фоновая предзагрузка текущего + 2–3 (или 5–6 при нестабильной сети) следующих треков в 4 ГБ кэш
+        scope.launch {
+            combine(
+                player.currentMediaItemIndex,
+                player.songQueue,
+                player.currentPlaybackResource,
+            ) { index, songs, resource ->
+                Triple(index, songs.drop(index.coerceAtLeast(0)).take(6), resource?.videoId)
+            }.distinctUntilChanged()
+                .collectLatest { (index, upcoming, _) ->
+                    if (index < 0 || upcoming.isEmpty()) return@collectLatest
+                    val vibeTag =
+                        if (queue.isMyWaveQueue()) {
+                            AiWaveEngine.sharedInstance?.currentVibeTag()
+                        } else {
+                            null
+                        }
+                    CustomMediaCacheManager.preloadUpcomingTracks(
+                        songs = upcoming,
+                        vibeTag = vibeTag,
+                    )
+                    // Лёгкий пре-резолв ссылки следующего трека для мгновенного переключения
+                    upcoming.getOrNull(1)?.let { nextSong ->
+                        scope.launch(Dispatchers.IO) {
+                            HybridStreamResolver.preResolve(nextSong)
+                        }
+                    }
+                }
         }
 
         scope.launch {
@@ -228,6 +282,45 @@ internal class AndroidQueueTransitions(
         }
     }
 
+    private fun triggerCustomUpcomingPreload() {
+        val index = player.currentMediaItemIndex.value
+        val songs = player.songQueue.value
+        if (index !in songs.indices) return
+        val upcoming = songs.drop(index).take(6)
+        val vibeTag = if (queue.isMyWaveQueue()) AiWaveEngine.sharedInstance?.currentVibeTag() else null
+        CustomMediaCacheManager.preloadUpcomingTracks(songs = upcoming, vibeTag = vibeTag)
+    }
+
+    private fun schedulePreloadRetryIfEligible(
+        sessionId: Long,
+        attempt: NextTrackPreloadAttempt,
+    ) {
+        val key = "${attempt.currentPlaybackInstanceId}::${attempt.nextVideoId}"
+        if (nextTrackPreloadRetryKey != key) {
+            nextTrackPreloadRetryKey = key
+            nextTrackPreloadRetryCount = 0
+        }
+        if (nextTrackPreloadRetryCount >= MAX_PRELOAD_RETRIES) return
+        if (!PlaybackNetworkStateStore.current.connected) return
+
+        nextTrackPreloadRetryCount += 1
+        val delayMs = PRELOAD_RETRY_BASE_DELAY_MS * nextTrackPreloadRetryCount
+        nextTrackPreloadRetryJob?.cancel()
+        nextTrackPreloadRetryJob =
+            scope.launch {
+                delay(delayMs.milliseconds)
+                if (
+                    sessionId == queue.queueSessionId &&
+                    player.currentPlaybackInstanceId == attempt.currentPlaybackInstanceId &&
+                    nextTrackPreloadToken == null &&
+                    nextTrackPreloadAttempt == attempt
+                ) {
+                    nextTrackPreloadAttempt = null
+                    nextTrackPreloadInvalidation.value++
+                }
+            }
+    }
+
     fun scheduleNextTrackPreload(trigger: NextTrackPreloadTrigger) {
         if (trigger.invalidationGeneration != nextTrackPreloadInvalidation.value) return
         if (AndroidDeviceConnect.manager.remote.isActive || AndroidListenTogetherManager.isGuestPlaybackLocked) return
@@ -293,7 +386,11 @@ internal class AndroidQueueTransitions(
                     playbackPositionMs = 0L
                     resource = cachedAudio ?: fetchPlaybackResource(playbackSong, wantNextVideo)
                 }
-                if (resource == null || !isCurrentPreloadTarget(sessionId, trigger, currentVideoId, nextSong, wantNextVideo)) {
+                if (!isCurrentPreloadTarget(sessionId, trigger, currentVideoId, nextSong, wantNextVideo)) {
+                    return@launch
+                }
+                if (resource == null) {
+                    schedulePreloadRetryIfEligible(sessionId, attempt)
                     return@launch
                 }
                 if (playbackSong.isPodcast && episodeResumePosition(playbackSong, resource.durationSeconds?.times(1000L) ?: 0L) > 0L) {
@@ -310,13 +407,17 @@ internal class AndroidQueueTransitions(
                             positionMs = playbackPositionMs,
                             playbackSong = playbackSong,
                             sourceSong = sourceSong,
-                            onFailure = preloadFailureHandler(resource, playbackSong, wantNextVideo),
+                            onFailure = preloadFailureHandler(resource, playbackSong, wantNextVideo, sessionId, attempt),
                         )
                     }
                 if (token == null && playbackSong.id != nextSong.id) {
                     playbackSong = sourceSong
                     playbackPositionMs = 0L
-                    resource = cachedAudio ?: fetchPlaybackResource(playbackSong, wantNextVideo) ?: return@launch
+                    resource = cachedAudio ?: fetchPlaybackResource(playbackSong, wantNextVideo)
+                    if (resource == null) {
+                        schedulePreloadRetryIfEligible(sessionId, attempt)
+                        return@launch
+                    }
                     token =
                         withContext(Dispatchers.IO) {
                             player.prepareNextTrack(
@@ -328,15 +429,22 @@ internal class AndroidQueueTransitions(
                                 positionMs = playbackPositionMs,
                                 playbackSong = playbackSong,
                                 sourceSong = sourceSong,
-                                onFailure = preloadFailureHandler(resource, playbackSong, wantNextVideo),
+                                onFailure = preloadFailureHandler(resource, playbackSong, wantNextVideo, sessionId, attempt),
                             )
                         }
                 }
-                val preparedToken = token ?: return@launch
+                val preparedToken =
+                    token ?: run {
+                        schedulePreloadRetryIfEligible(sessionId, attempt)
+                        return@launch
+                    }
                 if (!isCurrentPreloadTarget(sessionId, trigger, currentVideoId, nextSong, wantNextVideo)) {
                     if (player.isPreloadedPlaybackActive(preparedToken)) player.cancelNext()
                     return@launch
                 }
+                nextTrackPreloadRetryCount = 0
+                nextTrackPreloadRetryJob?.cancel()
+                nextTrackPreloadRetryJob = null
                 nextTrackPreloadToken = preparedToken
                 nextTrackPreloadResource = resource
                 nextTrackPreloadSong = playbackSong
@@ -354,9 +462,12 @@ internal class AndroidQueueTransitions(
         resource: PlaybackResource,
         song: SongItem,
         wantVideo: Boolean,
+        sessionId: Long,
+        attempt: NextTrackPreloadAttempt,
     ): (Throwable) -> Unit =
         { error ->
             scope.launch(Dispatchers.IO) { onPreloadFailure(resource, song, wantVideo, error) }
+            scope.launch { schedulePreloadRetryIfEligible(sessionId, attempt) }
         }
 
     fun cancelNextTrackPreload(resetAttempt: Boolean = true) {
@@ -364,6 +475,8 @@ internal class AndroidQueueTransitions(
         preCacheJob = null
         nextTrackPreloadJob?.cancel()
         nextTrackPreloadJob = null
+        nextTrackPreloadRetryJob?.cancel()
+        nextTrackPreloadRetryJob = null
         nextTrackPreloadToken = null
         nextTrackPreloadResource = null
         nextTrackPreloadSong = null
@@ -371,6 +484,8 @@ internal class AndroidQueueTransitions(
         nextTrackPreloadExpectedInstanceId = 0L
         if (resetAttempt) {
             nextTrackPreloadAttempt = null
+            nextTrackPreloadRetryCount = 0
+            nextTrackPreloadRetryKey = null
             nextTrackPreloadInvalidation.value++
         }
         player.cancelNext()
