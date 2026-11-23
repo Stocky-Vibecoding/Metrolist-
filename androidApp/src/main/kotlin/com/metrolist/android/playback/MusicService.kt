@@ -10,7 +10,6 @@ import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Binder
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -260,7 +259,7 @@ class MusicService :
         private const val MUSIC_VIDEO_TAG = "MusicVideo"
         const val ACTION_OPEN_PLAYER = "action_open_player"
         const val ACTION_REFRESH_AUTOMOTIVE_LIBRARY = "action_refresh_automotive_library"
-        private const val ACTION_DISLIKE_WAVE = "com.metrolist.android.ACTION_DISLIKE_WAVE"
+        const val ACTION_DISLIKE_WAVE = "com.metrolist.android.ACTION_DISLIKE_WAVE"
         private val CommandDislikeWave = SessionCommand(ACTION_DISLIKE_WAVE, Bundle.EMPTY)
         private const val HEALTHY_PLAYBACK_THRESHOLD_MS = 30_000L
         private const val MAX_HEALTHY_REQUEST_HISTORY = 64
@@ -383,11 +382,13 @@ class MusicService :
     private val healthyQueueRequestIds = linkedSetOf<Long>()
     private var offlineScrobbleFlushJob: Job? = null
 
-    // Трекинг дослушиваний (>75%), быстрых скипов (<28с) и офлайн-скробблов
+    // Трекинг реального времени прослушивания (>75%), быстрых скипов (<28с) и офлайн-скробблов
     private var trackedInstanceId: Long = 0L
     private var trackedSong: SongItem? = null
     private var trackedStartPositionMs: Long = 0L
-    private var trackedMaxPositionMs: Long = 0L
+    private var trackedLastPositionMs: Long = 0L
+    private var trackedLastElapsedMs: Long = 0L
+    private var trackedAccumulatedPlayedMs: Long = 0L
     private var trackedDurationMs: Long = 0L
     private var trackedCompletedRecorded: Boolean = false
     private var trackedFinalized: Boolean = false
@@ -1005,13 +1006,13 @@ class MusicService :
         trackedFinalized = true
 
         val engine = AiWaveEngine.sharedInstance ?: return
-        val playedDeltaMs = (trackedMaxPositionMs - trackedStartPositionMs).coerceAtLeast(0L)
+        val playedMs = trackedAccumulatedPlayedMs
         when {
-            playedDeltaMs >= QUICK_SKIP_THRESHOLD_MS -> {
-                // Слушал дольше 28с — записываем в TTL-антиповтор и статистику без штрафа скипа
+            playedMs >= QUICK_SKIP_THRESHOLD_MS -> {
+                // Слушал дольше 28с реального времени — записываем в TTL-антиповтор и статистику без штрафа скипа
                 engine.recordTrackCompletion(prevSong, completed = false)
             }
-            trackedStartPositionMs < QUICK_SKIP_THRESHOLD_MS && playedDeltaMs >= QUICK_SKIP_MIN_PLAYED_MS -> {
+            trackedStartPositionMs < QUICK_SKIP_THRESHOLD_MS && playedMs >= QUICK_SKIP_MIN_PLAYED_MS -> {
                 // Быстрый скип (<28с) — фиксируем сигнал и проверяем авторазворот волны (3 подряд)
                 engine.recordSessionSkip(prevSong, isQuickSkip = true)
                 if (queueCoordinator.isMyWaveQueue()) {
@@ -1038,7 +1039,7 @@ class MusicService :
                 player.isPlaying.map { Unit },
             ).collect { updatePodcastProgress() }
         }
-        // Отслеживание дослушиваний >75%, быстрых скипов (<28с) и офлайн-буфера скробблов Last.fm
+        // Отслеживание реального времени прослушивания (>75%), быстрых скипов (<28с) и офлайн-буфера скробблов Last.fm
         serviceScope.launch {
             combine(
                 player.playbackInstanceId,
@@ -1048,13 +1049,16 @@ class MusicService :
             ) { instanceId, song, positionMs, durationMs ->
                 Quad(instanceId, song, positionMs, durationMs)
             }.collect { (instanceId, song, positionMs, durationMs) ->
+                val nowElapsed = SystemClock.elapsedRealtime()
+                val safePos = positionMs.coerceAtLeast(0L)
                 if (instanceId != trackedInstanceId) {
                     finalizePreviousTrackedPlayback()
-                    val safePos = positionMs.coerceAtLeast(0L)
                     trackedInstanceId = instanceId
                     trackedSong = song
                     trackedStartPositionMs = safePos
-                    trackedMaxPositionMs = safePos
+                    trackedLastPositionMs = safePos
+                    trackedLastElapsedMs = nowElapsed
+                    trackedAccumulatedPlayedMs = 0L
                     trackedDurationMs = durationMs.coerceAtLeast(0L)
                     trackedCompletedRecorded = false
                     trackedFinalized = false
@@ -1062,20 +1066,29 @@ class MusicService :
                     return@collect
                 }
                 if (instanceId <= 0L || song == null) return@collect
-                if (positionMs > trackedMaxPositionMs) trackedMaxPositionMs = positionMs
+
+                val wallDelta = (nowElapsed - trackedLastElapsedMs).coerceAtLeast(0L)
+                val posDelta = safePos - trackedLastPositionMs
+                val speed = player.playbackSpeed().coerceAtLeast(1f)
+                val maxExpectedDelta = (wallDelta * speed).toLong() + 1_500L
+                if (posDelta > 0L && posDelta <= maxExpectedDelta) {
+                    trackedAccumulatedPlayedMs += posDelta
+                }
+                trackedLastPositionMs = safePos
+                trackedLastElapsedMs = nowElapsed
                 if (durationMs > 0L) trackedDurationMs = durationMs
 
                 val effectiveDurationMs =
                     trackedDurationMs.takeIf { it > 0L }
                         ?: song.duration?.times(1_000L)
                         ?: 0L
-                val playedDeltaMs = (trackedMaxPositionMs - trackedStartPositionMs).coerceAtLeast(0L)
+                val playedMs = trackedAccumulatedPlayedMs
 
                 val reachedCompletion =
-                    playedDeltaMs >= MIN_COMPLETION_PLAYED_MS &&
+                    playedMs >= MIN_COMPLETION_PLAYED_MS &&
                         (
-                            (effectiveDurationMs >= 20_000L && trackedMaxPositionMs >= (effectiveDurationMs * 3L) / 4L) ||
-                                (effectiveDurationMs <= 0L && playedDeltaMs >= 90_000L)
+                            (effectiveDurationMs >= 20_000L && playedMs >= (effectiveDurationMs * 3L) / 4L) ||
+                                (effectiveDurationMs <= 0L && playedMs >= 90_000L)
                         )
                 if (!trackedCompletedRecorded && reachedCompletion) {
                     trackedCompletedRecorded = true
@@ -1084,10 +1097,10 @@ class MusicService :
                 }
 
                 val reachedScrobble =
-                    playedDeltaMs >= MIN_COMPLETION_PLAYED_MS &&
+                    playedMs >= MIN_COMPLETION_PLAYED_MS &&
                         (
-                            (effectiveDurationMs >= 30_000L && trackedMaxPositionMs >= effectiveDurationMs / 2L) ||
-                                (effectiveDurationMs <= 0L && playedDeltaMs >= 45_000L)
+                            (effectiveDurationMs >= 30_000L && playedMs >= effectiveDurationMs / 2L) ||
+                                (effectiveDurationMs <= 0L && playedMs >= 45_000L)
                         )
                 // Штатный ScrobbleManager уже буферизует треки с известной длительностью;
                 // в наш LastFmOfflineBuffer пишем только треки без duration, чтобы не было дублей
@@ -1170,9 +1183,14 @@ class MusicService :
         }
 
         serviceScope.launch {
+            var initialNetworkEmission = true
             PlaybackNetworkStateStore.state.collect { network ->
+                val isFirst = initialNetworkEmission
+                initialNetworkEmission = false
                 if (network.connected) {
-                    player.invalidateActiveStreamForNetworkChange()
+                    if (!isFirst) {
+                        player.invalidateActiveStreamForNetworkChange()
+                    }
                     val sender = offlineScrobbleSender
                     if (sender != null && LastFmOfflineBuffer.pendingCount() > 0 && offlineScrobbleFlushJob?.isActive != true) {
                         offlineScrobbleFlushJob =
@@ -1522,16 +1540,23 @@ class MusicService :
                 )
             budget = decision.budget
             if (decision.action == PlaybackRecoveryAction.NONE) break
+            // Зависший поток по watchdog не повторяем по тому же URL — сразу переключаемся на следующий источник каскада
+            val effectiveAction =
+                if (failure.stage == "buffering_watchdog" && decision.action == PlaybackRecoveryAction.RETRY_SAME_URL) {
+                    PlaybackRecoveryAction.RETRY_CLIENT
+                } else {
+                    decision.action
+                }
             excludedProfiles += PlaybackRecoveryPolicy.recoveryExclusions(failureCategory, failedResource, failure.playbackPositionMs)
             PlaybackEventLog.info(
                 kind = PlaybackEventKind.RECOVERY,
-                message = "Trying Android playback recovery action ${decision.action}.",
+                message = "Trying Android playback recovery action $effectiveAction.",
                 videoId = videoId,
                 clientName = failedResource?.clientName,
                 profileId = failedResource?.profileId,
                 details =
                     mapOf(
-                        "recoveryAction" to decision.action.name,
+                        "recoveryAction" to effectiveAction.name,
                         "failureCategory" to failureCategory.name,
                         "httpStatus" to (lastHttpStatusCode?.toString() ?: "unknown"),
                         "attemptsRemaining" to budget.attemptsRemaining.toString(),
@@ -1545,7 +1570,7 @@ class MusicService :
                         failure.stage == "buffering_watchdog" ||
                             ((failureCategory == PlaybackFailureCategory.TIMEOUT || lastFailure is TimeoutException) &&
                                 (resource.clientName == "vk" || resource.clientName == "yandex"))
-                    decision.action == PlaybackRecoveryAction.RETRY_CLIENT ||
+                    effectiveAction == PlaybackRecoveryAction.RETRY_CLIENT ||
                         isWatchdogOrCustomTimeout ||
                         failureCategory == PlaybackFailureCategory.CDN_FORBIDDEN ||
                         failureCategory == PlaybackFailureCategory.SABR_PROTOCOL ||
@@ -1566,7 +1591,7 @@ class MusicService :
                     streamResolver = streamResolver,
                     retryNetworkResource = retryNetworkResource,
                     now = Clock.System.now(),
-                    action = decision.action,
+                    action = effectiveAction,
                     currentResource = failedResource,
                     failure = lastFailure,
                     videoId = videoId,
@@ -1577,7 +1602,7 @@ class MusicService :
                     excludedProfiles = excludedProfiles,
                     category = failureCategory,
                 )
-            if (decision.action == PlaybackRecoveryAction.INVALIDATE_NETWORK) retryNetworkResource = false
+            if (effectiveAction == PlaybackRecoveryAction.INVALIDATE_NETWORK) retryNetworkResource = false
             budget = recoveryResource.budget
             streamRecoveryBudget = budget
             val freshResource = recoveryResource.resource
@@ -1615,7 +1640,7 @@ class MusicService :
                     profileId = freshResource.profileId,
                     details =
                         mapOf(
-                            "recoveryAction" to decision.action.name,
+                            "recoveryAction" to effectiveAction.name,
                             "playbackPositionMs" to failure.playbackPositionMs.toString(),
                             "transport" to if (freshResource.isSabr) "SABR" else "Direct",
                         ),
@@ -2499,6 +2524,14 @@ class MusicService :
         updateWidgetsNow()
     }
 
+    private fun skipOrAdvanceAfterDislike() {
+        if (player.currentMediaItemIndex.value < player.songQueue.value.lastIndex) {
+            player.skipToNext(resumePlayback = true)
+        } else {
+            serviceScope.launch { advanceQueueAfterCurrent() }
+        }
+    }
+
     private fun dislikeCurrentSong() {
         val song = player.currentSong.value ?: return
         if (trackedSong?.id == song.id) {
@@ -2514,7 +2547,7 @@ class MusicService :
         if (queueCoordinator.isMyWaveQueue()) {
             queueCoordinator.triggerAutoPivotInBackground()
         }
-        player.skipToNext(resumePlayback = true)
+        skipOrAdvanceAfterDislike()
         updateWidgetsNow()
     }
 
@@ -3208,6 +3241,7 @@ class MusicService :
     }
 
     private fun releasePlaybackState() {
+        finalizePreviousTrackedPlayback()
         val checkpoint = saveFinalPlaybackState()
         updatePodcastProgress()
         val podcastWrite = podcastProgress.flush()
@@ -3403,7 +3437,7 @@ class MusicService :
                     queueCoordinator.triggerAutoPivotInBackground()
                 }
                 if (song.id == player.currentSong.value?.id) {
-                    player.skipToNext(resumePlayback = true)
+                    skipOrAdvanceAfterDislike()
                 }
                 updateWidgetsNow()
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
