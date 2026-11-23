@@ -8,6 +8,7 @@ import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.GlobalYouTube
 import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -133,7 +134,15 @@ class AiWaveEngine(
         val artist = song.artists.joinToString(", ") { it.name }.trim()
         val key = CustomConfigStore.buildTrackKey(artist, song.title)
         if (key.isNotBlank()) {
-            sessionSkippedUntilMs[key] = System.currentTimeMillis() + SESSION_SKIP_COOLDOWN_MS
+            val now = System.currentTimeMillis()
+            if (sessionSkippedUntilMs.size > 60) {
+                val expired = sessionSkippedUntilMs.filterValues { it <= now }.keys
+                expired.forEach {
+                    sessionSkippedUntilMs.remove(it)
+                    sessionSkippedLabels.remove(it)
+                }
+            }
+            sessionSkippedUntilMs[key] = now + SESSION_SKIP_COOLDOWN_MS
             sessionSkippedLabels[key] = if (artist.isNotBlank()) "$artist — ${song.title}" else song.title
             if (sessionSkippedLabels.size > 20) {
                 val firstKey = sessionSkippedLabels.keys.firstOrNull()
@@ -232,6 +241,7 @@ class AiWaveEngine(
         excludeIds: Set<String> = emptySet(),
     ): Result<List<SongItem>> =
         waveMutex.withLock {
+            var keepErrorStatus = false
             _isGeneratingWave.value = true
             _statusText.value =
                 when {
@@ -267,17 +277,15 @@ class AiWaveEngine(
                         onSuccess = { suggestions ->
                             val filtered = filterSuggestionsByFeedback(suggestions, respectPlayedCooldown = true)
                             val found = resolveSuggestionsToSongs(filtered, maxResults = targetCount)
-                            val clean =
-                                diversifyWaveSongs(
-                                    songs =
-                                        filterSongsByFeedback(
-                                            found,
-                                            respectSessionSkips = true,
-                                            respectPlayedCooldown = true,
-                                        ).filter { it.id !in excludeIds }.map(::withFallbackCover),
-                                    cfg = cfg,
-                                )
-                            clean
+                            diversifyWaveSongs(
+                                songs =
+                                    filterSongsByFeedback(
+                                        found,
+                                        respectSessionSkips = true,
+                                        respectPlayedCooldown = true,
+                                    ).filter { it.id !in excludeIds }.map(::withFallbackCover),
+                                cfg = cfg,
+                            )
                         },
                         onFailure = { err ->
                             Log.w(TAG, "Gemini wave generation failed (${err.message}), trying Last.fm fallback")
@@ -289,7 +297,6 @@ class AiWaveEngine(
                     when {
                         resolvedOnline.isNotEmpty() -> resolvedOnline
                         else -> {
-                            // Резерв 1: Last.fm (при 429 от Gemini или пустом ключе)
                             val lastFmSongs =
                                 generateLastFmFallbackSongs(
                                     cfg = cfg,
@@ -301,7 +308,6 @@ class AiWaveEngine(
                             if (lastFmSongs.isNotEmpty()) {
                                 lastFmSongs
                             } else {
-                                // Резерв 2: Умный офлайн-фолбэк из 4 ГБ кэша и скачанных лайков
                                 CustomMediaCacheManager
                                     .getOfflineCachedSongs(
                                         preferredVibe = currentVibeTag(cfg),
@@ -316,7 +322,10 @@ class AiWaveEngine(
 
                 if (finalSongs.isEmpty()) {
                     val err = geminiResult.exceptionOrNull() ?: IllegalStateException("Не удалось подобрать треки")
-                    _statusText.value = if (backgroundLabel) null else (err.message ?: "Ошибка генерации волны")
+                    if (!backgroundLabel) {
+                        _statusText.value = err.message ?: "Ошибка генерации волны"
+                        keepErrorStatus = true
+                    }
                     return@withLock Result.failure(err)
                 }
 
@@ -324,7 +333,6 @@ class AiWaveEngine(
                     markAutoPivotTriggered()
                 }
 
-                // Сохраняем свежую очередь (если это основная волна, а не разовая волна по треку)
                 if (seedSong == null) {
                     val savedWave =
                         finalSongs.map { song ->
@@ -338,15 +346,16 @@ class AiWaveEngine(
                     configStore.saveLastWaveTracks(savedWave)
                 }
 
-                // Фоновая предзагрузка первых треков новой пачки в 4 ГБ кэш
                 CustomMediaCacheManager.preloadUpcomingTracks(
                     songs = finalSongs,
                     vibeTag = currentVibeTag(cfg),
                 )
 
-                _statusText.value = null
                 Result.success(finalSongs)
             } finally {
+                if (!keepErrorStatus) {
+                    _statusText.value = null
+                }
                 _isGeneratingWave.value = false
             }
         }
@@ -468,7 +477,6 @@ class AiWaveEngine(
                 }
             }
 
-            // 1. Похожие на seedSong
             if (seedSong != null) {
                 val seedArtist = seedSong.artists.joinToString(", ") { it.name }.trim()
                 fetchLastFmSimilarTracks(apiKey, seedArtist, seedSong.title, limit = 16).forEach {
@@ -476,7 +484,6 @@ class AiWaveEngine(
                 }
             }
 
-            // 2. Похожие артисты и их топ-треки по локальному топу
             val anchorArtists =
                 buildList {
                     seedSong?.artists?.firstOrNull()?.name?.takeIf { it.isNotBlank() }?.let(::add)
@@ -512,68 +519,101 @@ class AiWaveEngine(
         title: String,
         limit: Int,
     ): List<AiTrackSuggestion> =
-        runCatching {
+        try {
             val url =
                 "https://ws.audioscrobbler.com/2.0/?method=track.getsimilar" +
                     "&artist=${CustomHttp.urlEncode(artist)}" +
                     "&track=${CustomHttp.urlEncode(title)}" +
                     "&limit=$limit&api_key=${CustomHttp.urlEncode(apiKey)}&format=json"
             val resp = CustomHttp.get(url, timeoutMs = 6_000)
-            if (!resp.isSuccess) return@runCatching emptyList<AiTrackSuggestion>()
-            val arr = JSONObject(resp.body).optJSONObject("similartracks")?.optJSONArray("track") ?: return@runCatching emptyList()
-            buildList {
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    val t = o.optString("name").trim()
-                    val a = o.optJSONObject("artist")?.optString("name").orEmpty().trim()
-                    if (a.isNotBlank() && t.isNotBlank()) add(AiTrackSuggestion(a, t))
+            if (!resp.isSuccess) {
+                emptyList()
+            } else {
+                val arr = JSONObject(resp.body).optJSONObject("similartracks")?.optJSONArray("track")
+                if (arr == null) {
+                    emptyList()
+                } else {
+                    buildList {
+                        for (i in 0 until arr.length()) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val t = o.optString("name").trim()
+                            val a = o.optJSONObject("artist")?.optString("name").orEmpty().trim()
+                            if (a.isNotBlank() && t.isNotBlank()) add(AiTrackSuggestion(a, t))
+                        }
+                    }
                 }
             }
-        }.getOrDefault(emptyList())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
 
     private suspend fun fetchLastFmSimilarArtists(
         apiKey: String,
         artist: String,
         limit: Int,
     ): List<String> =
-        runCatching {
+        try {
             val url =
                 "https://ws.audioscrobbler.com/2.0/?method=artist.getsimilar" +
                     "&artist=${CustomHttp.urlEncode(artist)}" +
                     "&limit=$limit&api_key=${CustomHttp.urlEncode(apiKey)}&format=json"
             val resp = CustomHttp.get(url, timeoutMs = 6_000)
-            if (!resp.isSuccess) return@runCatching emptyList<String>()
-            val arr = JSONObject(resp.body).optJSONObject("similarartists")?.optJSONArray("artist") ?: return@runCatching emptyList()
-            buildList {
-                for (i in 0 until arr.length()) {
-                    val name = arr.optJSONObject(i)?.optString("name")?.trim().orEmpty()
-                    if (name.isNotBlank()) add(name)
+            if (!resp.isSuccess) {
+                emptyList()
+            } else {
+                val arr = JSONObject(resp.body).optJSONObject("similarartists")?.optJSONArray("artist")
+                if (arr == null) {
+                    emptyList()
+                } else {
+                    buildList {
+                        for (i in 0 until arr.length()) {
+                            val name = arr.optJSONObject(i)?.optString("name")?.trim().orEmpty()
+                            if (name.isNotBlank()) add(name)
+                        }
+                    }
                 }
             }
-        }.getOrDefault(emptyList())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
 
     private suspend fun fetchLastFmArtistTopTracks(
         apiKey: String,
         artist: String,
         limit: Int,
     ): List<AiTrackSuggestion> =
-        runCatching {
+        try {
             val url =
                 "https://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks" +
                     "&artist=${CustomHttp.urlEncode(artist)}" +
                     "&limit=$limit&api_key=${CustomHttp.urlEncode(apiKey)}&format=json"
             val resp = CustomHttp.get(url, timeoutMs = 6_000)
-            if (!resp.isSuccess) return@runCatching emptyList<AiTrackSuggestion>()
-            val arr = JSONObject(resp.body).optJSONObject("toptracks")?.optJSONArray("track") ?: return@runCatching emptyList()
-            buildList {
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    val t = o.optString("name").trim()
-                    val a = o.optJSONObject("artist")?.optString("name").orEmpty().trim().ifBlank { artist }
-                    if (t.isNotBlank()) add(AiTrackSuggestion(a, t))
+            if (!resp.isSuccess) {
+                emptyList()
+            } else {
+                val arr = JSONObject(resp.body).optJSONObject("toptracks")?.optJSONArray("track")
+                if (arr == null) {
+                    emptyList()
+                } else {
+                    buildList {
+                        for (i in 0 until arr.length()) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val t = o.optString("name").trim()
+                            val a = o.optJSONObject("artist")?.optString("name").orEmpty().trim().ifBlank { artist }
+                            if (t.isNotBlank()) add(AiTrackSuggestion(a, t))
+                        }
+                    }
                 }
             }
-        }.getOrDefault(emptyList())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
 
     private fun SongItem.primaryArtistKey(): String =
         CustomConfigStore.buildArtistKey(artists.joinToString(", ") { it.name }.trim())
@@ -645,6 +685,15 @@ class AiWaveEngine(
             }
             if (!addedAny) break
         }
+
+        // Если после жёсткого окна артистов остались треки и пачка получилась короткой — мягко добираем
+        val leftovers = (orderedFresh + familiarPool).toMutableList()
+        while (result.size < minOf(songs.size, 8) && leftovers.isNotEmpty()) {
+            val nonConsecIdx = leftovers.indexOfFirst { it.primaryArtistKey() != result.lastOrNull()?.primaryArtistKey() }
+            val picked = if (nonConsecIdx >= 0) leftovers.removeAt(nonConsecIdx) else leftovers.removeAt(0)
+            result.add(picked)
+        }
+
         return if (result.isNotEmpty()) result else songs.shuffled()
     }
 
@@ -671,12 +720,16 @@ class AiWaveEngine(
             .firstOrNull { it.id == id && !it.thumbnail.isNullOrBlank() && it.thumbnail != CustomMascotAssets.fallbackCoverUri }
             ?.let { return it }
         val parsedArtists =
-            artist
-                .split(",", "&")
-                .map { it.trim() }
-                .filter { it.isNotBlank() }
+            CustomConfigStore
+                .splitArtistNames(artist)
                 .map { ArtistTiny(id = null, name = it) }
-                .ifEmpty { listOf(ArtistTiny(id = null, name = "Неизвестный")) }
+                .ifEmpty {
+                    artist
+                        .trim()
+                        .takeIf { it.isNotBlank() }
+                        ?.let { listOf(ArtistTiny(id = null, name = it)) }
+                        ?: listOf(ArtistTiny(id = null, name = "Неизвестный"))
+                }
         val resolvedThumbnail =
             thumbnail?.takeIf { it.isNotBlank() && it != CustomMascotAssets.fallbackCoverUri }
                 ?: ResolverDiagnostics.hdCoverFor(id)
@@ -847,7 +900,6 @@ class AiWaveEngine(
                 if (cleanArtist.isNotBlank()) bumpArtist(cleanArtist, artistWeight)
             }
 
-            // 1. Локальная статистика прослушиваний и топ артистов (главный источник после полного перехода)
             val now = System.currentTimeMillis()
             cfg.localArtistStats.forEach { (norm, stat) ->
                 val rep = cfg.artistReputation[norm]
@@ -856,7 +908,6 @@ class AiWaveEngine(
                 artistDisplayNames.putIfAbsent(norm, stat.displayName)
             }
 
-            // 2. Свежие локальные лайки
             val recentLocalLikes =
                 SongLikeState.likedSongs
                     .sortedByDescending { it.libraryAddedAt ?: 0L }
@@ -869,9 +920,8 @@ class AiWaveEngine(
                 if (art.isNotBlank()) bumpArtist(art, weight = 2.0)
             }
 
-            // 3. Last.fm (если настроен)
             if (cfg.lastFmUsername.isNotBlank() && LastFM.apiKeyConfigured()) {
-                runCatching {
+                try {
                     val recent = LastFM.getRecentTracks(GlobalYouTube.client, cfg.lastFmUsername.trim(), limit = 10).getOrNull()
                     if (recent != null) {
                         val root = JSONObject(recent.toString())
@@ -892,10 +942,12 @@ class AiWaveEngine(
                         if (art.isNotBlank()) bumpArtist(art, weight = 4.0)
                         if (coreRecent.size < 14) addCore(art, name, artistWeight = 2.0)
                     }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
                 }
             }
 
-            // 4. Полный бэкап локальных лайков
             cfg.likedTracksBackup.take(15).forEach { liked ->
                 addCore(liked.artist, liked.title, artistWeight = 3.0)
             }
@@ -903,13 +955,11 @@ class AiWaveEngine(
                 if (liked.artist.isNotBlank()) bumpArtist(liked.artist, weight = 1.0)
             }
 
-            // 5. Фоновый скан вкуса (ВК/Яндекс/YouTube — только для вычисления жанров и артистов)
             cfg.externalTasteProfile.take(250).forEach { ext ->
                 if (ext.artist.isNotBlank()) bumpArtist(ext.artist, weight = 0.8)
                 if (coreRecent.size < 10) addCore(ext.artist, ext.title, artistWeight = 0.5)
             }
 
-            // 6. Репутация артистов
             cfg.artistReputation.forEach { (normArtist, rep) ->
                 if (!rep.isAutoMuted && !rep.isLowWeight && rep.likes > 0) {
                     val delta = (rep.likes * 3.0 - rep.dislikes * 2.0).coerceAtLeast(0.0)
@@ -949,7 +999,7 @@ class AiWaveEngine(
 
     /**
      * Строгий каскадный резолв рекомендаций без мусорного `firstOrNull()`:
-     * - Зарубежные: Deezer → YTM → VK → Яндекс
+     * - Зарубежные: YTM → Deezer → VK → Яндекс
      * - Русские без цензуры: Яндекс → VK → Deezer → YTM
      * - Русские цензура/Explicit: VK → Яндекс → Deezer → YTM
      */
@@ -993,8 +1043,14 @@ class AiWaveEngine(
                         LocalCensorshipAdvisor.isLikelyCensoredOnYandex(artist, title)
                 )
 
-        // Сначала забираем эталон Deezer (обложка + длительность + Explicit)
-        val deezerTrack = runCatching { deezer?.searchCatalogTrack(artist, title) }.getOrNull()
+        val deezerTrack =
+            try {
+                deezer?.searchCatalogTrack(artist, title)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
         val effectiveRuCensored =
             isCensored || (isRu && cfg.preferVkForExplicit && deezerTrack?.isExplicit == true)
         val targetDur = deezerTrack?.durationSec
@@ -1017,27 +1073,35 @@ class AiWaveEngine(
                         if (cfg.yandexToken.isBlank() || yandex == null) {
                             null
                         } else {
-                            runCatching {
+                            try {
                                 yandex.searchCatalogTrack(
                                     artist = artist,
                                     title = title,
                                     targetDurationSec = targetDur,
                                     rejectSuspectedCensored = !effectiveRuCensored && cfg.vkToken.isNotBlank(),
                                 )?.toSongItem()
-                            }.getOrNull()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                null
+                            }
                         }
                     }
                     "vk" -> {
                         if (cfg.vkToken.isBlank() || vk == null) {
                             null
                         } else {
-                            runCatching {
+                            try {
                                 vk.searchCatalogTrack(
                                     artist = artist,
                                     title = title,
                                     targetDurationSec = targetDur,
                                 )?.toSongItem()
-                            }.getOrNull()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                null
+                            }
                         }
                     }
                     "ytm" -> {
@@ -1069,7 +1133,7 @@ class AiWaveEngine(
         suggestion: AiTrackSuggestion,
         targetDurationSec: Long? = null,
     ): SongItem? =
-        runCatching {
+        try {
             val q = "${suggestion.artist} ${suggestion.title}".trim()
             val page =
                 GlobalYouTubeRepository.instance.searchFiltered(
@@ -1078,9 +1142,12 @@ class AiWaveEngine(
                     allowOfflineFallback = false,
                 )
             pickBestSongStrict(page.items.filterIsInstance<SongItem>(), suggestion, targetDurationSec)
-        }.onFailure { err ->
+        } catch (e: CancellationException) {
+            throw e
+        } catch (err: Exception) {
             Log.d(TAG, "YTM search failed for ${suggestion.artist} - ${suggestion.title}: ${err.message}")
-        }.getOrNull()
+            null
+        }
 
     /** Строгий отбор без `firstOrNull()` — если трек не совпал, отбрасываем его. */
     private fun pickBestSongStrict(
@@ -1096,7 +1163,7 @@ class AiWaveEngine(
             .mapNotNull { song ->
                 val art = song.artists.joinToString(", ") { it.name }
                 val candLower = "$art ${song.title}".lowercase()
-                if (UNWANTED_VERSION_TAGS.any { badTag -> candLower.contains(badTag) && !targetLower.contains(badTag) }) {
+                if (hasUnwantedVersionTag(candLower, targetLower)) {
                     return@mapNotNull null
                 }
                 val durationSec = song.duration?.toLong()
@@ -1123,6 +1190,18 @@ class AiWaveEngine(
             ?.first
     }
 
+    private fun hasUnwantedVersionTag(
+        candLower: String,
+        targetLower: String,
+    ): Boolean {
+        if (UNWANTED_SUBSTRINGS.any { badTag -> candLower.contains(badTag) && !targetLower.contains(badTag) }) {
+            return true
+        }
+        return UNWANTED_WORD_REGEXES.any { (_, regex) ->
+            regex.containsMatchIn(candLower) && !regex.containsMatchIn(targetLower)
+        }
+    }
+
     companion object {
         private const val TAG = "AiWaveEngine"
         const val DEFAULT_WAVE_BATCH_SIZE = 14
@@ -1132,7 +1211,7 @@ class AiWaveEngine(
         private const val AUTO_PIVOT_SKIP_THRESHOLD = 3
         private const val AUTO_PIVOT_COOLDOWN_MS = 75_000L
 
-        private val UNWANTED_VERSION_TAGS =
+        private val UNWANTED_SUBSTRINGS =
             listOf(
                 "slowed",
                 "sped up",
@@ -1142,10 +1221,7 @@ class AiWaveEngine(
                 "8d audio",
                 "karaoke",
                 "караоке",
-                "минус",
                 "instrumental",
-                "cover",
-                "кавер",
                 "clean version",
                 "radio edit",
                 "censored",
@@ -1154,6 +1230,11 @@ class AiWaveEngine(
                 "acoustic",
                 "bass boosted",
             )
+
+        private val UNWANTED_WORD_REGEXES =
+            listOf("cover", "кавер", "минус", "minus").map { word ->
+                word to Regex("(?<![a-zа-яё0-9])${Regex.escape(word)}(?![a-zа-яё0-9])")
+            }
 
         @Volatile
         var sharedInstance: AiWaveEngine? = null
