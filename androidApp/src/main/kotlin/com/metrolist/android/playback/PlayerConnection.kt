@@ -9,7 +9,6 @@ import android.os.IBinder
 import android.widget.Toast
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.media3.common.Player
-import com.metrolist.android.R
 import com.metrolist.android.custom.AiWaveEngine
 import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.android.custom.HybridStreamResolver
@@ -201,8 +200,6 @@ class PlayerConnection(
     private var playlistRequestJob: Job? = null
     private var lastPreResolvedVideoId: String? = null
     private var preResolveJob: Job? = null
-    private var lastWaveRefillMs = 0L
-    private var waveRefillJob: Job? = null
 
     private fun cancelPlaylistRequest() {
         playlistRequestGeneration++
@@ -422,7 +419,6 @@ class PlayerConnection(
     private fun disconnect() {
         connectionJob?.cancel()
         preResolveJob?.cancel()
-        waveRefillJob?.cancel()
         observationScope?.cancel()
         observationScope = null
         musicService?.player?.removePlayerListener(readinessListener)
@@ -563,27 +559,13 @@ class PlayerConnection(
             _currentSong.value?.takeIf { it.id == songId }
                 ?: _queueSnapshot.value.displayedItems.firstOrNull { it.id == songId }
                 ?: return
-        val engine = AiWaveEngine.sharedInstance ?: run {
-            Toast.makeText(context, "Движок волны ещё не готов", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "Запускаю волну от «${song.title}»…", Toast.LENGTH_SHORT).show()
+        if (deferUntilConnected { startWaveFromTrackId(songId) }) return
+        if (AndroidListenTogetherManager.isGuestPlaybackLocked) {
+            listenTogetherPlaybackRequestsState.tryEmit(ListenTogetherPlaybackRequest(song = song))
             return
         }
-        Toast.makeText(context, "Собираю волну от «${song.title}»…", Toast.LENGTH_SHORT).show()
-        scope.launch {
-            engine
-                .generateWaveSongs(seedSong = song)
-                .onSuccess { generated ->
-                    val queue = listOf(song) + generated.filterNot { it.id == song.id }
-                    playQueue(
-                        songs = queue,
-                        startIndex = if (queue.size > 1) 1 else 0,
-                        queueTitle = "Моя волна • ${song.title}",
-                        finite = false,
-                        forceStartPlaying = true,
-                    )
-                }.onFailure { err ->
-                    Toast.makeText(context, err.message ?: "Не удалось собрать волну", Toast.LENGTH_SHORT).show()
-                }
-        }
+        musicService?.playMix(song, startPlaying = true)
     }
 
     private fun switchSourceFromMenu(
@@ -634,9 +616,6 @@ class PlayerConnection(
         scope.launch {
             player.playbackPitch.collect { _playbackPitchFlow.value = it }
         }
-        var trackedSong: SongItem? = null
-        var trackedMaxPosMs = 0L
-        var trackedDurationMs = 0L
         scope.launch {
             combine(player.currentSong, player.currentPosition, player.duration, player.bufferedPosition) { _, _, _, _ ->
                 val activeSong = player.currentSong.value
@@ -650,20 +629,6 @@ class PlayerConnection(
                     updateProgress()
                 } else {
                     _currentSong.value = activeSong
-                }
-
-                val prev = trackedSong
-                if (prev != null && activeSong?.id != prev.id) {
-                    if (trackedDurationMs > 45_000L && trackedMaxPosMs in 1_500L..25_000L) {
-                        AiWaveEngine.sharedInstance?.recordSessionSkip(prev)
-                    }
-                    trackedSong = activeSong
-                    trackedMaxPosMs = 0L
-                    trackedDurationMs = durMs
-                } else if (activeSong != null) {
-                    if (trackedSong == null) trackedSong = activeSong
-                    if (posMs > trackedMaxPosMs) trackedMaxPosMs = posMs
-                    if (durMs > 0L) trackedDurationMs = durMs
                 }
 
                 val remainingMs = durMs - posMs
@@ -723,7 +688,6 @@ class PlayerConnection(
                 _queueSongs.value = it.displayedItems
                 _currentMediaItemIndex.value = it.currentIndex
                 _shuffleModeEnabled.value = it.isShuffled
-                maybeRefillInfiniteWave(it)
             }
         }
         scope.launch {
@@ -769,7 +733,11 @@ class PlayerConnection(
                     if (SongLikeState.isLiked(activeSong.id)) {
                         CustomMediaCacheManager.downloadLikedTrack(activeSong, res)
                     } else if (_queueTitle.value?.startsWith("Моя волна") == true) {
-                        CustomMediaCacheManager.cacheWaveTrack(activeSong, res)
+                        CustomMediaCacheManager.cacheWaveTrack(
+                            song = activeSong,
+                            resource = res,
+                            vibeTag = AiWaveEngine.sharedInstance?.currentVibeTag(),
+                        )
                     }
                 }
             }
@@ -808,37 +776,18 @@ class PlayerConnection(
         if (nextSong.id.isBlank() || nextSong.id == lastPreResolvedVideoId) return
         lastPreResolvedVideoId = nextSong.id
         val isWave = _queueTitle.value?.startsWith("Моя волна") == true
+        val vibeTag = AiWaveEngine.sharedInstance?.currentVibeTag()
         preResolveJob?.cancel()
         preResolveJob =
             scope.launch(Dispatchers.IO) {
-                runCatching { HybridStreamResolver.preResolve(nextSong) }
-                if (isWave && HybridStreamResolver.isCachingEnabled()) {
-                    CustomMediaCacheManager.cacheWaveTrack(nextSong, null)
+                try {
+                    HybridStreamResolver.preResolve(nextSong)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
                 }
-            }
-    }
-
-    private fun maybeRefillInfiniteWave(snapshot: MusicQueueSnapshot) {
-        val title = _queueTitle.value ?: return
-        if (!title.startsWith("Моя волна")) return
-        if (snapshot.displayedItems.isEmpty() || snapshot.currentIndex < 0) return
-        val remaining = snapshot.displayedItems.lastIndex - snapshot.currentIndex
-        if (remaining > 3) return
-        if (waveRefillJob?.isActive == true) return
-        val now = System.currentTimeMillis()
-        if (now - lastWaveRefillMs < 45_000L) return
-        val engine = AiWaveEngine.sharedInstance ?: return
-        if (engine.isGeneratingWave.value) return
-
-        lastWaveRefillMs = now
-        val existingIds = snapshot.displayedItems.mapTo(HashSet()) { it.id }
-        waveRefillJob =
-            scope.launch {
-                engine.generateWaveSongs(count = 20, backgroundLabel = true).onSuccess { fresh ->
-                    val unique = fresh.filter { it.id !in existingIds }
-                    if (unique.isNotEmpty() && _queueTitle.value?.startsWith("Моя волна") == true) {
-                        addToQueue(unique, playNext = false)
-                    }
+                if (isWave && HybridStreamResolver.isCachingEnabled()) {
+                    CustomMediaCacheManager.cacheWaveTrack(nextSong, null, vibeTag = vibeTag)
                 }
             }
     }
@@ -862,7 +811,8 @@ class PlayerConnection(
             currentIndex,
             queueTitle = queueTitleNow,
             finite = queueTitleNow?.startsWith("Моя волна") != true,
-            shuffleModeEnabled = snapshot.isShuffled,
+            // displayedItems уже в актуальном порядке — повторно не перемешиваем
+            shuffleModeEnabled = false,
             startPositionMs = resumePosMs,
             startPlaying = shouldPlay,
             startVideo = _isVideoModeActive.value,
