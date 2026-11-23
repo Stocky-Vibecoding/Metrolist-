@@ -107,6 +107,8 @@ data class TrackReference(
     val fromDeezer: Boolean,
     val coverXlUrl: String? = null,
     val deezerId: String? = null,
+    val releaseYear: Int? = null,
+    val releaseDateMs: Long? = null,
 )
 
 private data class DeezerCandidate(
@@ -116,10 +118,13 @@ private data class DeezerCandidate(
     val duration: Long,
     val explicit: Boolean,
     val coverXl: String?,
+    val releaseYear: Int? = null,
+    val releaseDateMs: Long? = null,
 )
 
 class DeezerReferenceClient {
     private val cache = ConcurrentHashMap<String, TrackReference>()
+    private val releaseDateCache = ConcurrentHashMap<String, Long>()
 
     suspend fun lookup(
         artist: String,
@@ -157,6 +162,8 @@ class DeezerReferenceClient {
                     fromDeezer = true,
                     coverXlUrl = fetched.coverXl,
                     deezerId = fetched.id.takeIf { it.isNotBlank() },
+                    releaseYear = fetched.releaseYear,
+                    releaseDateMs = fetched.releaseDateMs,
                 )
             if (cache.size > 600) cache.clear()
             cache[cacheKey] = resolved
@@ -191,6 +198,8 @@ class DeezerReferenceClient {
                 fromDeezer = true,
                 coverXlUrl = best.coverXl,
                 deezerId = best.id,
+                releaseYear = best.releaseYear,
+                releaseDateMs = best.releaseDateMs,
             )
 
         return ExternalCatalogTrack(
@@ -201,8 +210,48 @@ class DeezerReferenceClient {
             durationSec = best.duration.takeIf { it > 0L },
             coverUrl = best.coverXl,
             isExplicit = best.explicit,
+            releaseYear = best.releaseYear,
+            releaseDateMs = best.releaseDateMs,
         )
     }
+
+    /** Точная дата релиза трека или альбома Deezer (кэшируется в памяти, вызывается только для проверки свежести). */
+    suspend fun fetchTrackReleaseDateMs(deezerExternalId: String): Long? =
+        withContext(Dispatchers.IO) {
+            val clean = deezerExternalId.removePrefix("dz_").trim()
+            if (clean.isBlank()) return@withContext null
+            releaseDateCache[clean]?.let { cached ->
+                return@withContext cached.takeIf { it > 0L }
+            }
+            val url =
+                if (clean.startsWith("alb_")) {
+                    "${apiBaseUrl()}/album/${clean.removePrefix("alb_")}"
+                } else {
+                    "${apiBaseUrl()}/track/$clean"
+                }
+            val parsedMs =
+                try {
+                    val resp = CustomHttp.get(url, timeoutMs = 2_500)
+                    if (!resp.isSuccess) {
+                        null
+                    } else {
+                        val root = JSONObject(resp.body)
+                        val rawDate =
+                            root
+                                .optString("release_date")
+                                .trim()
+                                .ifBlank { root.optJSONObject("album")?.optString("release_date")?.trim().orEmpty() }
+                        parseIsoReleaseDate(rawDate).second
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+            if (releaseDateCache.size > 1_000) releaseDateCache.clear()
+            releaseDateCache[clean] = parsedMs ?: -1L
+            parsedMs
+        }
 
     /** Чарт Deezer для единого блока «Чарты» на Главной. */
     suspend fun fetchChart(limit: Int = 25): List<ExternalCatalogTrack> =
@@ -224,6 +273,12 @@ class DeezerReferenceClient {
                         val cover =
                             albumObj?.optString("cover_xl")?.takeIf { it.isNotBlank() }
                                 ?: albumObj?.optString("cover_big")?.takeIf { it.isNotBlank() }
+                        val rawDate =
+                            item
+                                .optString("release_date")
+                                .trim()
+                                .ifBlank { albumObj?.optString("release_date")?.trim().orEmpty() }
+                        val (relYear, relMs) = parseIsoReleaseDate(rawDate)
                         add(
                             ExternalCatalogTrack(
                                 source = "deezer",
@@ -233,6 +288,8 @@ class DeezerReferenceClient {
                                 durationSec = item.optLong("duration", 0L).takeIf { it > 0L },
                                 coverUrl = cover,
                                 isExplicit = item.optBoolean("explicit_lyrics", false),
+                                releaseYear = relYear,
+                                releaseDateMs = relMs,
                             ),
                         )
                     }
@@ -244,7 +301,7 @@ class DeezerReferenceClient {
             }
         }
 
-    /** Свежие релизы конкретного артиста для «Радара новинок». */
+    /** Свежие релизы конкретного артиста для «Радара новинок» и свежей квоты волны. */
     suspend fun fetchArtistRecentReleases(
         artistName: String,
         maxAgeDays: Int = 60,
@@ -280,14 +337,13 @@ class DeezerReferenceClient {
 
                 val albumsResp =
                     CustomHttp.get(
-                        url = "${apiBaseUrl()}/artist/$id/albums?limit=8",
+                        url = "${apiBaseUrl()}/artist/$id/albums?limit=12",
                         timeoutMs = 5_000,
                     )
                 if (!albumsResp.isSuccess) return@withContext emptyList()
                 val albums = JSONObject(albumsResp.body).optJSONArray("data") ?: return@withContext emptyList()
 
                 val cutoffMs = System.currentTimeMillis() - maxAgeDays.toLong() * 24L * 3600L * 1_000L
-                val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
 
                 val recent = mutableListOf<Pair<Long, ExternalCatalogTrack>>()
                 for (i in 0 until albums.length()) {
@@ -296,8 +352,8 @@ class DeezerReferenceClient {
                     val title = alb.optString("title").trim()
                     val releaseStr = alb.optString("release_date").trim()
                     if (albId.isBlank() || title.isBlank() || releaseStr.length < 10) continue
-                    val releaseMs = runCatching { dateFormat.parse(releaseStr.take(10))?.time }.getOrNull() ?: continue
-                    if (releaseMs < cutoffMs) continue
+                    val (relYear, releaseMs) = parseIsoReleaseDate(releaseStr)
+                    if (releaseMs == null || releaseMs < cutoffMs) continue
                     val cover =
                         alb.optString("cover_xl").takeIf { it.isNotBlank() }
                             ?: alb.optString("cover_big").takeIf { it.isNotBlank() }
@@ -310,6 +366,8 @@ class DeezerReferenceClient {
                                 title = title,
                                 coverUrl = cover,
                                 isExplicit = alb.optBoolean("explicit_lyrics", false),
+                                releaseYear = relYear,
+                                releaseDateMs = releaseMs,
                             ),
                     )
                 }
@@ -332,7 +390,7 @@ class DeezerReferenceClient {
         try {
             val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
             val url = "${apiBaseUrl()}/search/track?q=${CustomHttp.urlEncode(query)}&limit=8"
-            val response = CustomHttp.get(url, timeoutMs = 4_000)
+            val response = CustomHttp.get(url, timeoutMs = 3_500)
             if (!response.isSuccess) {
                 null
             } else {
@@ -348,6 +406,12 @@ class DeezerReferenceClient {
                                 val cover =
                                     albumObj?.optString("cover_xl")?.takeIf { it.isNotBlank() }
                                         ?: albumObj?.optString("cover_big")?.takeIf { it.isNotBlank() }
+                                val rawDate =
+                                    item
+                                        .optString("release_date")
+                                        .trim()
+                                        .ifBlank { albumObj?.optString("release_date")?.trim().orEmpty() }
+                                val (relYear, relMs) = parseIsoReleaseDate(rawDate)
                                 add(
                                     DeezerCandidate(
                                         id = item.optString("id").trim(),
@@ -356,6 +420,8 @@ class DeezerReferenceClient {
                                         duration = item.optLong("duration", 0L),
                                         explicit = item.optBoolean("explicit_lyrics", false),
                                         coverXl = cover,
+                                        releaseYear = relYear,
+                                        releaseDateMs = relMs,
                                     ),
                                 )
                             }
@@ -397,6 +463,21 @@ class DeezerReferenceClient {
             }.maxByOrNull { (candidate, score) ->
                 score + if (candidate.explicit) 6 else 0
             }?.first
+
+    private fun parseIsoReleaseDate(raw: String?): Pair<Int?, Long?> {
+        val clean = raw?.trim().orEmpty()
+        if (clean.length < 4) return null to null
+        val year = clean.take(4).toIntOrNull()?.takeIf { it in 1900..2100 }
+        val ms =
+            if (clean.length >= 10) {
+                runCatching {
+                    SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(clean.take(10))?.time
+                }.getOrNull()
+            } else {
+                null
+            }
+        return year to ms
+    }
 
     companion object {
         private const val TAG = "DeezerRef"
