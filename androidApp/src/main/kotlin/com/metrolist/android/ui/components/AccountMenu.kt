@@ -20,7 +20,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -32,11 +36,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.metrolist.android.BuildConfig
+import com.metrolist.android.custom.CustomConfigStore
+import com.metrolist.android.custom.LastFmLoginDialog
 import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.ui.icons.MetrolistIcons
 import com.metrolist.shared.ui.icons.MetrolistIconsBrand
 import com.metrolist.shared.ui.tv.RequestTvFocus
 import com.metrolist.shared.ui.tv.tvFocusHighlight
+import org.koin.compose.koinInject
 
 @Composable
 fun AccountMenu(
@@ -49,20 +56,23 @@ fun AccountMenu(
     onNavigateToIntegrations: () -> Unit,
     onNavigateToSettings: () -> Unit,
     onLogout: () -> Unit,
-    onNavigateToLastFm: (() -> Unit)? = null,
+    @Suppress("UNUSED_PARAMETER") onNavigateToLastFm: (() -> Unit)? = null,
 ) {
+    val configStore: CustomConfigStore = koinInject()
+    val cfg by configStore.config.collectAsState()
     val initialFocusRequester = remember { FocusRequester() }
+    var showLastFmLogin by remember { mutableStateOf(false) }
     RequestTvFocus(initialFocusRequester)
 
-    val lastFmUsername = Settings.shared.lastFmUsername.trim()
+    val lastFmUsername = Settings.shared.lastFmUsername.ifBlank { cfg.lastFmUsername }.trim()
     val isLastFmConnected = Settings.shared.lastFmSession.isNotBlank() || lastFmUsername.isNotBlank()
-    val openLastFm = {
-        onClose()
-        if (onNavigateToLastFm != null) {
-            onNavigateToLastFm()
-        } else {
-            onNavigateToIntegrations()
-        }
+
+    if (showLastFmLogin) {
+        LastFmLoginDialog(
+            configStore = configStore,
+            onDismiss = { showLastFmLogin = false },
+        )
+        return
     }
 
     Dialog(onDismissRequest = onClose) {
@@ -76,7 +86,6 @@ fun AccountMenu(
                 modifier = Modifier.fillMaxWidth().padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                // Карточка профиля Last.fm
                 Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = MaterialTheme.colorScheme.surfaceContainer,
@@ -86,7 +95,7 @@ fun AccountMenu(
                             .clip(RoundedCornerShape(20.dp))
                             .focusRequester(initialFocusRequester)
                             .tvFocusHighlight(RoundedCornerShape(20.dp))
-                            .clickable(onClick = openLastFm),
+                            .clickable { showLastFmLogin = true },
                 ) {
                     Column(
                         modifier = Modifier.fillMaxWidth().padding(14.dp),
@@ -137,7 +146,7 @@ fun AccountMenu(
 
                         if (!isLastFmConnected) {
                             Button(
-                                onClick = openLastFm,
+                                onClick = { showLastFmLogin = true },
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text("Войти в Last.fm")
