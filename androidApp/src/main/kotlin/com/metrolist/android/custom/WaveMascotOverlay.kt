@@ -949,11 +949,19 @@ fun WaveHomeScreen(
 
     var mascotPhrase by remember { mutableStateOf<String?>(null) }
     var lastPhraseSongId by remember { mutableStateOf<String?>(null) }
+    var waveGenJob by remember { mutableStateOf<Job?>(null) }
+    var phraseRefreshJob by remember { mutableStateOf<Job?>(null) }
     var showWaveSettingsSheet by remember { mutableStateOf(false) }
     var showSourcePickerSheet by remember { mutableStateOf(false) }
 
     val isMascotVideoActive =
         isScreenActive && !showWaveSettingsSheet && !showSourcePickerSheet
+
+    fun currentMascotMoodLabel(): String =
+        listOfNotNull(
+            cfg.waveMood.takeIf { it != WaveMood.ANY }?.label,
+            cfg.waveEra.takeIf { it != WaveEra.ANY }?.label,
+        ).joinToString(", ").ifBlank { cfg.waveMood.label }
 
     LaunchedEffect(currentSong?.id) {
         val song = currentSong
@@ -978,8 +986,9 @@ fun WaveHomeScreen(
                     artist = artist,
                     title = song.title,
                     moodKey = cfg.waveMood.name,
-                    moodLabel = cfg.waveMood.label,
+                    moodLabel = currentMascotMoodLabel(),
                     hasGeminiKey = cfg.geminiApiKey.isNotBlank(),
+                    forceFresh = false,
                 )?.trim()?.takeIf { it.isNotBlank() }
             } catch (e: CancellationException) {
                 throw e
@@ -992,67 +1001,130 @@ fun WaveHomeScreen(
         }
     }
 
+    fun refreshMascotPhraseOnTap() {
+        val song = currentSong ?: return
+        if (isGenerating || !waveStatus.isNullOrBlank() || !isPlaying) return
+        val previousPhrase = mascotPhrase
+        val artist = song.artists.joinToString(", ") { it.name }.trim()
+        phraseRefreshJob?.cancel()
+        phraseRefreshJob =
+            scope.launch {
+                val fresh =
+                    try {
+                        phraseBank.nextPhraseForTrack(
+                            artist = artist,
+                            title = song.title,
+                            moodKey = cfg.waveMood.name,
+                            moodLabel = currentMascotMoodLabel(),
+                            hasGeminiKey = cfg.geminiApiKey.isNotBlank(),
+                            forceFresh = true,
+                        )?.trim()?.takeIf { it.isNotBlank() && it != previousPhrase }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
+                if (currentSong?.id == song.id) {
+                    mascotPhrase = fresh ?: pickFallbackMascotPhrase(cfg.waveMood, previousPhrase)
+                }
+            }
+    }
+
     fun regenerateWave() {
         val conn = playerConnection ?: return
         val excludeCurrent = setOfNotNull(currentSong?.id)
-        scope.launch {
-            aiWaveEngine
-                .generateWaveSongs(
-                    backgroundLabel = false,
-                    excludeIds = excludeCurrent,
-                ).onSuccess { fresh ->
-                    conn.playQueue(
-                        songs = fresh,
-                        queueTitle = "Моя волна",
-                        finite = false,
-                        forceStartPlaying = true,
-                    )
-                }.onFailure { err ->
-                    Toast.makeText(context, err.message ?: "Не удалось обновить волну", Toast.LENGTH_SHORT).show()
-                }
-        }
+        waveGenJob?.cancel()
+        waveGenJob =
+            scope.launch {
+                var earlyStarted = false
+                aiWaveEngine
+                    .generateWaveSongs(
+                        backgroundLabel = false,
+                        excludeIds = excludeCurrent,
+                        onEarlyBatchReady = { early ->
+                            earlyStarted = true
+                            conn.playQueue(
+                                songs = early,
+                                queueTitle = "Моя волна",
+                                finite = false,
+                                forceStartPlaying = true,
+                            )
+                        },
+                    ).onSuccess { fresh ->
+                        if (earlyStarted) {
+                            if (conn.queueTitle.value?.startsWith("Моя волна") == true) {
+                                conn.replaceUpcomingWaveQueue(fresh)
+                            }
+                        } else {
+                            conn.playQueue(
+                                songs = fresh,
+                                queueTitle = "Моя волна",
+                                finite = false,
+                                forceStartPlaying = true,
+                            )
+                        }
+                    }.onFailure { err ->
+                        if (!earlyStarted) {
+                            Toast.makeText(context, err.message ?: "Не удалось обновить волну", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+            }
     }
 
     fun resumeOrStartWave() {
         val conn = playerConnection ?: return
         val excludeCurrent = setOfNotNull(currentSong?.id)
-        val savedStarter = aiWaveEngine.buildInstantStarterSongs(excludeIds = excludeCurrent, limit = 40)
-        if (savedStarter.isEmpty()) {
+        val starter = aiWaveEngine.buildInstantStarterDetailed(excludeIds = excludeCurrent, limit = 40)
+        if (starter.songs.isEmpty()) {
             regenerateWave()
             return
         }
 
-        val unplayed =
-            savedStarter.filterNot { song ->
-                val artist = song.artists.joinToString(", ") { it.name }.trim()
-                configStore.isTrackInRecentCooldown(artist, song.title)
+        // Если это реальная сохранённая волна и в ней ещё достаточно непроигранных треков — продолжаем её
+        if (starter.isFromSavedWave) {
+            val unplayed =
+                starter.songs.filterNot { song ->
+                    val artist = song.artists.joinToString(", ") { it.name }.trim()
+                    configStore.isTrackInRecentCooldown(artist, song.title)
+                }
+            if (unplayed.size >= 4) {
+                conn.playQueue(
+                    songs = unplayed,
+                    queueTitle = "Моя волна",
+                    finite = false,
+                    forceStartPlaying = true,
+                )
+                return
             }
-
-        if (unplayed.isNotEmpty()) {
-            conn.playQueue(
-                songs = unplayed,
-                queueTitle = "Моя волна",
-                finite = false,
-                forceStartPlaying = true,
-            )
-            return
         }
 
+        // Стартуем мгновенно (офлайн-устойчивый запас), но хвост сразу тихо заменяем свежей ИИ-волной
+        val quickStarter = starter.songs.take(12)
         conn.playQueue(
-            songs = savedStarter,
+            songs = quickStarter,
             queueTitle = "Моя волна",
             finite = false,
             forceStartPlaying = true,
         )
-        scope.launch {
-            aiWaveEngine
-                .generateWaveSongs(backgroundLabel = true)
-                .onSuccess { fresh ->
-                    if (conn.queueTitle.value?.startsWith("Моя волна") == true) {
-                        conn.replaceUpcomingWaveQueue(fresh)
+        val excludeForFresh = excludeCurrent + setOfNotNull(quickStarter.firstOrNull()?.id)
+        waveGenJob?.cancel()
+        waveGenJob =
+            scope.launch {
+                aiWaveEngine
+                    .generateWaveSongs(
+                        backgroundLabel = true,
+                        excludeIds = excludeForFresh,
+                        onEarlyBatchReady = { early ->
+                            if (conn.queueTitle.value?.startsWith("Моя волна") == true) {
+                                conn.replaceUpcomingWaveQueue(early)
+                            }
+                        },
+                    ).onSuccess { fresh ->
+                        if (conn.queueTitle.value?.startsWith("Моя волна") == true) {
+                            conn.replaceUpcomingWaveQueue(fresh)
+                        }
                     }
-                }
-        }
+            }
     }
 
     fun startOrToggleWave() {
@@ -1208,11 +1280,7 @@ fun WaveHomeScreen(
                             showMascot = cfg.mascotEnabled,
                             isStageVisible = isMascotVideoActive,
                             speechBubbleText = activeBubbleText,
-                            onSpeechBubbleClick = {
-                                if (!isGenerating && waveStatus.isNullOrBlank() && isPlaying) {
-                                    mascotPhrase = pickFallbackMascotPhrase(cfg.waveMood, mascotPhrase)
-                                }
-                            },
+                            onSpeechBubbleClick = ::refreshMascotPhraseOnTap,
                             stageSize = 280.dp,
                             onClick = ::startOrToggleWave,
                         )
@@ -1239,11 +1307,7 @@ fun WaveHomeScreen(
                         showMascot = cfg.mascotEnabled,
                         isStageVisible = isMascotVideoActive,
                         speechBubbleText = activeBubbleText,
-                        onSpeechBubbleClick = {
-                            if (!isGenerating && waveStatus.isNullOrBlank() && isPlaying) {
-                                mascotPhrase = pickFallbackMascotPhrase(cfg.waveMood, mascotPhrase)
-                            }
-                        },
+                        onSpeechBubbleClick = ::refreshMascotPhraseOnTap,
                         stageSize = 290.dp,
                         onClick = ::startOrToggleWave,
                     )
@@ -2284,6 +2348,19 @@ private fun WaveFilterSheetContent(
             config.waveLanguage != WaveLanguage.ANY ||
             config.waveMood != WaveMood.ANY
 
+    val eraHint =
+        when (config.waveEra) {
+            WaveEra.ANY ->
+                if (config.waveLanguage == WaveLanguage.ANY) {
+                    "Баланс 50/50 РУ и зарубежка (из них по 25% — свежее до 1 года)"
+                } else {
+                    "50% свежих релизов (до 1 года) + 50% любых годов"
+                }
+            WaveEra.FRESH -> "Строго релизы не старше 1 года с проверкой даты выхода"
+            WaveEra.MODERN -> "Релизы последних 2 лет с отсевом старых хитов"
+            else -> null
+        }
+
     Column(
         modifier =
             Modifier
@@ -2318,6 +2395,13 @@ private fun WaveFilterSheetContent(
                     label = { Text(item.label, maxLines = 1) },
                 )
             }
+        }
+        if (!eraHint.isNullOrBlank()) {
+            Text(
+                text = eraHint,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         FilterGroupTitle("Язык")
