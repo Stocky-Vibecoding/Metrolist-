@@ -4425,7 +4425,7 @@ private fun removeVideoSurface(
         is Surface -> player.clearVideoSurface(surface)
         is SurfaceHolder -> player.clearVideoSurfaceHolder(surface)
         is SurfaceView -> player.clearVideoSurfaceView(surface)
-        is TextureView -> player.clearVideoSurfaceView(surface)
+        is TextureView -> player.clearVideoTextureView(surface)
         else -> player.clearVideoSurface()
     }
 }
