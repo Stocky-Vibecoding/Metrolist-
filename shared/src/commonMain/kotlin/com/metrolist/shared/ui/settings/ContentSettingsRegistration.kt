@@ -108,30 +108,6 @@ internal fun SettingsUiRegistryBuilder.registerContentSettings(host: SharedSetti
         }
         group("filtering", stringResource(Res.string.content_filters_filtering)) {
             switch(
-                id = "hideExplicit",
-                title = stringResource(Res.string.hide_explicit),
-                description = stringResource(Res.string.hide_explicit_desc),
-                checked = settings.hideExplicit,
-                enabled = !settings.explicitOnly,
-            ) {
-                settings.hideExplicit = it
-                if (it) settings.explicitOnly = false
-                BlockedContent.contentFiltersChanged()
-                host.onSettingChanged(SettingsChangeEffect.CONTENT, null)
-            }
-            switch(
-                id = "explicitOnly",
-                title = stringResource(Res.string.explicit_only),
-                description = stringResource(Res.string.explicit_only_desc),
-                checked = settings.explicitOnly,
-                enabled = !settings.hideExplicit,
-            ) {
-                settings.explicitOnly = it
-                if (it) settings.hideExplicit = false
-                BlockedContent.contentFiltersChanged()
-                host.onSettingChanged(SettingsChangeEffect.CONTENT, null)
-            }
-            switch(
                 id = "blockAiArtists",
                 title = stringResource(Res.string.block_ai_slop_artists),
                 description = blocklistDescription,
@@ -243,25 +219,11 @@ internal fun SettingsUiRegistryBuilder.registerContentSettings(host: SharedSetti
                 settings.showLikedPlaylist = it
             }
             switch(
-                "showDownloaded",
-                stringResource(Res.string.appearance_show_downloaded_playlist),
-                checked = settings.showDownloadedPlaylist,
-            ) {
-                settings.showDownloadedPlaylist = it
-            }
-            switch(
                 "showTop",
                 stringResource(Res.string.appearance_show_top_playlist),
                 checked = settings.showTopPlaylist,
             ) {
                 settings.showTopPlaylist = it
-            }
-            switch(
-                "showUploaded",
-                stringResource(Res.string.appearance_show_uploaded_playlist),
-                checked = settings.showUploadedPlaylist,
-            ) {
-                settings.showUploadedPlaylist = it
             }
             switch(
                 "showCached",
