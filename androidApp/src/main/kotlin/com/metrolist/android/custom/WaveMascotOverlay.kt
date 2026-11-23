@@ -163,8 +163,6 @@ private const val VK_SILENT_OAUTH_URL =
 private const val YANDEX_OAUTH_URL =
     "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d"
 private const val GEMINI_AI_STUDIO_URL = "https://aistudio.google.com/apikey"
-private const val LASTFM_API_CREATE_URL = "https://www.last.fm/api/account/create"
-private const val LASTFM_HOME_URL = "https://www.last.fm/"
 
 private const val FALLBACK_MOBILE_CHROME_UA =
     "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
@@ -527,6 +525,7 @@ private fun ServiceOAuthWebViewDialog(
                                         val u = request?.url?.toString() ?: return false
                                         if (checkUrl(u)) return true
                                         val scheme = request.url?.scheme?.lowercase().orEmpty()
+                                        // Не даём ВК перекинуть авторизацию в стороннее приложение через vk:// или intent://
                                         if (scheme != "http" && scheme != "https") {
                                             return true
                                         }
@@ -892,6 +891,7 @@ fun WaveHomeScreen(
                         playerConnection?.skipToPrevious()
                     },
                     onNextClick = {
+                        // Быстрый скип (<28с) и авторазворот волны централизованно считаются в MusicService
                         playerConnection?.skipToNext()
                     },
                     onOpenFullPlayer = onExpandPlayer,
@@ -1050,6 +1050,10 @@ fun WaveHomeScreen(
                 yandexProvider = yandexProvider,
                 vkProvider = vkProvider,
                 geminiClient = geminiClient,
+                onRefreshWave = {
+                    showEngineSettingsSheet = false
+                    launchFreshWave()
+                },
             )
         }
     }
@@ -2272,6 +2276,17 @@ fun CustomEngineSettingsContent(
             fontWeight = FontWeight.SemiBold,
         )
 
+        if (onRefreshWave != null) {
+            Button(
+                onClick = onRefreshWave,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(MetrolistIcons.Outlined.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Обновить волну сейчас", fontWeight = FontWeight.SemiBold)
+            }
+        }
+
         SettingSwitchRow(
             title = "Гибридный резолвер (Deezer / Яндекс / VK / YTM)",
             checked = cfg.hybridResolverEnabled,
@@ -2402,38 +2417,6 @@ fun CustomEngineSettingsContent(
         }
 
         FilterGroupTitle("Last.fm (необязательно — резерв и скробблинг)")
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            OutlinedButton(
-                onClick = {
-                    val cleanUser = lfmUserInput.trim()
-                    val url = if (cleanUser.isNotBlank()) "https://www.last.fm/user/${Uri.encode(cleanUser)}" else LASTFM_HOME_URL
-                    runCatching {
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                        )
-                    }.onFailure {
-                        Toast.makeText(context, "Не удалось открыть браузер", Toast.LENGTH_SHORT).show()
-                    }
-                },
-            ) {
-                Text(if (lfmUserInput.isNotBlank()) "Профиль Last.fm" else "Открыть Last.fm")
-            }
-            OutlinedButton(
-                onClick = {
-                    runCatching {
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse(LASTFM_API_CREATE_URL))
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                        )
-                    }.onFailure {
-                        Toast.makeText(context, "Не удалось открыть браузер", Toast.LENGTH_SHORT).show()
-                    }
-                },
-            ) {
-                Text("Создать API-ключ")
-            }
-        }
         OutlinedTextField(
             value = lfmKeyInput,
             onValueChange = { lfmKeyInput = it },
