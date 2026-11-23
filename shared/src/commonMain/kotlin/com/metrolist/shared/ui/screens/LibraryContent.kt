@@ -223,7 +223,6 @@ fun rememberLibrarySearchScrollState(
 internal class LibraryReorderScrollConnection(
     private val isDragging: () -> Boolean,
 ) : NestedScrollConnection {
-    // Auto-scroll at the grid edge must not pull the enclosing refresh indicator.
     override fun onPostScroll(
         consumed: Offset,
         available: Offset,
@@ -323,7 +322,6 @@ fun LibraryContent(
     val cachedItems = remember(presentation, presentationInput) { presentation.cached(presentationInput) }
     val preparedItems by produceState(cachedItems, presentation, presentationInput, rootActive, isLoading) {
         if (!rootActive || (isLoading && items.isEmpty())) return@produceState
-
         value = presentation.prepare(presentationInput)
     }
     LaunchedEffect(effectiveSortType, sortDirection) {
@@ -359,6 +357,7 @@ fun LibraryContent(
                 autoPlaylists.filterNot {
                     it.type.equals("downloaded", ignoreCase = true) ||
                         it.type.equals("downloads", ignoreCase = true) ||
+                        it.type.equals("uploaded", ignoreCase = true) ||
                         (Settings.shared.hidePodcasts && it.type in setOf("podcasts", "SE")) ||
                         HiddenLibraryItemKey(HiddenLibraryItemType.AUTO, it.type) in hiddenItemKeys
                 }
@@ -392,7 +391,7 @@ fun LibraryContent(
                 .distinctBy { it.id }
                 .sortedByDescending { it.libraryAddedAt ?: 0L }
         }
-    val gridAutoPlaylists =
+    val secondaryAutoPlaylists =
         remember(searchedAutoPlaylists, likedHeroPlaylist) {
             if (likedHeroPlaylist != null) {
                 searchedAutoPlaylists.filterNot { it.type == likedHeroPlaylist.type }
@@ -400,8 +399,6 @@ fun LibraryContent(
                 searchedAutoPlaylists
             }
         }
-    val showCompactAutoPlaylistRow =
-        likedHeroPlaylist != null && isGridView && gridAutoPlaylists.isNotEmpty()
 
     val toggleSearch = {
         if (isSearchOpen) onSearchQueryChange?.invoke("")
@@ -547,63 +544,30 @@ fun LibraryContent(
                             }
                         }
                     }
-                    if (showCompactAutoPlaylistRow) {
-                        item(key = "library_auto_playlists_compact", contentType = "auto_playlist_row", span = { GridItemSpan(maxLineSpan) }) {
-                            Column(
-                                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
-                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                    // Все автоплейлисты (Мой топ, Кэшированные и др.) в едином стиле полноширинных карточек
+                    items(
+                        count = secondaryAutoPlaylists.size,
+                        key = { "auto_${secondaryAutoPlaylists[it].type}" },
+                        contentType = { "auto_playlist_wide" },
+                        span = { GridItemSpan(maxLineSpan) },
+                    ) { index ->
+                        val playlist = secondaryAutoPlaylists[index]
+                        Box(Modifier.animateItem()) {
+                            itemContainer(
+                                HiddenLibraryItem(
+                                    HiddenLibraryItemType.AUTO,
+                                    playlist.type,
+                                    playlist.title,
+                                    subtitle = playlist.subtitle,
+                                ),
+                                null,
+                                false,
+                                { onAutoPlaylistClick(playlist.type) },
                             ) {
-                                gridAutoPlaylists.chunked(4).forEach { rowPlaylists ->
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                    ) {
-                                        rowPlaylists.forEach { playlist ->
-                                            Box(modifier = Modifier.weight(1f)) {
-                                                itemContainer(
-                                                    HiddenLibraryItem(
-                                                        HiddenLibraryItemType.AUTO,
-                                                        playlist.type,
-                                                        playlist.title,
-                                                        subtitle = playlist.subtitle,
-                                                    ),
-                                                    null,
-                                                    true,
-                                                    { onAutoPlaylistClick(playlist.type) },
-                                                ) {
-                                                    AutoPlaylistItem(playlist, isGridView = true)
-                                                }
-                                            }
-                                        }
-                                        repeat(4 - rowPlaylists.size) {
-                                            Spacer(modifier = Modifier.weight(1f))
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        items(
-                            count = gridAutoPlaylists.size,
-                            key = { "auto_${gridAutoPlaylists[it].type}" },
-                            contentType = { "auto_playlist" },
-                            span = { GridItemSpan(if (isGridView) 1 else maxLineSpan) },
-                        ) { index ->
-                            val playlist = gridAutoPlaylists[index]
-                            Box(Modifier.animateItem()) {
-                                itemContainer(
-                                    HiddenLibraryItem(
-                                        HiddenLibraryItemType.AUTO,
-                                        playlist.type,
-                                        playlist.title,
-                                        subtitle = playlist.subtitle,
-                                    ),
-                                    null,
-                                    isGridView,
-                                    { onAutoPlaylistClick(playlist.type) },
-                                ) {
-                                    AutoPlaylistItem(playlist, isGridView)
-                                }
+                                UnifiedAutoPlaylistCard(
+                                    playlist = playlist,
+                                    onClick = { onAutoPlaylistClick(playlist.type) },
+                                )
                             }
                         }
                     }
@@ -695,6 +659,80 @@ fun LibraryContent(
 }
 
 @Composable
+private fun UnifiedAutoPlaylistCard(
+    playlist: LibraryAutoPlaylist,
+    onClick: () -> Unit,
+) {
+    val gradientColors =
+        when (playlist.type.lowercase()) {
+            "top100" -> listOf(Color(0xFF4ADE80), Color(0xFF16A34A))
+            "cached" -> listOf(Color(0xFF60A5FA), Color(0xFF4F46E5))
+            "podcasts", "se" -> listOf(Color(0xFFC084FC), Color(0xFF7E22CE))
+            else -> listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.tertiary)
+        }
+
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Box(
+                modifier =
+                    Modifier
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Brush.linearGradient(colors = gradientColors)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = playlist.icon,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(26.dp),
+                )
+            }
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = playlist.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (playlist.subtitle.isNotBlank()) {
+                    Text(
+                        text = playlist.subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+
+            playlist.badge?.let { badge ->
+                AutoPlaylistBadge(badge, Modifier)
+            }
+
+            Icon(
+                imageVector = MetrolistIcons.Outlined.KeyboardArrowDown,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp).rotate(-90f),
+            )
+        }
+    }
+}
+
+@Composable
 private fun LikedHeroSection(
     playlist: LibraryAutoPlaylist,
     songs: List<SongItem>,
@@ -714,7 +752,7 @@ private fun LikedHeroSection(
     Surface(
         shape = RoundedCornerShape(24.dp),
         color = MaterialTheme.colorScheme.surfaceContainerLow,
-        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 6.dp),
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 2.dp),
     ) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
@@ -974,7 +1012,6 @@ private fun LibraryHeader(
             contentPadding = PaddingValues(horizontal = 2.dp),
         )
         Row(
-            // LazyVerticalGrid supplies unbounded height, which can inflate expressive buttons under release optimizations.
             Modifier.fillMaxWidth().height(SplitButtonDefaults.MediumContainerHeight),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1183,36 +1220,6 @@ private fun LibrarySortType.isAvailableFor(filter: LibraryFilter?): Boolean =
             true
         }
     }
-
-@Composable
-private fun AutoPlaylistItem(
-    playlist: LibraryAutoPlaylist,
-    isGridView: Boolean,
-) {
-    if (isGridView) {
-        Box(Modifier.fillMaxWidth()) {
-            GridCard(
-                cover = libraryCover(playlist.type).takeIf { Settings.shared.collectionCovers[playlist.type] == null },
-                title = playlist.title,
-                subtitle = playlist.subtitle,
-                thumbnail = Settings.shared.collectionCovers[playlist.type],
-                icon = playlist.icon,
-            )
-            playlist.badge?.let { AutoPlaylistBadge(it, Modifier.align(Alignment.TopEnd).padding(8.dp)) }
-        }
-    } else {
-        Box(Modifier.fillMaxWidth()) {
-            ListCard(
-                cover = libraryCover(playlist.type).takeIf { Settings.shared.collectionCovers[playlist.type] == null },
-                title = playlist.title,
-                subtitle = playlist.subtitle,
-                thumbnail = Settings.shared.collectionCovers[playlist.type],
-                icon = playlist.icon,
-            )
-            playlist.badge?.let { AutoPlaylistBadge(it, Modifier.align(Alignment.CenterEnd).padding(end = 8.dp)) }
-        }
-    }
-}
 
 @Composable
 private fun AutoPlaylistBadge(
