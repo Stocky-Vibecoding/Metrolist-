@@ -1408,7 +1408,7 @@ class HybridStreamResolver(
             val cachedCover = diskBinding?.hdCoverUrl
 
             val deezerDeferred =
-                if (!cachedCover.isNullOrBlank() && diskBinding?.durationSec != null) {
+                if (!cachedCover.isNullOrBlank() && !diskBinding?.deezerId.isNullOrBlank()) {
                     null
                 } else {
                     resolverScope.async {
@@ -1448,7 +1448,13 @@ class HybridStreamResolver(
                     val coverNow =
                         cachedCover
                             ?: if (deezerDeferred?.isCompleted == true) {
-                                runCatching { deezerDeferred.getCompleted()?.coverXlUrl }.getOrNull()
+                                try {
+                                    deezerDeferred.await()?.coverXlUrl
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                    null
+                                }
                             } else {
                                 null
                             }
@@ -1796,11 +1802,18 @@ class HybridStreamResolver(
                         LocalCensorshipAdvisor.isLikelyCensoredOnYandex(artist, title)
                 )
 
-        // Используем дисковую привязку или неблокирующий фолбэк, чтобы Deezer не тормозил старт трека
+        // Пропускаем блокирующий Deezer, только если реальный эталон Deezer уже кэширован или проверка цензуры не требуется
         val hasWarmBinding =
             diskBinding != null &&
                 diskBinding.durationSec != null &&
-                (!diskBinding.deezerId.isNullOrBlank() || !diskBinding.hdCoverUrl.isNullOrBlank())
+                !diskBinding.deezerId.isNullOrBlank()
+        val hasKnownDuration = (song.duration ?: diskBinding?.durationSec)?.let { it > 0L } == true
+        val needCensorshipDeezerCheck =
+            manualPref == TrackSourcePreference.AUTO &&
+                isRuTrack &&
+                cfg.preferVkForExplicit &&
+                cfg.vkToken.isNotBlank() &&
+                !alreadyKnownCensored
 
         val fallbackRef =
             TrackReference(
@@ -1817,7 +1830,8 @@ class HybridStreamResolver(
             prefetchedReference != null ||
                 hasWarmBinding ||
                 isManualCustom ||
-                (alreadyKnownCensored && (videoId.startsWith("vk_") || !diskBinding?.vkAudioKey.isNullOrBlank()))
+                (alreadyKnownCensored && hasKnownDuration) ||
+                (!needCensorshipDeezerCheck && hasKnownDuration)
 
         val reference: TrackReference =
             when {
