@@ -59,6 +59,11 @@ private data class ResolvedWaveCandidate(
     val knownStale: Boolean,
 )
 
+private data class LiveFreshPoolResult(
+    val suggestions: List<AiTrackSuggestion>,
+    val releaseDatesByKey: Map<String, Pair<Int?, Long?>>,
+)
+
 class AiWaveEngine(
     private val configStore: CustomConfigStore,
     private val geminiClient: GeminiClient,
@@ -261,9 +266,10 @@ class AiWaveEngine(
 
     /**
      * Быстрая адаптивная генерация волны:
-     * - Запускает плеер через `onEarlyBatchReady` сразу после готовности первых 3–4 треков (~3–5 с);
-     * - Добирает хвост параллельно в фоне и соблюдает баланс 50/50 (РУ/зарубежка) + квоту свежести (<= 1 года);
-     * - Резерв Last.fm при 429 / отсутствии ключа и офлайн-фолбэк из 4 ГБ кэша.
+     * - Запускает плеер через `onEarlyBatchReady` сразу после готовности первых 3–4 треков;
+     * - Эпоха «Свежее» — до 1 года с кросс-проверкой дат в Яндексе и Deezer + живой пул каталога;
+     * - Эпоха «Современное» — до 5 лет с проверкой и отсевом старых хитов;
+     * - Эпоха «Любая» — 50/50 (РУ/зарубежка), из которых 25% РУ + 25% зарубежка не старше 2 лет.
      */
     suspend fun generateWaveSongs(
         seedSong: SongItem? = null,
@@ -287,18 +293,41 @@ class AiWaveEngine(
                 val cfg = configStore.current
                 val profile = collectStructuredTasteProfile(cfg)
                 val targetCount = count.coerceIn(MIN_WAVE_BATCH_SIZE, MAX_WAVE_BATCH_SIZE)
-                val wantsStrictFresh = seedSong == null && cfg.waveEra == WaveEra.FRESH
-                val wantsStrictModern = seedSong == null && cfg.waveEra == WaveEra.MODERN
-                val wantsFreshQuota = seedSong == null && cfg.waveEra == WaveEra.ANY
+                val effectiveEra = if (seedSong == null) cfg.waveEra else WaveEra.ANY
+                val wantsStrictFresh = effectiveEra == WaveEra.FRESH
+                val wantsStrictModern = effectiveEra == WaveEra.MODERN
+                val wantsFreshQuota = effectiveEra == WaveEra.ANY
                 val includeFreshTag = wantsStrictFresh || wantsFreshQuota
+
+                val maxAgeDaysForFresh =
+                    when (effectiveEra) {
+                        WaveEra.FRESH -> FRESH_MAX_AGE_DAYS
+                        WaveEra.MODERN -> MODERN_MAX_AGE_DAYS
+                        else -> ANY_FRESH_QUOTA_MAX_AGE_DAYS
+                    }
 
                 // Берём запас на строгий отсев старья, дизлайков и кулдауна
                 val requestCount =
-                    when {
-                        wantsStrictFresh -> (targetCount + 8).coerceAtMost(24)
-                        wantsStrictModern -> (targetCount + 6).coerceAtMost(22)
-                        wantsFreshQuota -> (targetCount + 6).coerceAtMost(22)
+                    when (effectiveEra) {
+                        WaveEra.FRESH -> (targetCount + 10).coerceAtMost(26)
+                        WaveEra.MODERN -> (targetCount + 6).coerceAtMost(22)
+                        WaveEra.ANY -> (targetCount + 6).coerceAtMost(22)
                         else -> (targetCount + 4).coerceAtMost(20)
+                    }
+
+                // В режиме «Свежее» сначала за <=1.5с берём живой пул свежих релизов (кэш/каталог),
+                // чтобы подсказать их Gemini (обходя срез знаний модели) и иметь проверенный запас.
+                val preloadedFreshPool: LiveFreshPoolResult? =
+                    if (wantsStrictFresh) {
+                        collectRealFreshPool(
+                            cfg = cfg,
+                            seedSong = seedSong,
+                            maxAgeDays = FRESH_MAX_AGE_DAYS,
+                            maxCount = 16,
+                            timeoutMs = 1_500L,
+                        )
+                    } else {
+                        null
                     }
 
                 val prompt =
@@ -307,9 +336,10 @@ class AiWaveEngine(
                         seedSong = seedSong,
                         profile = profile,
                         pivotVibe = pivotVibe,
+                        liveFreshHints = preloadedFreshPool?.suggestions.orEmpty().take(14),
                     )
 
-                val (geminiResult, realFreshPool) =
+                val (geminiResult, liveFreshResult) =
                     coroutineScope {
                         val geminiTask =
                             async {
@@ -325,20 +355,24 @@ class AiWaveEngine(
                             }
                         val freshPoolTask =
                             async(Dispatchers.IO) {
-                                collectRealFreshArtistSuggestions(
-                                    cfg = cfg,
-                                    seedSong = seedSong,
-                                    maxCount = if (wantsStrictFresh) 5 else 3,
-                                )
+                                preloadedFreshPool
+                                    ?: collectRealFreshPool(
+                                        cfg = cfg,
+                                        seedSong = seedSong,
+                                        maxAgeDays = maxAgeDaysForFresh,
+                                        maxCount = if (wantsFreshQuota) 5 else 3,
+                                        timeoutMs = 2_000L,
+                                    )
                             }
                         geminiTask.await() to freshPoolTask.await()
                     }
 
-                val maxAgeDaysForFresh =
-                    when {
-                        wantsStrictFresh -> FRESH_MAX_AGE_DAYS
-                        wantsStrictModern -> MODERN_MAX_AGE_DAYS
-                        else -> FRESH_MAX_AGE_DAYS
+                val knownReleaseDates = liveFreshResult.releaseDatesByKey
+                val directMixFreshPool =
+                    if (cfg.waveMood == WaveMood.ANY && cfg.waveCharacter != WaveCharacter.DISCOVERY) {
+                        liveFreshResult.suggestions.take(if (wantsStrictFresh) 7 else 3)
+                    } else {
+                        emptyList()
                     }
 
                 var earlyEmittedSongs: List<SongItem> = emptyList()
@@ -349,7 +383,7 @@ class AiWaveEngine(
                             val mergedSuggestions =
                                 mergeSuggestionsWithFreshPool(
                                     geminiList = rawSuggestions,
-                                    realFreshPool = realFreshPool,
+                                    realFreshPool = directMixFreshPool,
                                     forceAllFresh = wantsStrictFresh,
                                 )
                             val filtered = filterSuggestionsByFeedback(mergedSuggestions, respectPlayedCooldown = true)
@@ -360,8 +394,9 @@ class AiWaveEngine(
                                     resolveWaveCandidates(
                                         suggestions = starterBatch,
                                         maxResults = EARLY_STARTER_COUNT + 2,
-                                        strictEra = if (seedSong == null) cfg.waveEra else WaveEra.ANY,
+                                        strictEra = effectiveEra,
                                         maxAgeDays = maxAgeDaysForFresh,
+                                        knownReleaseDates = knownReleaseDates,
                                     ).filter { it.song.id !in excludeIds }
                                         .filter { isCandidateFeedbackClean(it.song, respectPlayedCooldown = true) }
 
@@ -369,7 +404,7 @@ class AiWaveEngine(
                                     selectEarlyStarterSongs(
                                         candidates = starterResolved,
                                         cfg = cfg,
-                                        strictEra = if (seedSong == null) cfg.waveEra else WaveEra.ANY,
+                                        strictEra = effectiveEra,
                                         limit = EARLY_STARTER_COUNT,
                                     ).map(::withFallbackCover)
 
@@ -391,8 +426,9 @@ class AiWaveEngine(
                                         resolveWaveCandidates(
                                             suggestions = tailBatch,
                                             maxResults = (targetCount - earlyEmittedSongs.size + 4).coerceAtLeast(6),
-                                            strictEra = if (seedSong == null) cfg.waveEra else WaveEra.ANY,
+                                            strictEra = effectiveEra,
                                             maxAgeDays = maxAgeDaysForFresh,
+                                            knownReleaseDates = knownReleaseDates,
                                         ).filter { it.song.id !in excludeIds && it.song.id !in earlyIds }
                                             .filter { cand ->
                                                 val art = cand.song.artists.joinToString(", ") { it.name }.trim()
@@ -411,7 +447,7 @@ class AiWaveEngine(
                                     diversifyWaveCandidates(
                                         candidates = allTailCandidates,
                                         cfg = cfg,
-                                        strictEra = if (seedSong == null) cfg.waveEra else WaveEra.ANY,
+                                        strictEra = effectiveEra,
                                         previousArtistKey = earlyEmittedSongs.lastOrNull()?.primaryArtistKey(),
                                     ).map(::withFallbackCover)
 
@@ -423,22 +459,42 @@ class AiWaveEngine(
                                     resolveWaveCandidates(
                                         suggestions = filtered,
                                         maxResults = targetCount + 2,
-                                        strictEra = if (seedSong == null) cfg.waveEra else WaveEra.ANY,
+                                        strictEra = effectiveEra,
                                         maxAgeDays = maxAgeDaysForFresh,
+                                        knownReleaseDates = knownReleaseDates,
                                     ).filter { it.song.id !in excludeIds }
                                         .filter { isCandidateFeedbackClean(it.song, respectPlayedCooldown = true) }
 
                                 diversifyWaveCandidates(
                                     candidates = resolved,
                                     cfg = cfg,
-                                    strictEra = if (seedSong == null) cfg.waveEra else WaveEra.ANY,
+                                    strictEra = effectiveEra,
                                 ).map(::withFallbackCover)
                                     .take(targetCount)
                             }
                         },
                         onFailure = { err ->
-                            Log.w(TAG, "Gemini wave generation failed (${err.message}), trying Last.fm fallback")
-                            emptyList()
+                            Log.w(TAG, "Gemini wave generation failed (${err.message}), trying fallback")
+                            // Если Gemini упал (429/сеть), но в «Свежем» уже есть живой пул каталога — пробуем его
+                            if (wantsStrictFresh && liveFreshResult.suggestions.isNotEmpty()) {
+                                val freshFallback =
+                                    resolveWaveCandidates(
+                                        suggestions = filterSuggestionsByFeedback(liveFreshResult.suggestions, respectPlayedCooldown = true),
+                                        maxResults = targetCount,
+                                        strictEra = WaveEra.FRESH,
+                                        maxAgeDays = FRESH_MAX_AGE_DAYS,
+                                        knownReleaseDates = knownReleaseDates,
+                                    ).filter { it.song.id !in excludeIds }
+                                        .filter { isCandidateFeedbackClean(it.song, respectPlayedCooldown = true) }
+                                diversifyWaveCandidates(
+                                    candidates = freshFallback,
+                                    cfg = cfg,
+                                    strictEra = WaveEra.FRESH,
+                                ).map(::withFallbackCover)
+                                    .take(targetCount)
+                            } else {
+                                emptyList()
+                            }
                         },
                     )
 
@@ -598,26 +654,40 @@ class AiWaveEngine(
         )
     }
 
-    /** Реальные свежие релизы любимых артистов пользователя за последние 365 дней. */
-    private suspend fun collectRealFreshArtistSuggestions(
+    /** Собирает реальные свежие релизы из каталогов (Премьера, Новинки, Радар артистов, свежие чарты). */
+    private suspend fun collectRealFreshPool(
         cfg: CustomAppConfig,
         seedSong: SongItem?,
+        maxAgeDays: Int,
         maxCount: Int,
-    ): List<AiTrackSuggestion> {
-        if (seedSong != null || maxCount <= 0) return emptyList()
-        if (cfg.waveCharacter == WaveCharacter.DISCOVERY) return emptyList()
-        if (cfg.waveMood != WaveMood.ANY) return emptyList()
-        if (cfg.waveEra !in setOf(WaveEra.ANY, WaveEra.FRESH, WaveEra.MODERN)) return emptyList()
-        if (cfg.waveLanguage == WaveLanguage.INSTRUMENTAL) return emptyList()
+        timeoutMs: Long,
+    ): LiveFreshPoolResult {
+        if (seedSong != null || maxCount <= 0) {
+            return LiveFreshPoolResult(emptyList(), emptyMap())
+        }
+        if (cfg.waveEra !in setOf(WaveEra.ANY, WaveEra.FRESH, WaveEra.MODERN)) {
+            return LiveFreshPoolResult(emptyList(), emptyMap())
+        }
+        if (cfg.waveLanguage == WaveLanguage.INSTRUMENTAL) {
+            return LiveFreshPoolResult(emptyList(), emptyMap())
+        }
 
         val raw =
             try {
-                withTimeoutOrNull(2_000L) {
-                    CustomCatalogProvider.getCachedFreshArtistReleases(
-                        configStore = configStore,
-                        maxAgeDays = FRESH_MAX_AGE_DAYS,
-                        limit = 20,
-                    )
+                withTimeoutOrNull(timeoutMs) {
+                    if (cfg.waveEra == WaveEra.FRESH) {
+                        CustomCatalogProvider.getLiveFreshCatalogPool(
+                            configStore = configStore,
+                            maxAgeDays = maxAgeDays,
+                            limit = 42,
+                        )
+                    } else {
+                        CustomCatalogProvider.getCachedFreshArtistReleases(
+                            configStore = configStore,
+                            maxAgeDays = maxAgeDays,
+                            limit = 20,
+                        )
+                    }
                 }.orEmpty()
             } catch (e: CancellationException) {
                 throw e
@@ -625,7 +695,7 @@ class AiWaveEngine(
                 emptyList()
             }
 
-        if (raw.isEmpty()) return emptyList()
+        if (raw.isEmpty()) return LiveFreshPoolResult(emptyList(), emptyMap())
 
         val langFiltered =
             raw.filter { track ->
@@ -637,11 +707,27 @@ class AiWaveEngine(
                 }
             }
 
-        return langFiltered
-            .shuffled()
-            .map { AiTrackSuggestion(artist = it.artist, title = it.title, isFreshSlot = true) }
-            .let { filterSuggestionsByFeedback(it, respectSessionSkips = true, respectPlayedCooldown = true) }
-            .take(maxCount)
+        val dateMap = HashMap<String, Pair<Int?, Long?>>(langFiltered.size)
+        langFiltered.forEach { t ->
+            if (t.releaseYear != null || t.releaseDateMs != null) {
+                val key = CustomConfigStore.buildTrackKey(t.artist, t.title)
+                if (key.isNotBlank()) {
+                    dateMap[key] = t.releaseYear to t.releaseDateMs
+                }
+            }
+        }
+
+        val suggestions =
+            langFiltered
+                .shuffled()
+                .map { AiTrackSuggestion(artist = it.artist, title = it.title, isFreshSlot = true) }
+                .let { filterSuggestionsByFeedback(it, respectSessionSkips = true, respectPlayedCooldown = true) }
+                .take(maxCount)
+
+        return LiveFreshPoolResult(
+            suggestions = suggestions,
+            releaseDatesByKey = dateMap,
+        )
     }
 
     private fun mergeSuggestionsWithFreshPool(
@@ -659,10 +745,10 @@ class AiWaveEngine(
             }
         }
 
-        // Чередуем 1–2 гарантированно свежих релиза любимых артистов ближе к началу списка
+        // Чередуем гарантированно свежие релизы ближе к началу списка
         var freshIdx = 0
         geminiList.forEachIndexed { idx, item ->
-            if (freshIdx < realFreshPool.size && (idx == 1 || idx == 5 || idx == 9)) {
+            if (freshIdx < realFreshPool.size && idx % 3 == 1) {
                 addItem(realFreshPool[freshIdx++])
             }
             addItem(item)
@@ -914,15 +1000,20 @@ class AiWaveEngine(
         val nonStale = candidates.filterNot { it.knownStale }
         val verified = nonStale.filter { it.verifiedFresh }
         val unknown = nonStale.filterNot { it.verifiedFresh }
-        // Сначала ставим треки с подтверждённой датой релиза, при нехватке мягко добираем без даты (но никогда старьё)
-        val combined = verified + unknown
+        // В «Свежем» если есть достаточно проверенных новинок — держим их, при нехватке мягко добираем без даты
+        val combined =
+            if (strictEra == WaveEra.FRESH && verified.size >= 6) {
+                verified
+            } else {
+                verified + unknown
+            }
         return if (combined.isNotEmpty()) combined else candidates
     }
 
     /**
      * Разнообразит очередь с учётом:
      * - Баланса ~50/50 РУ / зарубежка при `WaveLanguage.ANY`;
-     * - Квот свежести (25% свежего РУ + 25% свежей зарубежки при `WaveEra.ANY`, 100% при `FRESH`/`MODERN`);
+     * - Квот свежести (25% РУ до 2 лет + 25% зарубежка до 2 лет при `WaveEra.ANY`, 100% до 1 года при `FRESH`, до 5 лет при `MODERN`);
      * - Ограничения на повторы одного артиста подряд и максимум 2 трека артиста в окне из 8.
      */
     private fun diversifyWaveCandidates(
@@ -1123,12 +1214,14 @@ class AiWaveEngine(
         seedSong: SongItem?,
         profile: StructuredTasteProfile,
         pivotVibe: Boolean,
+        liveFreshHints: List<AiTrackSuggestion> = emptyList(),
     ): String {
         val nowMs = System.currentTimeMillis()
         val fmt = SimpleDateFormat("yyyy-MM", Locale.US)
         val todayStr = fmt.format(Date(nowMs))
         val oneYearAgoStr = fmt.format(Date(nowMs - FRESH_MAX_AGE_DAYS * DAY_MS))
-        val twoYearsAgoStr = fmt.format(Date(nowMs - MODERN_MAX_AGE_DAYS * DAY_MS))
+        val twoYearsAgoStr = fmt.format(Date(nowMs - ANY_FRESH_QUOTA_MAX_AGE_DAYS * DAY_MS))
+        val fiveYearsAgoStr = fmt.format(Date(nowMs - MODERN_MAX_AGE_DAYS * DAY_MS))
 
         return buildString {
             appendLine("Текущая дата: $todayStr.")
@@ -1168,6 +1261,12 @@ class AiWaveEngine(
                 }
             }
 
+            if (seedSong == null && cfg.waveEra == WaveEra.FRESH && liveFreshHints.isNotEmpty()) {
+                val hintLine = liveFreshHints.joinToString("; ") { "${it.artist} - ${it.title}" }
+                appendLine()
+                appendLine("АКТУАЛЬНЫЕ СВЕЖИЕ РЕЛИЗЫ КАТАЛОГА ЗА ПОСЛЕДНИЙ ГОД (отбери из них самые подходящие по вкусу/настроению/характеру и дополни другими реальными релизами строго с $oneYearAgoStr по $todayStr): $hintLine.")
+            }
+
             appendLine()
             when (cfg.waveCharacter) {
                 WaveCharacter.FAVORITE -> {
@@ -1187,17 +1286,17 @@ class AiWaveEngine(
                         appendLine("СТРОГАЯ СВЕЖЕСТЬ (до 1 года): 100% треков должны быть выпущены строго в период с $oneYearAgoStr по $todayStr. Ставь \"fresh\":true. НИКАКИХ хитов старше 12 месяцев!")
                     }
                     WaveEra.MODERN -> {
-                        appendLine("СТРОГО СОВРЕМЕННОЕ (до 2 лет): 100% треков должны быть выпущены в период с $twoYearsAgoStr по $todayStr. НЕ добавляй треки 5–8-летней давности!")
+                        appendLine("СОВРЕМЕННОЕ (до 5 лет): 100% треков должны быть выпущены в период с $fiveYearsAgoStr по $todayStr. НЕ добавляй треки старше 5 лет!")
                     }
                     WaveEra.ANY -> {
                         if (cfg.waveLanguage == WaveLanguage.ANY) {
                             appendLine("КВОТЫ БАЛАНСА И СВЕЖЕСТИ (ОБЯЗАТЕЛЬНО): общий баланс ровно ~50% русскоязычных и ~50% зарубежных треков ТОГО ЖЕ поджанра, энергии и звучания:")
-                            appendLine("• 25% — СВЕЖИЕ русские релизы строго с $oneYearAgoStr по $todayStr (ставь \"fresh\":true);")
-                            appendLine("• 25% — СВЕЖИЕ зарубежные релизы строго с $oneYearAgoStr по $todayStr (ставь \"fresh\":true);")
+                            appendLine("• 25% — свежие русские релизы не старше 2 лет (с $twoYearsAgoStr по $todayStr, ставь \"fresh\":true);")
+                            appendLine("• 25% — свежие зарубежные релизы не старше 2 лет (с $twoYearsAgoStr по $todayStr, ставь \"fresh\":true);")
                             appendLine("• 25% — русские треки любых годов под вкус (\"fresh\":false);")
                             appendLine("• 25% — зарубежные треки любых годов под вкус (\"fresh\":false).")
                         } else {
-                            appendLine("КВОТА СВЕЖЕСТИ: ровно 50% треков должны быть свежими релизами строго с $oneYearAgoStr по $todayStr (ставь \"fresh\":true), остальные 50% — любых годов (\"fresh\":false).")
+                            appendLine("КВОТА СВЕЖЕСТИ: 50% треков должны быть релизами не старше 2 лет (с $twoYearsAgoStr по $todayStr, ставь \"fresh\":true), остальные 50% — любых годов (\"fresh\":false).")
                         }
                     }
                     else -> Unit
@@ -1209,7 +1308,7 @@ class AiWaveEngine(
             }
 
             appendLine("Не добавляй случайную попсу или треки из несовместимых жанров. Каждый трек должен органично переходить в следующий.")
-            appendLine("Только реальные существующие студийные треки — БЕЗ slowed/reverb, sped up, nightcore, tiktok-ремиксов, 8D, каверов и караоке.")
+            appendLine("Только реальные существующие студийные треки — БЕЗ slowed/reverb, sped up, nightcore, сниппетов, tiktok-ремиксов, 8D, каверов и караоке.")
             appendLine("Не ставь одного артиста подряд и максимум 2 трека одного артиста в пачке.")
             appendFeedbackHints(cfg, includeSessionSkips = true)
         }
@@ -1419,7 +1518,8 @@ class AiWaveEngine(
             suggestions = suggestions,
             maxResults = maxResults,
             strictEra = WaveEra.ANY,
-            maxAgeDays = FRESH_MAX_AGE_DAYS,
+            maxAgeDays = ANY_FRESH_QUOTA_MAX_AGE_DAYS,
+            knownReleaseDates = emptyMap(),
         ).map { it.song }.take(maxResults)
 
     private suspend fun resolveWaveCandidates(
@@ -1427,11 +1527,12 @@ class AiWaveEngine(
         maxResults: Int,
         strictEra: WaveEra,
         maxAgeDays: Int,
+        knownReleaseDates: Map<String, Pair<Int?, Long?>> = emptyMap(),
     ): List<ResolvedWaveCandidate> =
         coroutineScope {
             val found = mutableListOf<ResolvedWaveCandidate>()
             val seenKeys = HashSet<String>()
-            val cap = suggestions.take(maxResults + 8)
+            val cap = suggestions.take(maxResults + 10)
 
             for (batch in cap.chunked(RESOLVE_CONCURRENCY)) {
                 val batchResults =
@@ -1441,6 +1542,7 @@ class AiWaveEngine(
                                 item = item,
                                 strictEra = strictEra,
                                 maxAgeDays = maxAgeDays,
+                                knownReleaseDates = knownReleaseDates,
                             )
                         }
                     }.awaitAll()
@@ -1469,12 +1571,13 @@ class AiWaveEngine(
     /**
      * Ускоренный каскадный резолв одного трека:
      * Deezer и основной источник (YTM / Яндекс / VK) запускаются ПАРАЛЛЕЛЬНО,
-     * после чего проверяются антицензура и реальная дата релиза.
+     * после чего проверяются антицензура и кросс-источниковая дата релиза (Яндекс + Deezer).
      */
     private suspend fun resolveSingleSuggestionCascade(
         item: AiTrackSuggestion,
         strictEra: WaveEra = WaveEra.ANY,
-        maxAgeDays: Int = FRESH_MAX_AGE_DAYS,
+        maxAgeDays: Int = ANY_FRESH_QUOTA_MAX_AGE_DAYS,
+        knownReleaseDates: Map<String, Pair<Int?, Long?>> = emptyMap(),
     ): ResolvedWaveCandidate? =
         coroutineScope {
             val artist = item.artist.trim()
@@ -1573,20 +1676,25 @@ class AiWaveEngine(
             val targetDur = deezerTrack?.durationSec
             val hdCover = deezerTrack?.coverUrl
 
+            // Сохраняем метаданные Яндекса (год/дату) до возможного отклонения по цензуре
+            val initialYandexRelease = prefetchedYandex?.let { it.releaseYear to it.releaseDateMs }
+
             // Перекрёстная проверка антицензуры для уже найденного Яндекса против Deezer
-            if (prefetchedYandex != null && isRu && cfg.preferVkForExplicit && cfg.vkToken.isNotBlank()) {
+            val ymCheck = prefetchedYandex
+            if (ymCheck != null && isRu && cfg.preferVkForExplicit && cfg.vkToken.isNotBlank()) {
                 val cutOnYandex =
                     targetDur != null &&
-                        prefetchedYandex.durationSec != null &&
-                        (targetDur - prefetchedYandex.durationSec) >= 4L
-                val lostExplicit = deezerTrack?.isExplicit == true && !prefetchedYandex.isExplicit
+                        ymCheck.durationSec != null &&
+                        (targetDur - ymCheck.durationSec) >= 4L
+                val lostExplicit = deezerTrack?.isExplicit == true && !ymCheck.isExplicit
                 if (effectiveRuCensored || cutOnYandex || lostExplicit) {
                     prefetchedYandex = null
                 }
             }
             // Проверка длительности для предзагруженного YTM против эталона Deezer
-            if (prefetchedYtm != null && targetDur != null && prefetchedYtm.duration != null &&
-                !TrackMatcher.isDurationAcceptable(targetDur, prefetchedYtm.duration, toleranceSec = 8L)
+            val ytmCheck = prefetchedYtm
+            if (ytmCheck != null && targetDur != null && ytmCheck.duration != null &&
+                !TrackMatcher.isDurationAcceptable(targetDur, ytmCheck.duration, toleranceSec = 8L)
             ) {
                 prefetchedYtm = null
             }
@@ -1606,8 +1714,9 @@ class AiWaveEngine(
                     when (source) {
                         "deezer" -> deezerTrack?.toSongItem()
                         "yandex" -> {
-                            if (prefetchedYandex != null) {
-                                prefetchedYandex.toSongItem()
+                            val ymReady = prefetchedYandex
+                            if (ymReady != null) {
+                                ymReady.toSongItem()
                             } else if (primarySource == "yandex" || cfg.yandexToken.isBlank() || yandex == null) {
                                 null
                             } else {
@@ -1631,8 +1740,9 @@ class AiWaveEngine(
                             }
                         }
                         "vk" -> {
-                            if (prefetchedVk != null) {
-                                prefetchedVk.toSongItem()
+                            val vkReady = prefetchedVk
+                            if (vkReady != null) {
+                                vkReady.toSongItem()
                             } else if (primarySource == "vk" || cfg.vkToken.isBlank() || vk == null) {
                                 null
                             } else {
@@ -1652,8 +1762,9 @@ class AiWaveEngine(
                             }
                         }
                         "ytm" -> {
-                            if (prefetchedYtm != null) {
-                                prefetchedYtm
+                            val ytmReady = prefetchedYtm
+                            if (ytmReady != null) {
+                                ytmReady
                             } else if (primarySource == "ytm") {
                                 null
                             } else {
@@ -1671,31 +1782,82 @@ class AiWaveEngine(
 
             val finalSong = resolvedSong ?: return@coroutineScope null
 
-            // Пост-проверка реальной даты релиза для свежих слотов и режимов «Свежее» / «Современное»
-            var verifiedFresh = false
-            var knownStale = false
+            // Кросс-проверка реальной даты релиза (Яндекс + Deezer + каталог)
+            val trackKey = CustomConfigStore.buildTrackKey(artist, title)
+            val catalogRelease = if (trackKey.isNotBlank()) knownReleaseDates[trackKey] else null
+            val years = mutableListOf<Int>()
+            val datesMs = mutableListOf<Long>()
+
+            fun collectRelease(
+                year: Int?,
+                dateMs: Long?,
+            ) {
+                if (year != null && year in 1900..2100) years.add(year)
+                if (dateMs != null && dateMs > 0L) datesMs.add(dateMs)
+            }
+
+            collectRelease(catalogRelease?.first, catalogRelease?.second)
+            collectRelease(initialYandexRelease?.first, initialYandexRelease?.second)
+            val ymFinal = resolvedYandexTrack
+            collectRelease(ymFinal?.releaseYear, ymFinal?.releaseDateMs)
+            collectRelease(deezerTrack?.releaseYear, deezerTrack?.releaseDateMs)
+
             if (needFreshnessCheck) {
-                var releaseDateMs = resolvedYandexTrack?.releaseDateMs ?: deezerTrack?.releaseDateMs
-                val releaseYear = resolvedYandexTrack?.releaseYear ?: deezerTrack?.releaseYear
-                if (releaseDateMs == null && deezerTrack != null && deezer != null) {
-                    releaseDateMs =
-                        try {
-                            withTimeoutOrNull(2_000L) { deezer.fetchTrackReleaseDateMs(deezerTrack.externalId) }
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (_: Exception) {
+                val needYandexCrossLookup =
+                    yandex != null &&
+                        initialYandexRelease == null &&
+                        ymFinal == null &&
+                        (years.isEmpty() || (strictEra == WaveEra.FRESH && datesMs.isEmpty()))
+                val needDeezerDateLookup =
+                    deezer != null &&
+                        deezerTrack != null &&
+                        datesMs.isEmpty()
+
+                if (needYandexCrossLookup || needDeezerDateLookup) {
+                    val ymLookupTask =
+                        if (needYandexCrossLookup) {
+                            async(Dispatchers.IO) {
+                                try {
+                                    withTimeoutOrNull(2_200L) { yandex!!.lookupTrackReleaseInfo(artist, title) }
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                    null
+                                }
+                            }
+                        } else {
                             null
                         }
+                    val dzDateTask =
+                        if (needDeezerDateLookup) {
+                            async(Dispatchers.IO) {
+                                try {
+                                    withTimeoutOrNull(1_800L) { deezer!!.fetchTrackReleaseDateMs(deezerTrack!!.externalId) }
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                    null
+                                }
+                            }
+                        } else {
+                            null
+                        }
+
+                    ymLookupTask?.await()?.let { (y, d) -> collectRelease(y, d) }
+                    dzDateTask?.await()?.let { d -> collectRelease(null, d) }
                 }
-                val (freshFlag, staleFlag) =
+            }
+
+            val (verifiedFresh, knownStale) =
+                if (years.isNotEmpty() || datesMs.isNotEmpty()) {
                     evaluateReleaseFreshness(
-                        releaseDateMs = releaseDateMs,
-                        releaseYear = releaseYear,
+                        earliestDateMs = datesMs.minOrNull(),
+                        earliestYear = years.minOrNull(),
                         maxAgeDays = maxAgeDays,
                     )
-                verifiedFresh = freshFlag
-                knownStale = staleFlag
-            }
+                } else {
+                    false to false
+                }
 
             val bestCover = hdCover ?: finalSong.thumbnail?.takeUnless { it == CustomMascotAssets.fallbackCoverUri }
             TrackBindingCache.put(finalSong.id, artist, title) { prev ->
@@ -1721,34 +1883,41 @@ class AiWaveEngine(
         }
 
     /**
-     * Возвращает `(verifiedFresh, knownStale)` по реальной дате релиза из Яндекса / Deezer.
+     * Возвращает `(verifiedFresh, knownStale)` по самым ранним известным дате и году выхода.
+     * Если один из источников знает, что оригинальный год релиза строго старше порога — трек считается старым,
+     * даже если в другом источнике он попал в свежий сборник.
      */
     private fun evaluateReleaseFreshness(
-        releaseDateMs: Long?,
-        releaseYear: Int?,
+        earliestDateMs: Long?,
+        earliestYear: Int?,
         maxAgeDays: Int,
     ): Pair<Boolean, Boolean> {
         val nowMs = System.currentTimeMillis()
-        if (releaseDateMs != null && releaseDateMs > 0L) {
-            val ageMs = nowMs - releaseDateMs
-            val maxAgeMs = maxAgeDays.toLong() * DAY_MS
-            return if (ageMs <= maxAgeMs) {
+        val cutoffMs = nowMs - maxAgeDays.toLong() * DAY_MS
+        val cutoffCal = Calendar.getInstance().apply { timeInMillis = cutoffMs }
+        val cutoffYear = cutoffCal.get(Calendar.YEAR)
+
+        if (earliestYear != null && earliestYear < cutoffYear) {
+            return false to true
+        }
+
+        if (earliestDateMs != null && earliestDateMs > 0L) {
+            return if (earliestDateMs >= cutoffMs) {
                 true to false
             } else {
                 false to true
             }
         }
-        if (releaseYear != null && releaseYear in 1900..2100) {
+
+        if (earliestYear != null && earliestYear in 1900..2100) {
             val cal = Calendar.getInstance()
             val currentYear = cal.get(Calendar.YEAR)
-            val currentMonth = cal.get(Calendar.MONTH) + 1 // 1..12
-            val cutoffCal = Calendar.getInstance().apply { timeInMillis = nowMs - maxAgeDays.toLong() * DAY_MS }
-            val cutoffYear = cutoffCal.get(Calendar.YEAR)
+            val currentMonth = cal.get(Calendar.MONTH) + 1
 
             return when {
-                releaseYear >= currentYear -> true to false
-                releaseYear < cutoffYear -> false to true
-                // Год на границе (например прошлый год при пороге 12 мес): в первой половине года допускаем, в конце года без месяца — скорее старьё
+                earliestYear >= currentYear -> true to false
+                earliestYear > cutoffYear -> true to false
+                // Пограничный год без месяца: для строгого «Свежего (1 год)» в конце года режем прошлый год
                 maxAgeDays <= FRESH_MAX_AGE_DAYS && currentMonth >= 10 -> false to true
                 else -> true to false
             }
@@ -1838,8 +2007,9 @@ class AiWaveEngine(
         private const val EARLY_BATCH_TRIGGER_MIN = 8
         private const val EARLY_BATCH_CANDIDATES = 8
         private const val EARLY_STARTER_COUNT = 4
-        private const val FRESH_MAX_AGE_DAYS = 366
-        private const val MODERN_MAX_AGE_DAYS = 731
+        private const val FRESH_MAX_AGE_DAYS = 366 // до 1 года (фильтр «Свежее»)
+        private const val ANY_FRESH_QUOTA_MAX_AGE_DAYS = 731 // до 2 лет (квота 25/25 в «Любой»)
+        private const val MODERN_MAX_AGE_DAYS = 1_826 // до 5 лет (фильтр «Современное»)
         private const val DAY_MS = 24L * 3600L * 1_000L
         private const val SESSION_SKIP_COOLDOWN_MS = 210 * 60 * 1_000L // 3.5 часа
         private const val AUTO_PIVOT_SKIP_THRESHOLD = 3
@@ -1849,6 +2019,7 @@ class AiWaveEngine(
             listOf(
                 "slowed",
                 "sped up",
+                "spedup",
                 "speed up",
                 "nightcore",
                 "reverb",
@@ -1863,6 +2034,8 @@ class AiWaveEngine(
                 "live at",
                 "acoustic",
                 "bass boosted",
+                "snippet",
+                "сниппет",
             )
 
         private val UNWANTED_WORD_REGEXES =
