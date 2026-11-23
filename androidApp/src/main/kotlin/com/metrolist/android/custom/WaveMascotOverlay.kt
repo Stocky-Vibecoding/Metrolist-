@@ -125,6 +125,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import com.metrolist.android.playback.PlayerConnection
+import com.metrolist.android.playback.SmartLoudnessController
 import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.state.GlobalYouTubeRepository
@@ -462,6 +463,7 @@ fun WaveHomeScreen(
 
     DisposableEffect(context) {
         CustomAuthWebViewHelper.registerContext(context)
+        SmartLoudnessController.init(context)
         onDispose { }
     }
 
@@ -702,7 +704,7 @@ fun WaveHomeScreen(
                         playerConnection?.skipToPrevious()
                     },
                     onNextClick = {
-                        currentSong?.let { aiWaveEngine.recordSessionSkip(it) }
+                        // Быстрый скип (<28с) и авторазворот волны централизованно считаются в MusicService
                         playerConnection?.skipToNext()
                     },
                     onOpenFullPlayer = onExpandPlayer,
@@ -1063,6 +1065,8 @@ private fun LiveMascotVideoLayer(
     var textureViewRef by remember { mutableStateOf<TextureView?>(null) }
     var lastAppliedSpeed by remember { mutableFloatStateOf(1f) }
     var lastSpeedUpdateMs by remember { mutableLongStateOf(0L) }
+    var lastShaderSize by remember { mutableStateOf(0 to 0) }
+    var lastTransformKey by remember { mutableStateOf("") }
 
     val shouldRenderVideo = isStageVisible && isLifecycleStarted
 
@@ -1074,6 +1078,9 @@ private fun LiveMascotVideoLayer(
         val viewW = tv.width
         val viewH = tv.height
         if (viewW <= 0 || viewH <= 0 || vw <= 0 || vh <= 0) return
+        val key = "$viewW:$viewH:$vw:$vh"
+        if (lastTransformKey == key) return
+        lastTransformKey = key
         val viewAspect = viewW.toFloat() / viewH.toFloat()
         val videoAspect = vw.toFloat() / vh.toFloat()
         val scaleX: Float
@@ -1095,6 +1102,9 @@ private fun LiveMascotVideoLayer(
         val w = tv.width
         val h = tv.height
         if (w <= 0 || h <= 0) return
+        val sizePair = w to h
+        if (lastShaderSize == sizePair) return
+        lastShaderSize = sizePair
         runCatching {
             val shader = RuntimeShader(MASCOT_BLACK_KEY_AGSL)
             shader.setFloatUniform("iResolution", w.toFloat(), h.toFloat())
@@ -1934,11 +1944,13 @@ fun CustomEngineSettingsContent(
     val activeModel by geminiClient.activeModel.collectAsState()
     val resolverLogs by ResolverDiagnostics.logs.collectAsState()
     val cacheStats by CustomMediaCacheManager.stats.collectAsState()
+    val smartLoudnessEnabled by SmartLoudnessController.enabled.collectAsState()
     val likedIds by SongLikeState.likedSongIdsForDisplay.collectAsState(initial = SongLikeState.likedSongIds)
     val catalogProvider = remember(configStore) { CustomCatalogProvider(configStore) }
 
     DisposableEffect(context) {
         CustomAuthWebViewHelper.registerContext(context)
+        SmartLoudnessController.init(context)
         onDispose { }
     }
 
@@ -2093,6 +2105,11 @@ fun CustomEngineSettingsContent(
             title = "Антицензура РФ (Explicit и обрезанные → VK)",
             checked = cfg.preferVkForExplicit,
             onCheckedChange = { v -> configStore.update { it.copy(preferVkForExplicit = v) } },
+        )
+        SettingSwitchRow(
+            title = "Умная нормализация (подтяжка тихих + антиклип)",
+            checked = smartLoudnessEnabled,
+            onCheckedChange = { v -> SmartLoudnessController.setEnabled(context, v) },
         )
         SettingSwitchRow(
             title = "Кэш 4 ГБ (FIFO) и защищённый кэш лайков",
@@ -2619,11 +2636,13 @@ fun CustomEngineSettingsContent(
                     OAuthProvider.VK -> {
                         vkInput = capturedToken
                         configStore.update { it.copy(vkToken = capturedToken) }
+                        CustomCatalogProvider.triggerBackgroundTasteScan(configStore, force = true)
                         statusMessage = "Вход в ВК выполнен — токен сохранён, вкус сканируется в фоне"
                     }
                     OAuthProvider.YANDEX -> {
                         yandexInput = capturedToken
                         configStore.update { it.copy(yandexToken = capturedToken) }
+                        CustomCatalogProvider.triggerBackgroundTasteScan(configStore, force = true)
                         statusMessage = "Вход в Яндекс выполнен — проверяю подписку Плюс…"
                         scope.launch {
                             val st = yandexProvider.checkPlusStatus(capturedToken)
