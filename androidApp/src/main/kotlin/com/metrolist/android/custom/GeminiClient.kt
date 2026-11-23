@@ -2,9 +2,12 @@ package com.metrolist.android.custom
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
@@ -20,6 +23,9 @@ class GeminiClient(
     private val cooldownUntilMs = ConcurrentHashMap<String, Long>()
     private val consecutive429 = ConcurrentHashMap<String, Int>()
     private val unavailableModels = ConcurrentHashMap.newKeySet<String>()
+
+    @Volatile
+    private var lastUsedApiKey: String = ""
 
     @Volatile
     private var discoveredModels: List<String> = emptyList()
@@ -154,6 +160,7 @@ class GeminiClient(
     suspend fun testConnection(apiKeyOverride: String? = null): Result<String> {
         val key = (apiKeyOverride ?: configStore.current.geminiApiKey).trim()
         if (key.isBlank()) return Result.failure(IllegalStateException("Укажи Gemini API ключ"))
+        resetStateIfKeyChanged(key)
         refreshDiscoveredModelsIfNeeded(key, force = true)
         return generateText(
             prompt = "Ответь одним словом: OK",
@@ -168,6 +175,15 @@ class GeminiClient(
         }
     }
 
+    private fun resetStateIfKeyChanged(apiKey: String) {
+        if (apiKey != lastUsedApiKey) {
+            lastUsedApiKey = apiKey
+            cooldownUntilMs.clear()
+            consecutive429.clear()
+            unavailableModels.clear()
+        }
+    }
+
     private suspend fun refreshDiscoveredModelsIfNeeded(
         apiKey: String,
         force: Boolean = false,
@@ -177,49 +193,60 @@ class GeminiClient(
             return
         }
         val found =
-            runCatching<List<String>> {
+            try {
                 val url = "${apiBaseUrl()}/models?pageSize=100"
                 val resp = CustomHttp.get(url, headers = mapOf("x-goog-api-key" to apiKey), timeoutMs = 8_000)
-                if (!resp.isSuccess) return@runCatching emptyList<String>()
-                val arr = JSONObject(resp.body).optJSONArray("models") ?: return@runCatching emptyList<String>()
-                val badTokens =
-                    listOf(
-                        "embedding",
-                        "imagen",
-                        "veo",
-                        "tts",
-                        "audio",
-                        "live",
-                        "aqa",
-                        "robotics",
-                        "computer-use",
-                        "deep-research",
-                        "transcribe",
-                        "vision",
-                        "nano",
-                    )
-                val candidates = mutableListOf<String>()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    val rawName = obj.optString("name").removePrefix("models/").trim()
-                    if (rawName.isBlank()) continue
-                    val lower = rawName.lowercase()
-                    if (!lower.startsWith("gemini-") && !lower.startsWith("gemma-3-")) continue
-                    if (badTokens.any { lower.contains(it) }) continue
-                    val methods = obj.optJSONArray("supportedGenerationMethods")
-                    var supportsGenerate = false
-                    if (methods != null) {
-                        for (j in 0 until methods.length()) {
-                            if (methods.optString(j) == "generateContent") {
-                                supportsGenerate = true
-                                break
+                if (!resp.isSuccess) {
+                    emptyList()
+                } else {
+                    val arr = JSONObject(resp.body).optJSONArray("models")
+                    if (arr == null) {
+                        emptyList()
+                    } else {
+                        val badTokens =
+                            listOf(
+                                "embedding",
+                                "imagen",
+                                "veo",
+                                "tts",
+                                "audio",
+                                "live",
+                                "aqa",
+                                "robotics",
+                                "computer-use",
+                                "deep-research",
+                                "transcribe",
+                                "vision",
+                                "nano",
+                            )
+                        val candidates = mutableListOf<String>()
+                        for (i in 0 until arr.length()) {
+                            val obj = arr.optJSONObject(i) ?: continue
+                            val rawName = obj.optString("name").removePrefix("models/").trim()
+                            if (rawName.isBlank()) continue
+                            val lower = rawName.lowercase()
+                            if (!lower.startsWith("gemini-") && !lower.startsWith("gemma-3-")) continue
+                            if (badTokens.any { lower.contains(it) }) continue
+                            val methods = obj.optJSONArray("supportedGenerationMethods")
+                            var supportsGenerate = false
+                            if (methods != null) {
+                                for (j in 0 until methods.length()) {
+                                    if (methods.optString(j) == "generateContent") {
+                                        supportsGenerate = true
+                                        break
+                                    }
+                                }
                             }
+                            if (supportsGenerate) candidates.add(rawName)
                         }
+                        candidates.distinct().sortedBy { modelPriority(it) }
                     }
-                    if (supportsGenerate) candidates.add(rawName)
                 }
-                candidates.distinct().sortedBy { modelPriority(it) }
-            }.getOrDefault(emptyList())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
 
         if (found.isNotEmpty()) {
             discoveredModels = found
@@ -263,6 +290,8 @@ class GeminiClient(
             return Result.failure(IllegalStateException("Не задан Gemini API ключ"))
         }
 
+        resetStateIfKeyChanged(apiKey)
+
         if (discoveredModels.isEmpty() || discoveredForKey != apiKey) {
             refreshDiscoveredModelsIfNeeded(apiKey, force = false)
         }
@@ -275,14 +304,16 @@ class GeminiClient(
             val url = "${apiBaseUrl()}/models/$model:generateContent"
 
             val response =
-                runCatching {
+                try {
                     CustomHttp.postJson(
                         url = url,
                         jsonBody = payload,
                         headers = mapOf("x-goog-api-key" to apiKey),
                         timeoutMs = 25_000,
                     )
-                }.getOrElse { err ->
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (err: Exception) {
                     attempts.add("${shortName(model)}:net")
                     Log.w(TAG, "Network error on $model: ${err.message}")
                     continue
@@ -448,47 +479,49 @@ class GeminiClient(
             .trim()
     }
 
-    private fun parseTrackSuggestions(raw: String): List<AiTrackSuggestion> {
-        val cleaned = stripCodeFences(raw)
-        val start = cleaned.indexOf('[')
-        val end = cleaned.lastIndexOf(']')
-        if (start < 0 || end <= start) return emptyList()
+    private fun parseTrackSuggestions(raw: String): List<AiTrackSuggestion> =
+        runCatching {
+            val cleaned = stripCodeFences(raw)
+            val start = cleaned.indexOf('[')
+            val end = cleaned.lastIndexOf(']')
+            if (start < 0 || end <= start) return@runCatching emptyList()
 
-        val array = JSONArray(cleaned.substring(start, end + 1))
-        val seen = HashSet<String>()
-        return buildList {
-            for (i in 0 until array.length()) {
-                val obj = array.optJSONObject(i) ?: continue
-                val artist = obj.optString("artist").trim()
-                val title = obj.optString("title").trim()
-                if (artist.isBlank() || title.isBlank()) continue
-                val key = "${artist.lowercase()}::${title.lowercase()}"
-                if (seen.add(key)) {
-                    add(AiTrackSuggestion(artist = artist, title = title))
+            val array = JSONArray(cleaned.substring(start, end + 1))
+            val seen = HashSet<String>()
+            buildList {
+                for (i in 0 until array.length()) {
+                    val obj = array.optJSONObject(i) ?: continue
+                    val artist = obj.optString("artist").trim()
+                    val title = obj.optString("title").trim()
+                    if (artist.isBlank() || title.isBlank()) continue
+                    val key = "${artist.lowercase()}::${title.lowercase()}"
+                    if (seen.add(key)) {
+                        add(AiTrackSuggestion(artist = artist, title = title))
+                    }
                 }
             }
-        }
-    }
+        }.getOrDefault(emptyList())
 
-    private fun parseStringArray(raw: String): List<String> {
-        val cleaned = stripCodeFences(raw)
-        val start = cleaned.indexOf('[')
-        val end = cleaned.lastIndexOf(']')
-        if (start < 0 || end <= start) return emptyList()
+    private fun parseStringArray(raw: String): List<String> =
+        runCatching {
+            val cleaned = stripCodeFences(raw)
+            val start = cleaned.indexOf('[')
+            val end = cleaned.lastIndexOf(']')
+            if (start < 0 || end <= start) return@runCatching emptyList()
 
-        val array = JSONArray(cleaned.substring(start, end + 1))
-        return buildList {
-            for (i in 0 until array.length()) {
-                val line =
-                    array
-                        .optString(i)
-                        .replace("\"", "")
-                        .replace("\n", " ")
-                        .trim()
-                if (line.length in 6..110) add(line)
-            }
-        }.distinct()
-    }
+            val array = JSONArray(cleaned.substring(start, end + 1))
+            buildList {
+                for (i in 0 until array.length()) {
+                    val line =
+                        array
+                            .optString(i)
+                            .replace("\"", "")
+                            .replace("\n", " ")
+                            .trim()
+                    if (line.length in 6..110) add(line)
+                }
+            }.distinct()
+        }.getOrDefault(emptyList())
 
     companion object {
         private const val TAG = "GeminiClient"
@@ -522,8 +555,13 @@ class MascotPhraseBank(
     context: Context,
     private val geminiClient: GeminiClient,
 ) {
-    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val prefsLock = Any()
+
+    @Volatile
     private var lastShownLine: String? = null
+
+    @Volatile
     private var tracksSinceMoodLine = 1
 
     suspend fun nextPhraseForTrack(
@@ -532,53 +570,56 @@ class MascotPhraseBank(
         moodKey: String,
         moodLabel: String,
         hasGeminiKey: Boolean,
-    ): String? {
-        val trackKey = "${artist.trim().lowercase()}::${title.trim().lowercase()}"
+    ): String? =
+        withContext(Dispatchers.IO) {
+            val trackKey = "${artist.trim().lowercase()}::${title.trim().lowercase()}"
 
-        loadTrackCache().optString(trackKey).takeIf { it.isNotBlank() }?.let { cached ->
-            lastShownLine = cached
-            tracksSinceMoodLine = 0
-            return cached
-        }
-
-        val now = System.currentTimeMillis()
-        val lastTrackAiMs = prefs.getLong(KEY_LAST_TRACK_AI_MS, 0L)
-
-        if (hasGeminiKey && !geminiClient.hasActiveCooldown() && now - lastTrackAiMs >= TRACK_AI_COOLDOWN_MS) {
-            prefs.edit().putLong(KEY_LAST_TRACK_AI_MS, now).apply()
-            val generated = geminiClient.generateMascotLine(artist = artist, title = title, moodHint = moodLabel)
-            if (!generated.isNullOrBlank()) {
-                saveTrackPhrase(trackKey, generated)
-                lastShownLine = generated
+            synchronized(prefsLock) {
+                loadTrackCache().optString(trackKey).takeIf { it.isNotBlank() }
+            }?.let { cached ->
+                lastShownLine = cached
                 tracksSinceMoodLine = 0
-                return generated
+                return@withContext cached
             }
-        }
 
-        tracksSinceMoodLine += 1
-        if (tracksSinceMoodLine < 2) {
-            return null
-        }
+            val now = System.currentTimeMillis()
+            val lastTrackAiMs = prefs.getLong(KEY_LAST_TRACK_AI_MS, 0L)
 
-        var pool = loadMoodPool(moodKey)
-        val lastPackMs = prefs.getLong(KEY_LAST_PACK_PREFIX + moodKey, 0L)
-        if (hasGeminiKey && !geminiClient.hasActiveCooldown() && pool.size < MIN_POOL_SIZE && now - lastPackMs >= PACK_REFRESH_COOLDOWN_MS) {
-            prefs.edit().putLong(KEY_LAST_PACK_PREFIX + moodKey, now).apply()
-            val fresh = geminiClient.generateMascotPhrasePack(moodHint = moodLabel, count = 10)
-            if (fresh.isNotEmpty()) {
-                pool = (fresh + pool).distinct().take(MAX_MOOD_POOL)
-                saveMoodPool(moodKey, pool)
+            if (hasGeminiKey && !geminiClient.hasActiveCooldown() && now - lastTrackAiMs >= TRACK_AI_COOLDOWN_MS) {
+                prefs.edit().putLong(KEY_LAST_TRACK_AI_MS, now).apply()
+                val generated = geminiClient.generateMascotLine(artist = artist, title = title, moodHint = moodLabel)
+                if (!generated.isNullOrBlank()) {
+                    saveTrackPhrase(trackKey, generated)
+                    lastShownLine = generated
+                    tracksSinceMoodLine = 0
+                    return@withContext generated
+                }
             }
+
+            tracksSinceMoodLine += 1
+            if (tracksSinceMoodLine < 2) {
+                return@withContext null
+            }
+
+            var pool = synchronized(prefsLock) { loadMoodPool(moodKey) }
+            val lastPackMs = prefs.getLong(KEY_LAST_PACK_PREFIX + moodKey, 0L)
+            if (hasGeminiKey && !geminiClient.hasActiveCooldown() && pool.size < MIN_POOL_SIZE && now - lastPackMs >= PACK_REFRESH_COOLDOWN_MS) {
+                prefs.edit().putLong(KEY_LAST_PACK_PREFIX + moodKey, now).apply()
+                val fresh = geminiClient.generateMascotPhrasePack(moodHint = moodLabel, count = 10)
+                if (fresh.isNotEmpty()) {
+                    pool = (fresh + pool).distinct().take(MAX_MOOD_POOL)
+                    saveMoodPool(moodKey, pool)
+                }
+            }
+
+            if (pool.isEmpty()) return@withContext null
+
+            val candidates = pool.filterNot { it == lastShownLine }.ifEmpty { pool }
+            val chosen = candidates.random()
+            lastShownLine = chosen
+            tracksSinceMoodLine = 0
+            chosen
         }
-
-        if (pool.isEmpty()) return null
-
-        val candidates = pool.filterNot { it == lastShownLine }.ifEmpty { pool }
-        val chosen = candidates.random()
-        lastShownLine = chosen
-        tracksSinceMoodLine = 0
-        return chosen
-    }
 
     private fun loadTrackCache(): JSONObject =
         runCatching {
@@ -589,14 +630,17 @@ class MascotPhraseBank(
         trackKey: String,
         phrase: String,
     ) {
-        runCatching {
-            val obj = loadTrackCache()
-            obj.put(trackKey, phrase)
-            while (obj.length() > MAX_TRACK_CACHE) {
-                val oldestKey = obj.keys().next()
-                obj.remove(oldestKey)
+        synchronized(prefsLock) {
+            runCatching {
+                val obj = loadTrackCache()
+                obj.put(trackKey, phrase)
+                while (obj.length() > MAX_TRACK_CACHE) {
+                    val keys = obj.keys()
+                    if (!keys.hasNext()) break
+                    obj.remove(keys.next())
+                }
+                prefs.edit().putString(KEY_TRACK_CACHE, obj.toString()).apply()
             }
-            prefs.edit().putString(KEY_TRACK_CACHE, obj.toString()).apply()
         }
     }
 
@@ -615,10 +659,12 @@ class MascotPhraseBank(
         moodKey: String,
         phrases: List<String>,
     ) {
-        runCatching {
-            val arr = JSONArray()
-            phrases.take(MAX_MOOD_POOL).forEach { arr.put(it) }
-            prefs.edit().putString(KEY_MOOD_POOL_PREFIX + moodKey, arr.toString()).apply()
+        synchronized(prefsLock) {
+            runCatching {
+                val arr = JSONArray()
+                phrases.take(MAX_MOOD_POOL).forEach { arr.put(it) }
+                prefs.edit().putString(KEY_MOOD_POOL_PREFIX + moodKey, arr.toString()).apply()
+            }
         }
     }
 
