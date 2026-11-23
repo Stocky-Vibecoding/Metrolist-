@@ -233,6 +233,7 @@ class CustomConfigStore(
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val censorshipPrefs = appContext.getSharedPreferences(CENSORSHIP_PREFS_NAME, Context.MODE_PRIVATE)
+    private val stateLock = Any()
     private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val persistChannel = Channel<CustomAppConfig>(Channel.CONFLATED)
 
@@ -269,12 +270,22 @@ class CustomConfigStore(
     }
 
     fun update(transform: (CustomAppConfig) -> CustomAppConfig) {
-        val previous = _config.value
-        val updated = transform(previous)
-        saveAndPublish(
+        val updated: CustomAppConfig
+        val yandexTokenChanged: Boolean
+        val vkTokenChanged: Boolean
+        synchronized(stateLock) {
+            val previous = _config.value
+            updated = transform(previous)
+            if (updated == previous) return
+            yandexTokenChanged = previous.yandexToken != updated.yandexToken
+            vkTokenChanged = previous.vkToken != updated.vkToken
+            _config.value = updated
+        }
+        publishSideEffects(
             updated = updated,
-            yandexTokenChanged = previous.yandexToken != updated.yandexToken,
-            vkTokenChanged = previous.vkToken != updated.vkToken,
+            yandexTokenChanged = yandexTokenChanged,
+            vkTokenChanged = vkTokenChanged,
+            triggerTasteScan = true,
         )
     }
 
@@ -672,10 +683,11 @@ class CustomConfigStore(
     ) {
         val key = buildTrackKey(artist, title)
         if (key.isBlank()) return
+        val editor = censorshipPrefs.edit()
         if (censorshipPrefs.all.size > 800) {
-            censorshipPrefs.edit().clear().apply()
+            editor.clear()
         }
-        censorshipPrefs.edit().putBoolean(key, censored).apply()
+        editor.putBoolean(key, censored).apply()
     }
 
     /** Собирается строго на лету по нажатию «Экспорт», лишних файлов в памяти не держит. */
@@ -685,11 +697,19 @@ class CustomConfigStore(
     fun importFromJson(rawJson: String): Result<CustomAppConfig> =
         runCatching {
             val parsed = fromJson(JSONObject(rawJson.trim()))
-            val previous = _config.value
-            saveAndPublish(
+            val yandexTokenChanged: Boolean
+            val vkTokenChanged: Boolean
+            synchronized(stateLock) {
+                val previous = _config.value
+                yandexTokenChanged = previous.yandexToken != parsed.yandexToken
+                vkTokenChanged = previous.vkToken != parsed.vkToken
+                _config.value = parsed
+            }
+            publishSideEffects(
                 updated = parsed,
-                yandexTokenChanged = previous.yandexToken != parsed.yandexToken,
-                vkTokenChanged = previous.vkToken != parsed.vkToken,
+                yandexTokenChanged = yandexTokenChanged,
+                vkTokenChanged = vkTokenChanged,
+                triggerTasteScan = parsed.externalTasteProfile.isEmpty(),
             )
             parsed
         }
@@ -716,12 +736,12 @@ class CustomConfigStore(
         }
     }
 
-    private fun saveAndPublish(
+    private fun publishSideEffects(
         updated: CustomAppConfig,
         yandexTokenChanged: Boolean,
         vkTokenChanged: Boolean,
+        triggerTasteScan: Boolean,
     ) {
-        _config.value = updated
         persistChannel.trySend(updated)
         syncLocalProfileBridge(updated)
         syncLearnedCensorship(updated)
@@ -731,7 +751,9 @@ class CustomConfigStore(
         }
         if (yandexTokenChanged || vkTokenChanged) {
             CustomHomeShelvesBridge.requestLoad(force = true)
-            CustomCatalogProvider.triggerBackgroundTasteScan(this, force = true)
+            if (triggerTasteScan) {
+                CustomCatalogProvider.triggerBackgroundTasteScan(this, force = true)
+            }
         }
         applyRuntimeIntegrations(updated)
     }
@@ -1042,9 +1064,12 @@ class CustomConfigStore(
         private const val MAX_PLAYED_HISTORY_AGE_MS = 72L * 60 * 60 * 1_000L
         const val DEFAULT_REPEAT_COOLDOWN_MS = 16L * 60 * 60 * 1_000L
 
+        private val ARTIST_SPLIT_REGEX =
+            Regex("""\s*(?:,|&|×|\bfeat\.?|\bft\.?|\bfeaturing)\s*""", RegexOption.IGNORE_CASE)
+
         fun splitArtistNames(raw: String): List<String> =
             raw
-                .split(",", "&", "feat.", "ft.", "featuring", "×")
+                .split(ARTIST_SPLIT_REGEX)
                 .map { it.trim() }
                 .filter { it.length >= 2 }
                 .distinctBy { it.lowercase() }
@@ -1060,13 +1085,7 @@ class CustomConfigStore(
         }
 
         fun buildArtistKey(artist: String): String {
-            val primary =
-                artist
-                    .substringBefore(",")
-                    .substringBefore("&")
-                    .substringBefore("feat.")
-                    .substringBefore("ft.")
-                    .trim()
+            val primary = artist.split(ARTIST_SPLIT_REGEX, limit = 2).firstOrNull().orEmpty().trim()
             return TrackMatcher.normalize(primary)
         }
     }
