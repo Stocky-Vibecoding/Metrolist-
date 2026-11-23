@@ -49,6 +49,7 @@ import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.exoplayer.util.EventLogger
 import com.metrolist.android.BuildConfig
+import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.innertubex.sabr.ExperimentalSabrApi
 import com.metrolist.innertubex.sabr.SabrVideoStream
 import com.metrolist.innertubex.sabr.findSabrProtocolException
@@ -140,6 +141,8 @@ private const val SWITCH_READY_BUFFER_MS = 500L
 private const val SWITCH_RETARGET_THRESHOLD_MS = 100L
 private const val MAX_SWITCH_RETARGETS = 3
 private const val STATE_UPDATE_INTERVAL_MS = 100L
+private const val BUFFERING_STALL_TIMEOUT_MS = 5_500L
+private const val VK_NETWORK_RECOVERY_DEBOUNCE_MS = 2_500L
 
 private const val SMOOTH_PAUSE_FADE_MS = 160L
 private const val SMOOTH_RESUME_FADE_MS = 200L
@@ -414,6 +417,7 @@ class ExoPlaybackPlayer(
     private var audioOutputEnabled = true
     private var outputRecoveryState = AudioOutputRecoveryState()
     private val a2dpMonitor = BluetoothA2dpMonitor(this.context) { maybeRecoverAudioOutput(a2dpStateChanged = true) }
+    private var lastVkNetworkRecoveryMs = 0L
 
     private fun createPlayer(
         bufferForPlaybackMs: Int = 2_000,
@@ -1057,6 +1061,47 @@ class ExoPlaybackPlayer(
                     recordPlaybackState("Android playback foreground changed.", mapOf("appForeground" to foreground.toString()))
                 }
         }
+
+        // Сторож зависшего потока: если сетевая буферизация висит >5.5 сек — уходим на следующий источник по каскаду
+        scope.launch {
+            combine(_playbackState, _wantsPlayback, playbackTransitions.pending) { state, wants, pending ->
+                Triple(state, wants, pending)
+            }.distinctUntilChanged().collectLatest { (state, wants, pending) ->
+                if (state != Player.STATE_BUFFERING || !wants || pending || controllerClock != null) return@collectLatest
+                val watchedInstance = currentInstance
+                val watchedResource = currentResource ?: return@collectLatest
+                if (watchedInstance <= 0L) return@collectLatest
+                if (watchedResource.clientName == "local" || watchedResource.profileId?.startsWith("custom_cache_") == true) {
+                    return@collectLatest
+                }
+                delay(BUFFERING_STALL_TIMEOUT_MS.milliseconds)
+                if (
+                    exo.playbackState == Player.STATE_BUFFERING &&
+                    exo.playWhenReady &&
+                    !exo.isPlaying &&
+                    currentInstance == watchedInstance &&
+                    currentResource === watchedResource &&
+                    !playbackTransitions.pending.value &&
+                    !isFadingOutForRequest &&
+                    !isFadingOutForPause
+                ) {
+                    Timber.tag(MUSIC_VIDEO_TAG).w(
+                        "Stream buffering watchdog triggered after %dms videoId=%s client=%s",
+                        BUFFERING_STALL_TIMEOUT_MS,
+                        watchedResource.videoId,
+                        watchedResource.clientName,
+                    )
+                    reportPlaybackFailure(
+                        PlaybackException(
+                            "Stream buffering stalled",
+                            TimeoutException("Buffering watchdog exceeded ${BUFFERING_STALL_TIMEOUT_MS}ms"),
+                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+                        ),
+                    )
+                }
+            }
+        }
+
         Timber.tag(MUSIC_VIDEO_TAG).d("ExoPlayer created player=%s", playerId())
         progressJob =
             scope.launch {
@@ -2260,13 +2305,27 @@ class ExoPlaybackPlayer(
         }
     }
 
-    private fun PlaybackResource?.normalizationGain(): Float =
-        playbackNormalizationGain(
-            loudnessDb = this?.loudnessDb,
-            enabled = Settings.shared.audioNormalization,
-            level = Settings.shared.loudnessLevel,
-            perceptualLoudnessDb = this?.perceptualLoudnessDb,
-        )
+    private fun PlaybackResource?.normalizationGain(): Float {
+        val baseGain =
+            playbackNormalizationGain(
+                loudnessDb = this?.loudnessDb,
+                enabled = Settings.shared.audioNormalization,
+                level = Settings.shared.loudnessLevel,
+                perceptualLoudnessDb = this?.perceptualLoudnessDb,
+            )
+        if (this == null || this.loudnessDb != null || this.perceptualLoudnessDb != null) {
+            return baseGain
+        }
+        if (!Settings.shared.audioNormalization) return baseGain
+        // Компенсация базовой громкости VK и Я.Музыки при отсутствии loudnessDb, чтобы не было скачков с YTM
+        val sourceCompensation =
+            when (this.clientName) {
+                "vk" -> 0.72f
+                "yandex" -> 0.78f
+                else -> 1.0f
+            }
+        return (baseGain * sourceCompensation).coerceIn(0.1f, 1.0f)
+    }
 
     override fun startNextPlayback(): Boolean {
         if (playbackTransitions.recovering) return false
@@ -2597,6 +2656,43 @@ class ExoPlaybackPlayer(
     }
 
     override fun invalidateActiveStreamForNetworkChange() {
+        HybridStreamResolver.invalidateVkSessionStreams()
+        val resource = currentResource
+        val isLiveVkStream =
+            resource != null &&
+                resource.clientName == "vk" &&
+                resource.profileId?.startsWith("custom_cache_") != true &&
+                currentInstance > 0L &&
+                exo.playWhenReady &&
+                !playbackTransitions.pending.value &&
+                !isFadingOutForRequest &&
+                !isFadingOutForPause
+        if (isLiveVkStream) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastVkNetworkRecoveryMs >= VK_NETWORK_RECOVERY_DEBOUNCE_MS) {
+                lastVkNetworkRecoveryMs = now
+                Timber.tag(MUSIC_VIDEO_TAG).d(
+                    "Proactive VK stream re-resolve on network change videoId=%s posMs=%d",
+                    resource.videoId,
+                    getRealtimePositionMs(),
+                )
+                emitPlaybackFailure(
+                    PlaybackFailure(
+                        stage = "vk_network_change",
+                        message = "VK IP-bound stream refreshed after network change",
+                        sourceName = "Media3",
+                        videoId = resource.videoId,
+                        playbackInstanceId = currentInstance,
+                        playbackPositionMs = getRealtimePositionMs(),
+                        resumePlayback = wantsPlayback,
+                        isMediaSourceFailure = true,
+                        shouldExcludePlaybackProfile = false,
+                        category = PlaybackFailureCategory.NETWORK,
+                    ),
+                )
+                return
+            }
+        }
         if (!shouldRecoverPlaybackOnNetworkChange(currentResource, exo.playerError != null, exo.playWhenReady)) return
         exo.playerError?.let(::reportPlaybackFailure)
     }
