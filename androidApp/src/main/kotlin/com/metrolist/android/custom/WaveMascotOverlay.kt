@@ -141,7 +141,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.lang.ref.WeakReference
 import kotlin.coroutines.resume
 import kotlin.math.PI
 import kotlin.math.abs
@@ -203,10 +202,10 @@ private enum class OAuthProvider(
  */
 object CustomAuthWebViewHelper {
     @Volatile
-    private var contextRef: WeakReference<Context>? = null
+    private var appContext: Context? = null
 
     fun registerContext(context: Context) {
-        contextRef = WeakReference(context)
+        appContext = context.applicationContext
         if (VkMusicProvider.onTokenExpiredRefreshHook == null) {
             VkMusicProvider.onTokenExpiredRefreshHook = { silentRefreshVkToken() }
         }
@@ -223,7 +222,7 @@ object CustomAuthWebViewHelper {
 
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun silentRefreshVkToken(): String? {
-        val ctx = contextRef?.get() ?: return null
+        val ctx = appContext ?: return null
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(12_000L) {
                 suspendCancellableCoroutine<String?> { cont ->
