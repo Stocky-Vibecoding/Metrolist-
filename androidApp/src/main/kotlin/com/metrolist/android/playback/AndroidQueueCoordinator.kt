@@ -428,7 +428,8 @@ internal class AndroidQueueCoordinator(
 
     private fun appendPlaylistSongs(songs: List<SongItem>) {
         player.appendPlaylistSongs(songs)
-        queuedSongIds.addAll(songs.map(SongItem::id))
+        queuedSongIds.clear()
+        queuedSongIds.addAll(player.songQueue.value.map(SongItem::id))
         onSave()
     }
 
@@ -518,7 +519,13 @@ internal class AndroidQueueCoordinator(
             queueChipsState.value = emptyList()
             val sessionId = queueSessionId
             scope.launch {
-                appendAiWaveBatch(sessionId = sessionId, seedSong = seed, promoteWaveTitle = false)
+                try {
+                    appendAiWaveBatch(sessionId = sessionId, seedSong = seed, promoteWaveTitle = false)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w("Wave mix append failed: %s", e.message)
+                }
             }
         } else {
             isRadioQueue = true
@@ -583,7 +590,6 @@ internal class AndroidQueueCoordinator(
     }
 
     fun bootstrapRecommendations(seedSongId: String) {
-        // В «Моей волне» полностью отключаем перехват родного YTM-радио и его чипы
         if (isMyWaveQueue()) return
         if (AiWaveEngine.sharedInstance != null && player.songQueue.value.size <= 2) return
         if (!PlaybackNetworkStateStore.current.connected) return
@@ -803,6 +809,13 @@ internal class AndroidQueueCoordinator(
             }
         }
         scope.launch {
+            PlaybackNetworkStateStore.state.map { it.connected }.distinctUntilChanged().collect { connected ->
+                if (connected) {
+                    lastAutoLoadedSongId = null
+                }
+            }
+        }
+        scope.launch {
             player.shuffleEnabled.collect { if (it) schedulePlaylistPage() }
         }
         scope.launch {
@@ -851,7 +864,6 @@ internal class AndroidQueueCoordinator(
     }
 
     fun scheduleAutoLoadMore(trigger: AutoLoadMoreTrigger) {
-        // Для «Моей волны» разрешаем дозагрузку и без сети — AiWaveEngine подхватит локальный 4 ГБ кэш
         if (!PlaybackNetworkStateStore.current.connected && !isMyWaveQueue()) return
         if (!trigger.shouldLoadMore) return
         val currentSongId = trigger.currentSongId ?: return
@@ -863,8 +875,10 @@ internal class AndroidQueueCoordinator(
         autoLoadMoreJob =
             scope.launch {
                 try {
-                    lastAutoLoadedSongId = currentSongId
-                    performAutoLoadMore(sessionId, currentSongId)
+                    val loaded = performAutoLoadMore(sessionId, currentSongId)
+                    if (loaded && sessionId == queueSessionId) {
+                        lastAutoLoadedSongId = currentSongId
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -922,7 +936,6 @@ internal class AndroidQueueCoordinator(
         if (sessionId != queueSessionId) return false
         if (repeatMode.value != Player.REPEAT_MODE_OFF) return false
 
-        // 1. Бесконечная «Моя волна» (работает и онлайн, и офлайн из 4 ГБ кэша)
         if (isMyWaveQueue()) {
             val isTrackWave = queueTitleState.value?.contains("•") == true
             val seed = if (isTrackWave) player.currentSong.value else null
@@ -937,7 +950,6 @@ internal class AndroidQueueCoordinator(
         val currentIndex = player.currentMediaItemIndex.value
         if (currentIndex !in currentQueue.indices) return false
 
-        // 2. Умное доигрывание после одиночного трека (из поиска или чарта) — запускаем «Мою волну по этому треку»
         val isSingleTrackContinuation = playlistPage?.hasMore != true && currentQueue.size <= 2 && currentIndex == currentQueue.lastIndex
         if ((isSingleTrackContinuation || Settings.shared.autoLoadMore) && AiWaveEngine.sharedInstance != null) {
             val seedSong = player.currentSong.value ?: currentQueue.getOrNull(currentIndex)
@@ -1187,7 +1199,6 @@ internal class AndroidQueueCoordinator(
             return
         }
 
-        // Умное доигрывание: для «Моей волны» или после одиночного трека из поиска/чарта продолжаем волной
         val shouldContinueWithWave =
             isMyWaveQueue() ||
                 Settings.shared.autoLoadMore ||
