@@ -242,18 +242,10 @@ fun HomeContent(
     val paginationScrollConnection = rememberHomePagination(uiState, listState, onLoadMore)
     BoxWithConstraints(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         val isWide = maxWidth > 840.dp
-        val baseShelves =
-            shelves ?: (shelfCache ?: localShelfCache).build(uiState, text, maxWidth)
-        val customShelves =
-            if (uiState.selectedChip == null) CustomHomeShelvesBridge.shelves else emptyList()
+        // Источники (Яндекс / VK / Deezer / YouTube) разведены по вкладкам в HomeScreen —
+        // не подмешиваем CustomHomeShelvesBridge.shelves поверх, чтобы не было дублей
         val effectiveShelves =
-            if (customShelves.isEmpty()) {
-                baseShelves
-            } else if (baseShelves.firstOrNull()?.style == HomeShelfStyle.SPEED_DIAL) {
-                listOf(baseShelves.first()) + customShelves + baseShelves.drop(1)
-            } else {
-                customShelves + baseShelves
-            }
+            shelves ?: (shelfCache ?: localShelfCache).build(uiState, text, maxWidth)
 
         DragScrollableColumn(
             state = listState,
@@ -289,7 +281,7 @@ fun HomeContent(
                 isWide = isWide,
             )
 
-            if (uiState.isContentLoading || uiState.isLoadingMore) {
+            if (shelves == null && (uiState.isContentLoading || uiState.isLoadingMore)) {
                 item(key = "home_content_loading") {
                     Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
                         ContainedLoadingIndicator(Modifier.semantics { contentDescription = text.loading })
@@ -297,7 +289,7 @@ fun HomeContent(
                 }
             }
 
-            if (!uiState.isLoading && uiState.error.isNullOrBlank() && uiState.loadMoreError && onLoadMore != null) {
+            if (shelves == null && !uiState.isLoading && uiState.error.isNullOrBlank() && uiState.loadMoreError && onLoadMore != null) {
                 item(key = "home_load_more_retry") {
                     Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
                         TextButton(onClick = onLoadMore, shapes = ButtonDefaults.shapes()) { Text(text.tryAgain) }
@@ -307,7 +299,7 @@ fun HomeContent(
         }
 
         HomeRevalidationIndicator(
-            visible = uiState.isRevalidating,
+            visible = shelves == null && uiState.isRevalidating,
             modifier = Modifier.align(Alignment.TopCenter).padding(top = contentPadding.calculateTopPadding()),
         )
     }
@@ -779,7 +771,6 @@ private fun HomeCarouselShelf(
     val imageSize = CarouselItemSize
     val state = rememberCarouselState { shelf.items.size }
     DesktopHorizontalScrollControls(state) {
-        // Material 3 1.13 defaults to one item per fling; keep momentum with snapping.
         val carouselFling = CarouselDefaults.multiBrowseFlingBehavior(state)
         HorizontalMultiBrowseCarousel(
             state = state,
