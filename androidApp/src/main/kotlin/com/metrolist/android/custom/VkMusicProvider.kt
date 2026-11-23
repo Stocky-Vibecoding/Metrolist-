@@ -67,7 +67,7 @@ class VkMusicProvider(
         val notes = mutableListOf<String>()
         var allUnknownMethod = true
         for ((index, profile) in CLIENT_PROFILES.withIndex()) {
-            if (index > 0) delay(450L)
+            if (index > 0) delay(550L)
             val attempt = testSearchProfile(cleanToken, profile)
             if (attempt.isSuccess) {
                 activeProfile = profile
@@ -89,24 +89,17 @@ class VkMusicProvider(
             notes.add("${profile.label}/${profile.endpoint.label}: $errMsg")
         }
 
-        if (allUnknownMethod && notes.isNotEmpty()) {
+        if (allUnknownMethod) {
             return Result.failure(
-                IllegalStateException(
-                    "Токен без прав аудио (#3 — VK отключил Kate). Нажми «Обновить ВК» и выбери VK Admin или VK Android",
-                ),
+                IllegalStateException("Токен ВК без прав аудио (#3) — нажми «Обновить ВК» и войди через Kate Mobile"),
             )
         }
-
         return Result.failure(IllegalStateException("ВК аудио недоступно (${notes.joinToString("; ")})"))
     }
 
     suspend fun resolve(reference: TrackReference): ResolvedCustomStream? =
         resolveWithVariant(reference, variantIndex = 0)?.first
 
-    /**
-     * Прямой резолв по сохранённому `vk_ownerId_audioId` (или `ownerId_audioId`) через `audio.getById`
-     * без лишнего вызова поиска — быстрее и защищает от flood control (#9).
-     */
     suspend fun resolveDirectById(
         vkTrackId: String,
         allowAutoRefresh: Boolean = true,
@@ -253,7 +246,6 @@ class VkMusicProvider(
         return stream to variantTag
     }
 
-    /** Строгий поиск карточки в VK для каскада волны (удалённые/цензурные треки без мусора). */
     suspend fun searchCatalogTrack(
         artist: String,
         title: String,
@@ -762,10 +754,12 @@ class VkMusicProvider(
         @Volatile
         var onTokenExpiredRefreshHook: (suspend () -> String?)? = null
 
-        private const val VK_ANDROID_UA =
-            "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)"
-        private const val KATE_UA =
+        private const val KATE_CLASSIC_UA =
+            "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)"
+        private const val KATE_MODERN_UA =
             "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
+        private const val VK_ANDROID_UA =
+            "VKAndroidApp/5.52-4543 (Android 5.1.1; SDK 22; x86_64; unknown Android SDK built for x86_64; en; 320x240)"
 
         private val MULTI_SPACE_REGEX = Regex("\\s+")
         private val EMPTY_BRACKETS_REGEX = Regex("[(\\[{]\\s*[)\\]}]")
@@ -937,34 +931,34 @@ class VkMusicProvider(
         private val CLIENT_PROFILES =
             listOf(
                 VkClientProfile(
-                    label = "VKApp",
-                    userAgent = VK_ANDROID_UA,
-                    apiVersion = "5.131",
-                    endpoint = VkSearchEndpoint.CATALOG,
-                ),
-                VkClientProfile(
-                    label = "VKApp",
-                    userAgent = VK_ANDROID_UA,
-                    apiVersion = "5.131",
-                    endpoint = VkSearchEndpoint.LEGACY,
-                ),
-                VkClientProfile(
-                    label = "VKApp",
-                    userAgent = VK_ANDROID_UA,
+                    label = "Kate",
+                    userAgent = KATE_CLASSIC_UA,
                     apiVersion = "5.95",
                     endpoint = VkSearchEndpoint.LEGACY,
                 ),
                 VkClientProfile(
                     label = "Kate",
-                    userAgent = KATE_UA,
+                    userAgent = KATE_CLASSIC_UA,
                     apiVersion = "5.131",
-                    endpoint = VkSearchEndpoint.CATALOG,
+                    endpoint = VkSearchEndpoint.LEGACY,
                 ),
                 VkClientProfile(
                     label = "Kate",
-                    userAgent = KATE_UA,
+                    userAgent = KATE_MODERN_UA,
                     apiVersion = "5.95",
                     endpoint = VkSearchEndpoint.LEGACY,
+                ),
+                VkClientProfile(
+                    label = "VKApp",
+                    userAgent = VK_ANDROID_UA,
+                    apiVersion = "5.131",
+                    endpoint = VkSearchEndpoint.LEGACY,
+                ),
+                VkClientProfile(
+                    label = "VKApp",
+                    userAgent = VK_ANDROID_UA,
+                    apiVersion = "5.131",
+                    endpoint = VkSearchEndpoint.CATALOG,
                 ),
             )
     }
