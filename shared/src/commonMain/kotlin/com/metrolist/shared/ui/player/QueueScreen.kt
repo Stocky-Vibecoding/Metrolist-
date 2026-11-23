@@ -10,12 +10,11 @@ package com.metrolist.shared.ui.player
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkHorizontally
-import androidx.compose.animation.slideInVertically
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -87,10 +86,13 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.focusRestorer
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.Key
@@ -150,6 +152,7 @@ import com.metrolist.shared.generated.resources.undo
 import com.metrolist.shared.generated.resources.unlock_queue
 import com.metrolist.shared.generated.resources.up_next
 import com.metrolist.shared.model.RadioQueueChip
+import com.metrolist.shared.model.SongItem
 import com.metrolist.shared.model.moveSelection
 import com.metrolist.shared.playback.LocalPlayerSession
 import com.metrolist.shared.playback.QueueRemoval
@@ -190,6 +193,10 @@ import org.jetbrains.compose.resources.pluralStringResource
 import org.jetbrains.compose.resources.stringResource
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
+
+object CustomQueueBridge {
+    var onDislikeSong: ((SongItem) -> Unit)? = null
+}
 
 private val queueHorizontalInset = 12.dp
 private val queueItemGap = 4.dp
@@ -235,6 +242,10 @@ sealed class QueueEvent {
     ) : QueueEvent()
 
     data class RemoveTrack(
+        val entryKey: Long,
+    ) : QueueEvent()
+
+    data class DislikeTrack(
         val entryKey: Long,
     ) : QueueEvent()
 
@@ -677,10 +688,8 @@ fun QueueScreen(
                             ReorderableItem(
                                 state = reorderableState,
                                 key = track.uniqueKey,
-                                // A no-op drop inside the selection leaves the drag library waiting for a move.
                                 enabled = track.isReorderTarget(draggingEntryKey, state.selectedEntryKeys),
                             ) {
-                                // Keep the handle composed while the committed move awaits the player so the row does not shift.
                                 val dragModifier =
                                     if (isUnlocked && canControlPlayback && track.canRemove) {
                                         Modifier
@@ -711,6 +720,7 @@ fun QueueScreen(
                                         currentDuration = state.currentDuration.takeIf { isActive },
                                         trackIndex = queueIndex,
                                         isSelected = isSelected,
+                                        canControlPlayback = canControlPlayback,
                                         showSelectionCheckbox = if (isTv) tvSelecting else isUnlocked,
                                         isReorderable = showReorderHandleSpace && track.canRemove,
                                         showReorderHandleSpace = showReorderHandleSpace,
@@ -835,6 +845,7 @@ fun QueueScreen(
                                             currentDuration = state.currentDuration.takeIf { isActive },
                                             trackIndex = track.queueIndex,
                                             isSelected = false,
+                                            canControlPlayback = canControlPlayback,
                                             isReorderable = false,
                                             showReorderHandleSpace = showReorderHandleSpace,
                                             onEvent = trackEvent,
@@ -1294,6 +1305,28 @@ private fun QueueTrackSwipeToDismissBox(
     )
 }
 
+@Composable
+private fun QueueDislikeBanIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier = modifier.size(17.dp)) {
+        val strokePx = 1.6.dp.toPx()
+        val r = size.minDimension / 2f - strokePx
+        drawCircle(color = tint, radius = r, style = Stroke(width = strokePx))
+        val inset = r * 0.68f
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        drawLine(
+            color = tint,
+            start = Offset(cx - inset, cy - inset),
+            end = Offset(cx + inset, cy + inset),
+            strokeWidth = strokePx,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun TrackItem(
@@ -1307,6 +1340,7 @@ private fun TrackItem(
     showReorderHandleSpace: Boolean,
     onEvent: (QueueEvent) -> Unit,
     onClick: () -> Unit,
+    canControlPlayback: Boolean = true,
     showSelectionCheckbox: Boolean = false,
     isMoving: Boolean = false,
     movementMode: Boolean = false,
@@ -1318,6 +1352,7 @@ private fun TrackItem(
     onMoveToBottom: (() -> Unit)? = null,
 ) {
     val hapticManager = rememberMetrolistHaptics()
+    val isTv = LocalIsTv.current
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
     val isHovered by interactionSource.collectIsHoveredAsState()
@@ -1383,6 +1418,7 @@ private fun TrackItem(
     val contentColor = colors.content
     val secondaryContentColor = colors.subtitle
     val durationText = remember(track.duration, isActive, currentDuration) { track.durationText(isActive, currentDuration) }
+    val actionTint = if (isActive || isSelected || isMoving) contentColor else MaterialTheme.colorScheme.onSurfaceVariant
 
     Surface(
         color = if (isHovered || isPressed) contentColor.copy(alpha = 0.08f).compositeOver(backgroundColor) else backgroundColor,
@@ -1530,21 +1566,54 @@ private fun TrackItem(
                     Checkbox(checked = isSelected, onCheckedChange = null)
                 }
             } else {
-                IconButton(
-                    onClick = {
-                        Logger.d("Haptics", "Trigger QueueScreen track menu click index=$trackIndex")
-                        hapticManager.perform(HapticEvent.PRESS)
-                        onEvent(QueueEvent.OpenTrackMenu(track.entryKey, contextMenu.offset))
-                    },
-                    modifier = Modifier.size(40.dp).navigationPopupSource(),
-                    shapes = IconButtonDefaults.shapes(),
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(
-                        imageVector = MetrolistIcons.Rounded.MoreVert,
-                        contentDescription = stringResource(Res.string.more_options),
-                        tint = if (isActive || isSelected || isMoving) contentColor else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(20.dp),
-                    )
+                    if (!isTv && canControlPlayback) {
+                        IconButton(
+                            onClick = {
+                                hapticManager.perform(HapticEvent.PRESS)
+                                onEvent(QueueEvent.DislikeTrack(track.entryKey))
+                            },
+                            modifier = Modifier.size(34.dp),
+                            shapes = IconButtonDefaults.shapes(),
+                        ) {
+                            QueueDislikeBanIcon(tint = actionTint)
+                        }
+                        if (track.canRemove && !isActive) {
+                            IconButton(
+                                onClick = {
+                                    hapticManager.perform(HapticEvent.PRESS)
+                                    onEvent(QueueEvent.RemoveTrack(track.entryKey))
+                                },
+                                modifier = Modifier.size(34.dp),
+                                shapes = IconButtonDefaults.shapes(),
+                            ) {
+                                Icon(
+                                    imageVector = MetrolistIcons.Filled.Close,
+                                    contentDescription = stringResource(Res.string.delete),
+                                    tint = actionTint,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                    }
+                    IconButton(
+                        onClick = {
+                            Logger.d("Haptics", "Trigger QueueScreen track menu click index=$trackIndex")
+                            hapticManager.perform(HapticEvent.PRESS)
+                            onEvent(QueueEvent.OpenTrackMenu(track.entryKey, contextMenu.offset))
+                        },
+                        modifier = Modifier.size(34.dp).navigationPopupSource(),
+                        shapes = IconButtonDefaults.shapes(),
+                    ) {
+                        Icon(
+                            imageVector = MetrolistIcons.Rounded.MoreVert,
+                            contentDescription = stringResource(Res.string.more_options),
+                            tint = actionTint,
+                            modifier = Modifier.size(19.dp),
+                        )
+                    }
                 }
             }
         }
@@ -1648,6 +1717,7 @@ fun QueueScreen(
     var awaitingReorder by session::awaitingReorder
     var pendingRemovals by session::pendingRemovals
     val platform = LocalPlayerPlatform.current
+    val playerSession = LocalPlayerSession.current
     val isListenTogetherGuest = platform.isListenTogetherGuest()
     val canControlPlayback = !isListenTogetherGuest
     val downloadedSongIds = platform.downloadedSongIds()
@@ -1680,7 +1750,6 @@ fun QueueScreen(
     val latestTracks by rememberUpdatedState(tracks)
     LaunchedEffect(awaitingReorder) {
         if (awaitingReorder) {
-            // shortcut: Remote moves have no acknowledgement; roll back after 3 seconds without a matching queue.
             delay(3_000)
             reorderableTracks = latestTracks
             pendingReorder = null
@@ -1791,6 +1860,7 @@ fun QueueScreen(
                 (
                     event is QueueEvent.PlayTrack || event is QueueEvent.SelectChip || event is QueueEvent.ReorderTrack ||
                         event is QueueEvent.RemoveTrack ||
+                        event is QueueEvent.DislikeTrack ||
                         event == QueueEvent.CommitReorder ||
                         event == QueueEvent.DeleteSelected ||
                         event == QueueEvent.ToggleShuffle ||
@@ -1869,6 +1939,18 @@ fun QueueScreen(
 
                 is QueueEvent.RemoveTrack -> {
                     showRemovalUndo(viewModel.removeQueueEntry(event.entryKey))
+                }
+
+                is QueueEvent.DislikeTrack -> {
+                    val song = viewModel.getQueueSong(event.entryKey)
+                    if (song != null) {
+                        if (event.entryKey == currentEntryKey) {
+                            playerSession?.onSongDisliked(song.id)
+                        } else {
+                            CustomQueueBridge.onDislikeSong?.invoke(song)
+                            showRemovalUndo(viewModel.removeQueueEntry(event.entryKey))
+                        }
+                    }
                 }
 
                 QueueEvent.SelectAll -> {
