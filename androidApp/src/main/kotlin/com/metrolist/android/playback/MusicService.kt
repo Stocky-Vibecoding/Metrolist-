@@ -49,6 +49,7 @@ import com.metrolist.android.cast.AndroidMdnsCastDiscovery
 import com.metrolist.android.constants.MediaSessionConstants
 import com.metrolist.android.custom.AiWaveEngine
 import com.metrolist.android.custom.CustomCatalogProvider
+import com.metrolist.android.custom.CustomConfigStore
 import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.android.custom.HybridStreamResolver
 import com.metrolist.android.custom.LastFmOfflineBuffer
@@ -59,7 +60,6 @@ import com.metrolist.android.listentogether.AndroidListenTogetherManager
 import com.metrolist.android.models.PersistPlayerState
 import com.metrolist.android.models.PlaybackPersistenceWriter
 import com.metrolist.android.models.decodePersistPlayerState
-import com.metrolist.android.models.playbackPersistenceJson
 import com.metrolist.android.widget.EXTRA_WIDGET_COMMAND_TOKEN
 import com.metrolist.android.widget.MetrolistWidgetManager
 import com.metrolist.android.widget.MusicWidgetReceiver
@@ -68,7 +68,6 @@ import com.metrolist.android.widget.WidgetControls
 import com.metrolist.android.widget.sampleWidgetProgress
 import com.metrolist.android.widget.shouldSampleWidgetProgress
 import com.metrolist.android.widget.widgetScreenInteractive
-import com.metrolist.innertubex.extraction.ContentHints
 import com.metrolist.innertubex.extraction.TokenProvider
 import com.metrolist.innertubex.sabr.findSabrProtocolException
 import com.metrolist.shared.BuildConfig
@@ -163,7 +162,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onEach
@@ -186,12 +184,12 @@ import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
 import android.provider.Settings as AndroidSettings
 import com.metrolist.shared.generated.resources.Res as SharedRes
-import com.metrolist.shared.generated.resources.shuffle as sharedShuffle
 import com.metrolist.shared.generated.resources.start_radio as sharedStartRadio
 
 private const val QUEUE_RESOLVE_RETRY_DELAY_MS = 350L
 private const val QUICK_SKIP_MIN_PLAYED_MS = 1_200L
 private const val QUICK_SKIP_THRESHOLD_MS = 28_000L
+private const val MIN_COMPLETION_PLAYED_MS = 15_000L
 
 internal suspend fun observeAndroidScrobbles(
     player: AndroidPlaybackPlayer,
@@ -237,7 +235,6 @@ internal suspend fun observeAndroidScrobbles(
             val queueOccurrenceChanged = queueIndex != previousQueueIndex && queueKey != previousQueueKey
             val newPlayback = requestId != previousRequestId || (queueOccurrenceChanged && instance != previousInstance)
             onState(song, playing, newPlayback)
-            // Queue and instance flows may arrive in either order; retain the old occurrence until both change.
             if (!queueOccurrenceChanged || newPlayback) {
                 if (queueKey != previousQueueKey || queueIndex != previousQueueIndex || requestId != previousRequestId) {
                     previousInstance = instance
@@ -268,7 +265,6 @@ class MusicService :
         private const val HEALTHY_PLAYBACK_THRESHOLD_MS = 30_000L
         private const val MAX_HEALTHY_REQUEST_HISTORY = 64
         private const val MAX_CONSECUTIVE_FAILURE_SKIPS = 3
-        private const val MAX_RADIO_CONTINUATION_PAGES = 10
 
         internal val running = MutableStateFlow(false)
 
@@ -293,6 +289,7 @@ class MusicService :
     private val musicVideoResolver: MusicVideoResolver by inject()
     private val database: MusicDatabase by inject()
     private val widgetManager: MetrolistWidgetManager by inject()
+    private val customConfigStore: CustomConfigStore by inject()
 
     lateinit var player: AndroidPlaybackPlayer
         private set
@@ -384,13 +381,16 @@ class MusicService :
     private var streamRecoveryBudget: PlaybackRecoveryBudget? = null
     private var consecutiveFailureSkips = 0
     private val healthyQueueRequestIds = linkedSetOf<Long>()
+    private var offlineScrobbleFlushJob: Job? = null
 
     // Трекинг дослушиваний (>75%), быстрых скипов (<28с) и офлайн-скробблов
     private var trackedInstanceId: Long = 0L
     private var trackedSong: SongItem? = null
+    private var trackedStartPositionMs: Long = 0L
     private var trackedMaxPositionMs: Long = 0L
     private var trackedDurationMs: Long = 0L
     private var trackedCompletedRecorded: Boolean = false
+    private var trackedFinalized: Boolean = false
     private var trackedOfflineScrobbled: Boolean = false
 
     private var lastPersistenceState: PersistPlayerState? = null
@@ -437,7 +437,6 @@ class MusicService :
         CustomCatalogProvider.initDiskCache(this)
 
         setupNotificationChannel()
-        // An idle session with a restored queue but no current song renders as a blank "is running" card.
         setShowNotificationForIdlePlayer(SHOW_NOTIFICATION_FOR_IDLE_PLAYER_NEVER)
 
         mediaNotificationProvider =
@@ -645,7 +644,6 @@ class MusicService :
                 ) {
                     automotivePlaybackRequestGate.cancelPendingRequests()
                     pauseOnMute.cancelResume()
-                    // Pause even after focus loss so its delayed recovery cannot restart on the phone speaker.
                     player.pause()
                 }
             }
@@ -1003,15 +1001,17 @@ class MusicService :
 
     private fun finalizePreviousTrackedPlayback() {
         val prevSong = trackedSong ?: return
-        if (trackedInstanceId <= 0L || trackedCompletedRecorded) return
+        if (trackedInstanceId <= 0L || trackedCompletedRecorded || trackedFinalized) return
+        trackedFinalized = true
 
         val engine = AiWaveEngine.sharedInstance ?: return
+        val playedDeltaMs = (trackedMaxPositionMs - trackedStartPositionMs).coerceAtLeast(0L)
         when {
-            trackedMaxPositionMs >= QUICK_SKIP_THRESHOLD_MS -> {
+            playedDeltaMs >= QUICK_SKIP_THRESHOLD_MS -> {
                 // Слушал дольше 28с — записываем в TTL-антиповтор и статистику без штрафа скипа
                 engine.recordTrackCompletion(prevSong, completed = false)
             }
-            trackedMaxPositionMs >= QUICK_SKIP_MIN_PLAYED_MS -> {
+            trackedStartPositionMs < QUICK_SKIP_THRESHOLD_MS && playedDeltaMs >= QUICK_SKIP_MIN_PLAYED_MS -> {
                 // Быстрый скип (<28с) — фиксируем сигнал и проверяем авторазворот волны (3 подряд)
                 engine.recordSessionSkip(prevSong, isQuickSkip = true)
                 if (queueCoordinator.isMyWaveQueue()) {
@@ -1050,11 +1050,14 @@ class MusicService :
             }.collect { (instanceId, song, positionMs, durationMs) ->
                 if (instanceId != trackedInstanceId) {
                     finalizePreviousTrackedPlayback()
+                    val safePos = positionMs.coerceAtLeast(0L)
                     trackedInstanceId = instanceId
                     trackedSong = song
-                    trackedMaxPositionMs = positionMs.coerceAtLeast(0L)
+                    trackedStartPositionMs = safePos
+                    trackedMaxPositionMs = safePos
                     trackedDurationMs = durationMs.coerceAtLeast(0L)
                     trackedCompletedRecorded = false
+                    trackedFinalized = false
                     trackedOfflineScrobbled = false
                     return@collect
                 }
@@ -1066,18 +1069,26 @@ class MusicService :
                     trackedDurationMs.takeIf { it > 0L }
                         ?: song.duration?.times(1_000L)
                         ?: 0L
+                val playedDeltaMs = (trackedMaxPositionMs - trackedStartPositionMs).coerceAtLeast(0L)
 
                 val reachedCompletion =
-                    (effectiveDurationMs >= 20_000L && trackedMaxPositionMs >= (effectiveDurationMs * 3L) / 4L) ||
-                        (effectiveDurationMs <= 0L && trackedMaxPositionMs >= 90_000L)
+                    playedDeltaMs >= MIN_COMPLETION_PLAYED_MS &&
+                        (
+                            (effectiveDurationMs >= 20_000L && trackedMaxPositionMs >= (effectiveDurationMs * 3L) / 4L) ||
+                                (effectiveDurationMs <= 0L && playedDeltaMs >= 90_000L)
+                        )
                 if (!trackedCompletedRecorded && reachedCompletion) {
                     trackedCompletedRecorded = true
+                    trackedFinalized = true
                     AiWaveEngine.sharedInstance?.recordTrackCompletion(song, completed = true)
                 }
 
                 val reachedScrobble =
-                    (effectiveDurationMs >= 30_000L && trackedMaxPositionMs >= effectiveDurationMs / 2L) ||
-                        (effectiveDurationMs <= 0L && trackedMaxPositionMs >= 45_000L)
+                    playedDeltaMs >= MIN_COMPLETION_PLAYED_MS &&
+                        (
+                            (effectiveDurationMs >= 30_000L && trackedMaxPositionMs >= effectiveDurationMs / 2L) ||
+                                (effectiveDurationMs <= 0L && playedDeltaMs >= 45_000L)
+                        )
                 // Штатный ScrobbleManager уже буферизует треки с известной длительностью;
                 // в наш LastFmOfflineBuffer пишем только треки без duration, чтобы не было дублей
                 val missingDurationForCoreScrobbler = song.duration?.takeIf { it > 0L } == null
@@ -1163,10 +1174,11 @@ class MusicService :
                 if (network.connected) {
                     player.invalidateActiveStreamForNetworkChange()
                     val sender = offlineScrobbleSender
-                    if (sender != null && LastFmOfflineBuffer.pendingCount() > 0) {
-                        serviceScope.launch(Dispatchers.IO) {
-                            LastFmOfflineBuffer.flushPending(sender)
-                        }
+                    if (sender != null && LastFmOfflineBuffer.pendingCount() > 0 && offlineScrobbleFlushJob?.isActive != true) {
+                        offlineScrobbleFlushJob =
+                            serviceScope.launch(Dispatchers.IO) {
+                                LastFmOfflineBuffer.flushPending(sender)
+                            }
                     }
                 }
             }
@@ -1255,10 +1267,17 @@ class MusicService :
                                     null
                                 }
                             if (SongLikeState.isLiked(song.id)) {
-                                // Защищённый кэш лайков — строго по факту прослушивания
                                 CustomMediaCacheManager.downloadLikedTrack(song, resource)
-                            } else {
+                            } else if (resource.profileId?.startsWith("custom_cache_") != true) {
                                 CustomMediaCacheManager.cacheWaveTrack(song, resource, vibeTag = vibeTag)
+                            }
+                            val queue = player.songQueue.value
+                            val currentIdx = player.currentMediaItemIndex.value
+                            if (currentIdx in queue.indices && currentIdx + 1 < queue.size) {
+                                CustomMediaCacheManager.preloadUpcomingTracks(
+                                    songs = queue.drop(currentIdx + 1),
+                                    vibeTag = vibeTag,
+                                )
                             }
                         }
                     }
@@ -1349,7 +1368,6 @@ class MusicService :
             return
         }
         consecutiveFailureSkips++
-        // A terminal error would idle the session while the next track plays and drop its notification.
         advanceQueueAfterCurrent()
     }
 
@@ -1412,14 +1430,16 @@ class MusicService :
             )
             return
         }
-        if (isCorruptCachedAudioFailure(player.currentPlaybackResource.value, failure.cause)) {
+        val activeResource = player.currentPlaybackResource.value
+        val isCustomCacheFile = activeResource?.profileId?.startsWith("custom_cache_") == true
+        if (isCustomCacheFile || isCorruptCachedAudioFailure(activeResource, failure.cause)) {
             val removed = audioCacheManager.removeCorruptCache(videoId)
             CustomMediaCacheManager.invalidateTrack(videoId)
             PlaybackEventLog.warn(
                 PlaybackEventKind.RECOVERY,
                 "Android cached audio could not be parsed.",
                 videoId = videoId,
-                details = mapOf("cacheRemoved" to removed.toString()),
+                details = mapOf("cacheRemoved" to (removed || isCustomCacheFile).toString()),
                 error = failure.cause,
             )
         }
@@ -2219,14 +2239,18 @@ class MusicService :
         sessionId: Long,
         request: QueuePlaybackRequest,
     ) {
-        val available = audioCacheManager.cachedSongIds(player.songQueue.value.mapTo(mutableSetOf()) { it.id })
+        val queueSnapshot = player.songQueue.value
+        val currentIdx = player.currentMediaItemIndex.value
         val next =
-            nextOfflineQueueIndex(
-                player.songQueue.value,
-                player.currentMediaItemIndex.value,
-                _repeatMode.value == Player.REPEAT_MODE_ALL,
-            ) { song ->
-                song.isLocal || song.id.startsWith("local_") || song.id in available || CustomMediaCacheManager.hasLocalFile(song.id)
+            withContext(Dispatchers.IO) {
+                val available = audioCacheManager.cachedSongIds(queueSnapshot.mapTo(mutableSetOf()) { it.id })
+                nextOfflineQueueIndex(
+                    queueSnapshot,
+                    currentIdx,
+                    _repeatMode.value == Player.REPEAT_MODE_ALL,
+                ) { song ->
+                    song.isLocal || song.id.startsWith("local_") || song.id in available || CustomMediaCacheManager.hasLocalFile(song.id)
+                }
             }
         if (!isCurrentQueueRequest(sessionId, request)) return
         if (next != null && !AndroidListenTogetherManager.isGuestPlaybackLocked && !AndroidDeviceConnect.manager.remote.isActive) {
@@ -2381,7 +2405,6 @@ class MusicService :
         if (foregroundStart) {
             try {
                 setupNotificationChannel()
-                // Media buttons and paused notification actions can arrive before a queue is restored.
                 promotePlaybackServiceStart(mediaNotificationProvider?.latestNotification)
             } catch (error: RuntimeException) {
                 Timber.w(error, "Playback service foreground start failed")
@@ -2399,7 +2422,6 @@ class MusicService :
             foregroundStartCleanupJob =
                 serviceScope.launch {
                     delay(10_000L)
-                    // A late self-start must not restore a dismissed or empty notification.
                     if (shouldReconcilePlaybackServiceStart(intent, media3Player)) {
                         triggerNotificationUpdate()
                     }
@@ -2452,28 +2474,45 @@ class MusicService :
         return START_NOT_STICKY
     }
 
-    private fun toggleFavorite() {
-        val song = player.currentSong.value ?: return
-        val willLike = !SongLikeState.isLiked(song.id)
-        SongLikeState.toggleLike(song)
-        if (willLike) {
+    private fun handleLikeChanged(
+        song: SongItem,
+        isNowLiked: Boolean,
+    ) {
+        if (isNowLiked) {
             AiWaveEngine.sharedInstance?.recordLike(song)
             if (HybridStreamResolver.isCachingEnabled()) {
                 val activeRes = player.currentPlaybackResource.value?.takeIf { it.videoId == song.id }
                 CustomMediaCacheManager.downloadLikedTrack(song, activeRes)
             }
         } else {
+            val artist = song.artists.joinToString(", ") { it.name }.trim()
+            customConfigStore.removeLikedTrackBackup(song.id, artist, song.title)
             CustomMediaCacheManager.removeLikedDownload(song.id)
         }
+    }
+
+    private fun toggleFavorite() {
+        val song = player.currentSong.value ?: return
+        val willLike = !SongLikeState.isLiked(song.id)
+        SongLikeState.toggleLike(song)
+        handleLikeChanged(song, isNowLiked = willLike)
         updateWidgetsNow()
     }
 
     private fun dislikeCurrentSong() {
         val song = player.currentSong.value ?: return
+        if (trackedSong?.id == song.id) {
+            trackedFinalized = true
+        }
         AiWaveEngine.sharedInstance?.recordDislike(song)
         if (SongLikeState.isLiked(song.id)) {
             SongLikeState.toggleLike(song)
+            val artist = song.artists.joinToString(", ") { it.name }.trim()
+            customConfigStore.removeLikedTrackBackup(song.id, artist, song.title)
             CustomMediaCacheManager.removeLikedDownload(song.id)
+        }
+        if (queueCoordinator.isMyWaveQueue()) {
+            queueCoordinator.triggerAutoPivotInBackground()
         }
         player.skipToNext(resumePlayback = true)
         updateWidgetsNow()
@@ -2671,7 +2710,6 @@ class MusicService :
                 .distinctUntilChanged()
                 .collect { foreground ->
                     if (foreground) {
-                        // Requests fail while Android restricts background network; that is not a YouTube outage.
                         streamResolver.resetExtractionBackoff()
                     } else {
                         flushPodcastProgress()
@@ -2792,6 +2830,7 @@ class MusicService :
         val completedSong = player.currentSong.value ?: trackedSong
         if (!trackedCompletedRecorded && completedSong != null) {
             trackedCompletedRecorded = true
+            trackedFinalized = true
             AiWaveEngine.sharedInstance?.recordTrackCompletion(completedSong, completed = true)
         }
         flushPodcastProgress()
@@ -3143,7 +3182,6 @@ class MusicService :
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // The lifetime observer retains loading and remote playback; Media3 stops non-playing sessions immediately.
         if (!::player.isInitialized) return
         playbackBenchmark.cancel()
         saveFinalPlaybackState()
@@ -3159,7 +3197,6 @@ class MusicService :
             return
         }
         playbackBenchmark.cancel()
-        // A failure while saving state must not leak the session, or the next service fails with a duplicate session ID.
         try {
             releasePlaybackState()
         } finally {
@@ -3228,7 +3265,6 @@ class MusicService :
             controller: MediaSession.ControllerInfo,
         ): ListenableFuture<MediaSession.ConnectionResult> =
             if (controller.controllerVersion == MediaSession.ControllerInfo.LEGACY_CONTROLLER_VERSION) {
-                // Legacy browsers block main until this future completes; startup and restore also need main.
                 Futures.immediateFuture(connectionResult(session, controller))
             } else {
                 serviceScope.future {
@@ -3264,7 +3300,6 @@ class MusicService :
                     if (isAssistantController(controller)) {
                         automotivePlayerCommands()
                     } else if (authorized || controller.controllerVersion == MediaSession.ControllerInfo.LEGACY_CONTROLLER_VERSION) {
-                        // Platform bridges can lack a verified package; media-ID requests can only select the active queue.
                         externalTransportPlayerCommands()
                     } else {
                         MediaSession.ConnectionResult.DEFAULT_UNTRUSTED_PLAYER_COMMANDS
@@ -3354,10 +3389,18 @@ class MusicService :
                 if (AndroidListenTogetherManager.isGuestPlaybackLocked) {
                     return Futures.immediateFuture(SessionResult(SessionError.ERROR_PERMISSION_DENIED))
                 }
+                if (trackedSong?.id == song.id) {
+                    trackedFinalized = true
+                }
                 AiWaveEngine.sharedInstance?.recordDislike(song)
                 if (SongLikeState.isLiked(song.id)) {
                     SongLikeState.toggleLike(song)
+                    val artist = song.artists.joinToString(", ") { it.name }.trim()
+                    customConfigStore.removeLikedTrackBackup(song.id, artist, song.title)
                     CustomMediaCacheManager.removeLikedDownload(song.id)
+                }
+                if (queueCoordinator.isMyWaveQueue()) {
+                    queueCoordinator.triggerAutoPivotInBackground()
                 }
                 if (song.id == player.currentSong.value?.id) {
                     player.skipToNext(resumePlayback = true)
@@ -3365,8 +3408,17 @@ class MusicService :
                 updateWidgetsNow()
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             }
+            val wasLiked = song?.id?.let(SongLikeState::isLiked) == true
             val result = setMediaSessionRating(song, rating)
-            if (result == SessionResult.RESULT_SUCCESS) updateWidgetsNow()
+            if (result == SessionResult.RESULT_SUCCESS) {
+                if (song != null) {
+                    val isNowLiked = SongLikeState.isLiked(song.id)
+                    if (isNowLiked != wasLiked) {
+                        handleLikeChanged(song, isNowLiked = isNowLiked)
+                    }
+                }
+                updateWidgetsNow()
+            }
             return Futures.immediateFuture(SessionResult(result))
         }
 
