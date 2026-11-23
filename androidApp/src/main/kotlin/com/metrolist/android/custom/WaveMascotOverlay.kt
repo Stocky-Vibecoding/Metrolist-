@@ -525,6 +525,7 @@ private fun ServiceOAuthWebViewDialog(
                                         val u = request?.url?.toString() ?: return false
                                         if (checkUrl(u)) return true
                                         val scheme = request.url?.scheme?.lowercase().orEmpty()
+                                        // Не даём ВК перекинуть авторизацию в стороннее приложение через vk:// или intent://
                                         if (scheme != "http" && scheme != "https") {
                                             return true
                                         }
@@ -632,8 +633,8 @@ fun WaveHomeScreen(
     configStore: CustomConfigStore,
     aiWaveEngine: AiWaveEngine,
     geminiClient: GeminiClient,
-    yandexProvider: YandexMusicProvider,
-    vkProvider: VkMusicProvider,
+    @Suppress("UNUSED_PARAMETER") yandexProvider: YandexMusicProvider,
+    @Suppress("UNUSED_PARAMETER") vkProvider: VkMusicProvider,
     playerConnection: PlayerConnection?,
     bottomInset: Dp,
     onExpandPlayer: () -> Unit,
@@ -959,7 +960,7 @@ fun WaveHomeScreen(
                 config = cfg,
                 isGenerating = isGenerating,
                 onUpdate = { transform -> configStore.update(transform) },
-                onRefreshWave = {
+                onApplyOrRefresh = {
                     showWaveSettingsSheet = false
                     launchFreshWave()
                 },
@@ -1973,7 +1974,7 @@ private fun WaveFilterSheetContent(
     config: CustomAppConfig,
     isGenerating: Boolean,
     onUpdate: ((CustomAppConfig) -> CustomAppConfig) -> Unit,
-    onRefreshWave: () -> Unit,
+    onApplyOrRefresh: () -> Unit,
 ) {
     val hasCustomFilters =
         config.waveCharacter != WaveCharacter.DEFAULT ||
@@ -2062,7 +2063,7 @@ private fun WaveFilterSheetContent(
             }
             Button(
                 enabled = !isGenerating,
-                onClick = onRefreshWave,
+                onClick = onApplyOrRefresh,
                 modifier = Modifier.weight(1f).height(48.dp),
             ) {
                 Text(
@@ -2091,14 +2092,14 @@ fun CustomEngineSettingsContent(
     yandexProvider: YandexMusicProvider,
     vkProvider: VkMusicProvider,
     geminiClient: GeminiClient,
+    @Suppress("UNUSED_PARAMETER") onOpenClassicHome: () -> Unit = {},
+    @Suppress("UNUSED_PARAMETER") onRefreshWave: (() -> Unit)? = null,
     isYouTubeLoggedIn: Boolean = false,
     isLastFmLoggedIn: Boolean = false,
     onOpenYouTubeLogin: (() -> Unit)? = null,
     onOpenLastFmLogin: (() -> Unit)? = null,
     bottomPadding: Dp = 0.dp,
     showTitleHeader: Boolean = true,
-    onOpenClassicHome: () -> Unit = {},
-    onRefreshWave: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -2242,7 +2243,7 @@ fun CustomEngineSettingsContent(
             Modifier
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 8.dp),
+                .padding(horizontal = 20.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         if (showTitleHeader) {
@@ -2313,14 +2314,14 @@ fun CustomEngineSettingsContent(
                 Button(
                     onClick = onOpenYouTubeLogin,
                 ) {
-                    Text(if (isYouTubeLoggedIn) "Обновить YouTube" else "Войти в YouTube")
+                    Text(if (isYouTubeLoggedIn) "YouTube ✓" else "Войти в YouTube")
                 }
             }
             if (onOpenLastFmLogin != null) {
                 Button(
                     onClick = onOpenLastFmLogin,
                 ) {
-                    Text(if (isLastFmLoggedIn) "Настроить Last.fm" else "Войти в Last.fm")
+                    Text(if (isLastFmLoggedIn) "Last.fm ✓" else "Войти в Last.fm")
                 }
             }
             OutlinedButton(
@@ -2329,19 +2330,12 @@ fun CustomEngineSettingsContent(
                 Text(if (showManualTokens) "Скрыть токены" else "Вручную")
             }
         }
-        val statusParts =
-            buildList {
-                add("ВК: ${if (vkInput.isNotBlank()) "подключён" else "нет"}")
-                add("Яндекс: ${if (yandexInput.isNotBlank()) "подключён" else "нет"}")
-                if (onOpenYouTubeLogin != null) {
-                    add("YouTube: ${if (isYouTubeLoggedIn) "подключён" else "нет"}")
-                }
-                if (onOpenLastFmLogin != null) {
-                    add("Last.fm: ${if (isLastFmLoggedIn || lfmUserInput.isNotBlank()) "подключён" else "нет"}")
-                }
-            }
         Text(
-            text = statusParts.joinToString(" • "),
+            text =
+                "ВК: ${if (vkInput.isNotBlank()) "подключён" else "нет"} • " +
+                    "Яндекс: ${if (yandexInput.isNotBlank()) "подключён" else "нет"} • " +
+                    "YouTube: ${if (isYouTubeLoggedIn) "подключён" else "нет"} • " +
+                    "Last.fm: ${if (isLastFmLoggedIn) "подключён" else "нет"}",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -2371,14 +2365,14 @@ fun CustomEngineSettingsContent(
             OutlinedTextField(
                 value = lfmSecretInput,
                 onValueChange = { lfmSecretInput = it },
-                label = { Text("Last.fm Secret (необязательно)") },
+                label = { Text("Last.fm Secret") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
                 value = lfmUserInput,
                 onValueChange = { lfmUserInput = it },
-                label = { Text("Last.fm Username (необязательно)") },
+                label = { Text("Last.fm Username") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
