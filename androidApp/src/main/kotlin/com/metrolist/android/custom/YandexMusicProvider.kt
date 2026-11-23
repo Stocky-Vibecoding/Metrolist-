@@ -1,6 +1,9 @@
 package com.metrolist.android.custom
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
@@ -40,6 +43,8 @@ private data class YandexTrackCandidate(
 class YandexMusicProvider(
     private val configStore: CustomConfigStore,
 ) {
+    private val statusCheckMutex = Mutex()
+
     suspend fun checkPlusStatus(
         token: String = configStore.current.yandexToken,
     ): YandexPlusStatus {
@@ -50,7 +55,7 @@ class YandexMusicProvider(
         }
 
         val status =
-            runCatching {
+            try {
                 val response =
                     CustomHttp.get(
                         url = "$API_BASE/account/status",
@@ -66,9 +71,12 @@ class YandexMusicProvider(
                     }
                     else -> YandexPlusStatus.UNKNOWN
                 }
-            }.onFailure { error ->
+            } catch (e: CancellationException) {
+                throw e
+            } catch (error: Exception) {
                 Log.w(TAG, "Yandex status check failed: ${error.message}")
-            }.getOrDefault(YandexPlusStatus.UNKNOWN)
+                YandexPlusStatus.UNKNOWN
+            }
 
         configStore.setYandexPlusStatus(status)
         return status
@@ -105,7 +113,9 @@ class YandexMusicProvider(
         if (!ensurePlusActive(token)) return YandexResolveOutcome(stream = null)
 
         val cleanDirectId = directTrackId?.removePrefix("ym_")?.trim()?.takeIf { it.isNotBlank() && !it.startsWith("alb_") }
-        if (cleanDirectId != null && allowSuspectedCensored) {
+        val skipHeuristicCensorship = allowSuspectedCensored || !configStore.current.preferVkForExplicit
+
+        if (cleanDirectId != null && skipHeuristicCensorship) {
             val direct = fetchDirectMp3(token, cleanDirectId, reference.durationSec, reference.coverXlUrl)
             if (direct != null) {
                 return YandexResolveOutcome(stream = direct, trackId = cleanDirectId, coverUrl = direct.coverUrl)
@@ -137,7 +147,6 @@ class YandexMusicProvider(
             return YandexResolveOutcome(stream = null)
         }
 
-        val censorshipReason = detectCensorshipReason(best, reference)
         if (!best.available) {
             Log.d(TAG, "Yandex track unavailable (censored/removed): ${best.artist} - ${best.title}")
             return YandexResolveOutcome(
@@ -149,7 +158,8 @@ class YandexMusicProvider(
             )
         }
 
-        if (censorshipReason != null && !allowSuspectedCensored) {
+        val censorshipReason = detectCensorshipReason(best, reference)
+        if (censorshipReason != null && !skipHeuristicCensorship) {
             Log.d(TAG, "Yandex track flagged censored ($censorshipReason): ${best.artist} - ${best.title}")
             return YandexResolveOutcome(
                 stream = null,
@@ -197,7 +207,9 @@ class YandexMusicProvider(
             )
         val best = pickBestMatch(candidates, reference) ?: return null
         if (!best.available) return null
-        if (rejectSuspectedCensored && detectCensorshipReason(best, reference) != null) return null
+        if (rejectSuspectedCensored && configStore.current.preferVkForExplicit && detectCensorshipReason(best, reference) != null) {
+            return null
+        }
 
         return ExternalCatalogTrack(
             source = "yandex",
@@ -211,19 +223,22 @@ class YandexMusicProvider(
     }
 
     private suspend fun ensurePlusActive(token: String): Boolean {
-        val plusStatus =
-            when (val cached = configStore.yandexPlusStatus.value) {
-                YandexPlusStatus.UNKNOWN -> checkPlusStatus(token)
-                else -> cached
-            }
-        return plusStatus == YandexPlusStatus.ACTIVE
+        val cached = configStore.yandexPlusStatus.value
+        if (cached != YandexPlusStatus.UNKNOWN) {
+            return cached == YandexPlusStatus.ACTIVE
+        }
+        return statusCheckMutex.withLock {
+            val rechecked = configStore.yandexPlusStatus.value
+            val status = if (rechecked == YandexPlusStatus.UNKNOWN) checkPlusStatus(token) else rechecked
+            status == YandexPlusStatus.ACTIVE
+        }
     }
 
     private suspend fun searchTracks(
         token: String,
         query: String,
     ): List<YandexTrackCandidate> =
-        runCatching {
+        try {
             val url = "$API_BASE/search?type=track&text=${CustomHttp.urlEncode(query)}&page=0&nocorrect=false"
             val headers =
                 if (token.isNotBlank()) {
@@ -234,68 +249,75 @@ class YandexMusicProvider(
             val response = CustomHttp.get(url, headers = headers, timeoutMs = 6_000)
             if (token.isNotBlank() && (response.code == 401 || response.code == 403)) {
                 configStore.setYandexPlusStatus(YandexPlusStatus.INVALID_TOKEN)
-                return emptyList()
-            }
-            if (!response.isSuccess) return emptyList()
+                emptyList()
+            } else if (!response.isSuccess) {
+                emptyList()
+            } else {
+                val results =
+                    JSONObject(response.body)
+                        .optJSONObject("result")
+                        ?.optJSONObject("tracks")
+                        ?.optJSONArray("results")
 
-            val results =
-                JSONObject(response.body)
-                    .optJSONObject("result")
-                    ?.optJSONObject("tracks")
-                    ?.optJSONArray("results")
-                    ?: return emptyList()
-
-            buildList {
-                for (i in 0 until results.length()) {
-                    val item = results.optJSONObject(i) ?: continue
-                    val id = item.optString("id").takeIf { it.isNotBlank() } ?: continue
-                    val title = item.optString("title").trim()
-                    if (title.isBlank()) continue
-                    val version = item.optString("version").trim()
-                    val fullTitle =
-                        if (version.isNotBlank() && !title.contains(version, ignoreCase = true)) {
-                            "$title ($version)"
-                        } else {
-                            title
-                        }
-                    val artistsArray = item.optJSONArray("artists")
-                    val artistNames =
-                        buildList {
-                            if (artistsArray != null) {
-                                for (j in 0 until artistsArray.length()) {
-                                    artistsArray.optJSONObject(j)?.optString("name")?.takeIf { it.isNotBlank() }?.let(::add)
+                if (results == null) {
+                    emptyList()
+                } else {
+                    buildList {
+                        for (i in 0 until results.length()) {
+                            val item = results.optJSONObject(i) ?: continue
+                            val id = item.optString("id").takeIf { it.isNotBlank() } ?: continue
+                            val title = item.optString("title").trim()
+                            if (title.isBlank()) continue
+                            val version = item.optString("version").trim()
+                            val fullTitle =
+                                if (version.isNotBlank() && !title.contains(version, ignoreCase = true)) {
+                                    "$title ($version)"
+                                } else {
+                                    title
                                 }
-                            }
-                        }.joinToString(", ")
-                    val durationMs = item.optLong("durationMs", 0L)
-                    val durationSec = if (durationMs > 0L) durationMs / 1000L else null
-                    val contentWarning = item.optString("contentWarning")
-                    val disclaimers = item.optJSONArray("disclaimers")
-                    val isExplicit =
-                        contentWarning.equals("explicit", ignoreCase = true) ||
-                            hasDisclaimerToken(disclaimers, "explicit")
-                    val hasRestriction = hasRestrictionDisclaimer(disclaimers)
-                    val available = item.optBoolean("available", true)
-                    val coverUrl = formatHdCover(item.optString("coverUri"))
+                            val artistsArray = item.optJSONArray("artists")
+                            val artistNames =
+                                buildList {
+                                    if (artistsArray != null) {
+                                        for (j in 0 until artistsArray.length()) {
+                                            artistsArray.optJSONObject(j)?.optString("name")?.takeIf { it.isNotBlank() }?.let(::add)
+                                        }
+                                    }
+                                }.joinToString(", ")
+                            val durationMs = item.optLong("durationMs", 0L)
+                            val durationSec = if (durationMs > 0L) durationMs / 1000L else null
+                            val contentWarning = item.optString("contentWarning")
+                            val disclaimers = item.optJSONArray("disclaimers")
+                            val isExplicit =
+                                contentWarning.equals("explicit", ignoreCase = true) ||
+                                    hasDisclaimerToken(disclaimers, "explicit")
+                            val hasRestriction = hasRestrictionDisclaimer(disclaimers)
+                            val available = item.optBoolean("available", true)
+                            val coverUrl = formatHdCover(item.optString("coverUri"))
 
-                    add(
-                        YandexTrackCandidate(
-                            id = id,
-                            title = fullTitle,
-                            artist = artistNames,
-                            durationSec = durationSec,
-                            isExplicit = isExplicit,
-                            version = version,
-                            available = available,
-                            coverUrl = coverUrl,
-                            hasRestrictionDisclaimer = hasRestriction,
-                        ),
-                    )
+                            add(
+                                YandexTrackCandidate(
+                                    id = id,
+                                    title = fullTitle,
+                                    artist = artistNames,
+                                    durationSec = durationSec,
+                                    isExplicit = isExplicit,
+                                    version = version,
+                                    available = available,
+                                    coverUrl = coverUrl,
+                                    hasRestrictionDisclaimer = hasRestriction,
+                                ),
+                            )
+                        }
+                    }
                 }
             }
-        }.onFailure { error ->
+        } catch (e: CancellationException) {
+            throw e
+        } catch (error: Exception) {
             Log.w(TAG, "Yandex search failed: ${error.message}")
-        }.getOrDefault(emptyList())
+            emptyList()
+        }
 
     private fun pickBestMatch(
         candidates: List<YandexTrackCandidate>,
@@ -307,7 +329,7 @@ class YandexMusicProvider(
                     !TrackMatcher.hasForbiddenStopWord(reference.title, candidate.title) &&
                         candidate.durationSec.let { it == null || it > 35L }
                 }.mapNotNull { candidate ->
-                    // Допускаем до 12 сек на этапе отбора, чтобы ниже явно поймать обрезанный куплет (>=4 сек)
+                    // Допускаем до 15 сек на этапе отбора, чтобы ниже явно поймать обрезанный куплет (>=4 сек)
                     val durForMatch =
                         if (reference.durationSec != null && candidate.durationSec != null &&
                             abs(reference.durationSec - candidate.durationSec) > 15L
@@ -328,7 +350,7 @@ class YandexMusicProvider(
                     if (score >= 64) {
                         var bonus = 0
                         if (candidate.available) bonus += 8
-                        if (!isCleanVersionLabel(candidate.version)) bonus += 10 else bonus -= 25
+                        if (!isCleanVersionLabel(candidate.version, reference.title)) bonus += 10 else bonus -= 25
                         if (reference.isExplicit && candidate.isExplicit) bonus += 12
                         if (reference.isExplicit && !candidate.isExplicit) bonus -= 8
                         candidate to (score + bonus)
@@ -345,7 +367,7 @@ class YandexMusicProvider(
         reference: TrackReference,
     ): String? {
         if (!candidate.available) return "удалён/недоступен в Я.Музыке"
-        if (isCleanVersionLabel(candidate.version) || isCleanVersionLabel(candidate.title)) {
+        if (isCleanVersionLabel(candidate.version, reference.title) || isCleanVersionLabel(candidate.title, reference.title)) {
             return "clean/censored версия в Я.Музыке"
         }
         if (candidate.hasRestrictionDisclaimer) {
@@ -372,13 +394,18 @@ class YandexMusicProvider(
         return null
     }
 
-    private fun isCleanVersionLabel(text: String): Boolean {
+    private fun isCleanVersionLabel(
+        text: String,
+        targetTitle: String,
+    ): Boolean {
         val lower = text.lowercase()
-        return lower.contains("clean") ||
-            lower.contains("censored") ||
-            lower.contains("radio edit") ||
-            lower.contains("без мата") ||
-            lower.contains("цензур")
+        val targetLower = targetTitle.lowercase()
+        if (CLEAN_WORD_REGEX.containsMatchIn(lower) && !CLEAN_WORD_REGEX.containsMatchIn(targetLower)) {
+            return true
+        }
+        return CENSORED_VERSION_SUBSTRINGS.any { tag ->
+            lower.contains(tag) && !targetLower.contains(tag)
+        }
     }
 
     private fun hasDisclaimerToken(
@@ -417,7 +444,7 @@ class YandexMusicProvider(
         durationSec: Long?,
         coverUrl: String?,
     ): ResolvedCustomStream? =
-        runCatching {
+        try {
             val infoResp =
                 CustomHttp.get(
                     url = "$API_BASE/tracks/$trackId/download-info",
@@ -426,54 +453,70 @@ class YandexMusicProvider(
                 )
             if (infoResp.code == 401 || infoResp.code == 403) {
                 configStore.setYandexPlusStatus(YandexPlusStatus.INVALID_TOKEN)
-                return@runCatching null
-            }
-            if (!infoResp.isSuccess) return@runCatching null
+                null
+            } else if (!infoResp.isSuccess) {
+                null
+            } else {
+                val list = JSONObject(infoResp.body).optJSONArray("result")
+                if (list == null) {
+                    null
+                } else {
+                    var bestUrl: String? = null
+                    var bestBitrate = -1
 
-            val list = JSONObject(infoResp.body).optJSONArray("result") ?: return@runCatching null
-            var bestUrl: String? = null
-            var bestBitrate = -1
+                    for (i in 0 until list.length()) {
+                        val entry = list.optJSONObject(i) ?: continue
+                        if (entry.optBoolean("preview", false)) continue
+                        val codec = entry.optString("codec")
+                        if (!codec.equals("mp3", ignoreCase = true)) continue
+                        val bitrate = entry.optInt("bitrateInKbps", 0)
+                        val downloadInfoUrl = entry.optString("downloadInfoUrl")
+                        if (downloadInfoUrl.isNotBlank() && bitrate > bestBitrate) {
+                            bestBitrate = bitrate
+                            bestUrl = downloadInfoUrl
+                        }
+                    }
 
-            for (i in 0 until list.length()) {
-                val entry = list.optJSONObject(i) ?: continue
-                val codec = entry.optString("codec")
-                if (!codec.equals("mp3", ignoreCase = true)) continue
-                val bitrate = entry.optInt("bitrateInKbps", 0)
-                val downloadInfoUrl = entry.optString("downloadInfoUrl")
-                if (downloadInfoUrl.isNotBlank() && bitrate > bestBitrate) {
-                    bestBitrate = bitrate
-                    bestUrl = downloadInfoUrl
+                    val targetInfoUrl = bestUrl
+                    if (targetInfoUrl == null) {
+                        null
+                    } else {
+                        val separator = if (targetInfoUrl.contains('?')) '&' else '?'
+                        val metaResp =
+                            CustomHttp.get(
+                                url = "$targetInfoUrl${separator}format=json",
+                                headers = authHeaders(token),
+                                timeoutMs = 6_000,
+                            )
+                        val meta = if (metaResp.isSuccess) parseDownloadMeta(metaResp.body) else null
+                        if (meta == null) {
+                            null
+                        } else {
+                            val normalizedPath = if (meta.path.startsWith("/")) meta.path else "/${meta.path}"
+                            val sign = CustomHttp.md5Hex(SIGN_SALT + normalizedPath.removePrefix("/") + meta.s)
+                            val directUrl = "https://${meta.host}/get-mp3/$sign/${meta.ts}$normalizedPath"
+
+                            ResolvedCustomStream(
+                                url = directUrl,
+                                headers = mapOf("User-Agent" to CLIENT_USER_AGENT),
+                                mimeType = "audio/mpeg",
+                                bitrate = if (bestBitrate > 0) bestBitrate * 1000 else null,
+                                durationSec = durationSec,
+                                clientName = "yandex",
+                                isHls = false,
+                                sourceTrackId = trackId,
+                                coverUrl = coverUrl,
+                            )
+                        }
+                    }
                 }
             }
-
-            val targetInfoUrl = bestUrl ?: return@runCatching null
-            val separator = if (targetInfoUrl.contains('?')) '&' else '?'
-            val metaResp =
-                CustomHttp.get(
-                    url = "$targetInfoUrl${separator}format=json",
-                    headers = authHeaders(token),
-                    timeoutMs = 6_000,
-                )
-            if (!metaResp.isSuccess) return@runCatching null
-
-            val (host, path, ts, s) = parseDownloadMeta(metaResp.body) ?: return@runCatching null
-            val sign = CustomHttp.md5Hex(SIGN_SALT + path.removePrefix("/") + s)
-            val directUrl = "https://$host/get-mp3/$sign/$ts$path"
-
-            ResolvedCustomStream(
-                url = directUrl,
-                headers = mapOf("User-Agent" to CLIENT_USER_AGENT),
-                mimeType = "audio/mpeg",
-                bitrate = if (bestBitrate > 0) bestBitrate * 1000 else null,
-                durationSec = durationSec,
-                clientName = "yandex",
-                isHls = false,
-                sourceTrackId = trackId,
-                coverUrl = coverUrl,
-            )
-        }.onFailure { error ->
+        } catch (e: CancellationException) {
+            throw e
+        } catch (error: Exception) {
             Log.w(TAG, "Yandex direct link failed for $trackId: ${error.message}")
-        }.getOrNull()
+            null
+        }
 
     private fun parseDownloadMeta(body: String): DownloadMeta? {
         val trimmed = body.trim()
@@ -529,5 +572,9 @@ class YandexMusicProvider(
         private const val SIGN_SALT = "XGRlBW9FXlekgbPrRHuSiA"
         private const val CLIENT_USER_AGENT = "Yandex-Music-API"
         private const val CENSORED_DURATION_CUT_SEC = 4L
+
+        private val CLEAN_WORD_REGEX = Regex("(?<![a-zа-яё0-9])clean(?![a-zа-яё0-9])")
+        private val CENSORED_VERSION_SUBSTRINGS =
+            listOf("censored", "radio edit", "без мата", "цензур")
     }
 }
