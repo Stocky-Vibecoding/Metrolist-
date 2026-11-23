@@ -71,7 +71,9 @@ val appModule =
         single<LocalAudioSource> {
             LocalAudioSource { id, song ->
                 val storedSong = song ?: get<MusicDatabase>().dao().getSongById(id)?.toSongItem()
-                storedSong?.let { get<AudioCacheManager>().getCachedPlaybackResource(it) }
+                storedSong
+                    ?.takeUnless { HybridStreamResolver.shouldBypassAudioCache(it) }
+                    ?.let { get<AudioCacheManager>().getCachedPlaybackResource(it) }
             }
         }
 
@@ -123,7 +125,8 @@ val appModule =
 
         single { GeminiClient(get()) }
 
-        single { AiWaveEngine(get(), get()) }
+        // Инициализируем при старте, чтобы фоновый запуск (Bluetooth / Android Auto / виджет) всегда видел волну
+        single(createdAtStart = true) { AiWaveEngine(get(), get()) }
 
         single<StreamResolver> {
             val baseResolver =
