@@ -273,7 +273,7 @@ class MusicService :
         var isRunning: Boolean = false
             private set
 
-        /** Подключается для отправки накопленных в офлайне скробблов Last.fm при возврате сети. */
+        /** Подключается в App.kt для отправки накопленных в офлайне скробблов Last.fm при возврате сети. */
         @Volatile
         var offlineScrobbleSender: (suspend (PendingScrobble) -> Boolean)? = null
     }
@@ -1041,9 +1041,14 @@ class MusicService :
                 val reachedScrobble =
                     (effectiveDurationMs >= 30_000L && trackedMaxPositionMs >= effectiveDurationMs / 2L) ||
                         (effectiveDurationMs <= 0L && trackedMaxPositionMs >= 45_000L)
-                if (!trackedOfflineScrobbled && reachedScrobble && externalReportingEnabled && !PlaybackNetworkStateStore.current.connected) {
+                // Штатный ScrobbleManager уже буферизует треки с известной длительностью;
+                // в наш LastFmOfflineBuffer пишем только треки без duration, чтобы не было дублей
+                val missingDurationForCoreScrobbler = song.duration?.takeIf { it > 0L } == null
+                if (!trackedOfflineScrobbled && missingDurationForCoreScrobbler && reachedScrobble &&
+                    externalReportingEnabled && !PlaybackNetworkStateStore.current.connected
+                ) {
                     trackedOfflineScrobbled = true
-                    val artistStr = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
+                    val artistStr = song.artists.joinToString(", ") { it.name }.trim()
                     if (artistStr.isNotBlank() && song.title.isNotBlank()) {
                         LastFmOfflineBuffer.enqueue(
                             PendingScrobble(
@@ -1479,11 +1484,12 @@ class MusicService :
 
             failedResource
                 ?.takeIf { resource ->
-                    val isCustomTimeout =
-                        (failureCategory == PlaybackFailureCategory.TIMEOUT || lastFailure is TimeoutException) &&
-                            (resource.clientName == "vk" || resource.clientName == "yandex")
+                    val isWatchdogOrCustomTimeout =
+                        failure.stage == "buffering_watchdog" ||
+                            ((failureCategory == PlaybackFailureCategory.TIMEOUT || lastFailure is TimeoutException) &&
+                                (resource.clientName == "vk" || resource.clientName == "yandex"))
                     decision.action == PlaybackRecoveryAction.RETRY_CLIENT ||
-                        isCustomTimeout ||
+                        isWatchdogOrCustomTimeout ||
                         failureCategory == PlaybackFailureCategory.CDN_FORBIDDEN ||
                         failureCategory == PlaybackFailureCategory.SABR_PROTOCOL ||
                         failureCategory == PlaybackFailureCategory.SABR_ATTESTATION
