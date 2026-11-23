@@ -54,6 +54,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -198,7 +199,13 @@ class PlayerConnection(
     private var queueUndo: QueueUndo? = null
     private var playlistRequestGeneration = 0L
     private var playlistRequestJob: Job? = null
-    private var lastPreResolvedVideoId: String? = null
+
+    @Volatile
+    private var preResolvedVideoId: String? = null
+
+    @Volatile
+    private var preResolvingVideoId: String? = null
+
     private var preResolveJob: Job? = null
 
     private fun cancelPlaylistRequest() {
@@ -419,6 +426,8 @@ class PlayerConnection(
     private fun disconnect() {
         connectionJob?.cancel()
         preResolveJob?.cancel()
+        preResolvedVideoId = null
+        preResolvingVideoId = null
         observationScope?.cancel()
         observationScope = null
         musicService?.player?.removePlayerListener(readinessListener)
@@ -539,8 +548,16 @@ class PlayerConnection(
         if (songs.isEmpty()) return
         if (deferUntilConnected { replaceUpcomingWaveQueue(songs) }) return
         val player = musicService?.player ?: return
-        val currentId = _currentSong.value?.id
-        val upcoming = if (currentId != null) songs.filterNot { it.id == currentId } else songs
+        val snapshot = player.queueSnapshot()
+        val playedOrCurrentIds =
+            if (snapshot.currentIndex in snapshot.displayedItems.indices) {
+                snapshot.displayedItems
+                    .take(snapshot.currentIndex + 1)
+                    .mapTo(HashSet()) { it.id }
+            } else {
+                setOfNotNull(_currentSong.value?.id)
+            }
+        val upcoming = songs.filterNot { it.id in playedOrCurrentIds }
         if (upcoming.isEmpty()) return
         if (_currentSong.value == null) {
             playQueue(
@@ -631,9 +648,10 @@ class PlayerConnection(
                     _currentSong.value = activeSong
                 }
 
+                // Страховочный повтор предзагрузки ближе к концу трека, если ранний пре-резолв не успел
                 val remainingMs = durMs - posMs
                 if (durMs > 30_000L && remainingMs in 1_000L..22_000L) {
-                    triggerNextTrackPreResolve()
+                    triggerNextTrackPreResolve(debounceMs = 0L)
                 }
             }.collect {}
         }
@@ -688,6 +706,11 @@ class PlayerConnection(
                 _queueSongs.value = it.displayedItems
                 _currentMediaItemIndex.value = it.currentIndex
                 _shuffleModeEnabled.value = it.isShuffled
+                val activeSong = _currentSong.value
+                val activeRes = _currentPlaybackResource.value
+                if (activeSong != null && activeRes != null && activeRes.videoId == activeSong.id) {
+                    triggerNextTrackPreResolve(debounceMs = 700L)
+                }
             }
         }
         scope.launch {
@@ -729,16 +752,20 @@ class PlayerConnection(
                 _currentPlaybackResource.value = res
                 updateProgress()
                 val activeSong = player.currentSong.value
-                if (res != null && activeSong != null && res.videoId == activeSong.id && HybridStreamResolver.isCachingEnabled()) {
-                    if (SongLikeState.isLiked(activeSong.id)) {
-                        CustomMediaCacheManager.downloadLikedTrack(activeSong, res)
-                    } else if (_queueTitle.value?.startsWith("Моя волна") == true) {
-                        CustomMediaCacheManager.cacheWaveTrack(
-                            song = activeSong,
-                            resource = res,
-                            vibeTag = AiWaveEngine.sharedInstance?.currentVibeTag(),
-                        )
+                if (res != null && activeSong != null && res.videoId == activeSong.id) {
+                    if (HybridStreamResolver.isCachingEnabled()) {
+                        if (SongLikeState.isLiked(activeSong.id)) {
+                            CustomMediaCacheManager.downloadLikedTrack(activeSong, res)
+                        } else if (_queueTitle.value?.startsWith("Моя волна") == true) {
+                            CustomMediaCacheManager.cacheWaveTrack(
+                                song = activeSong,
+                                resource = res,
+                                vibeTag = AiWaveEngine.sharedInstance?.currentVibeTag(),
+                            )
+                        }
                     }
+                    // Сразу после старта текущего трека тихо предзагружаем следующий, чтобы ручной скип был мгновенным
+                    triggerNextTrackPreResolve(debounceMs = 700L)
                 }
             }
         }
@@ -770,24 +797,31 @@ class PlayerConnection(
         }
     }
 
-    private fun triggerNextTrackPreResolve() {
+    private fun triggerNextTrackPreResolve(debounceMs: Long = 700L) {
         val snap = _queueSnapshot.value
         val nextSong = snap.displayedItems.getOrNull(snap.currentIndex + 1) ?: return
-        if (nextSong.id.isBlank() || nextSong.id == lastPreResolvedVideoId) return
-        lastPreResolvedVideoId = nextSong.id
+        if (nextSong.id.isBlank()) return
+        if (nextSong.id == preResolvedVideoId || nextSong.id == preResolvingVideoId) return
         val isWave = _queueTitle.value?.startsWith("Моя волна") == true
         val vibeTag = AiWaveEngine.sharedInstance?.currentVibeTag()
         preResolveJob?.cancel()
+        preResolvingVideoId = nextSong.id
         preResolveJob =
             scope.launch(Dispatchers.IO) {
                 try {
+                    if (debounceMs > 0L) delay(debounceMs)
                     HybridStreamResolver.preResolve(nextSong)
+                    preResolvedVideoId = nextSong.id
+                    if (isWave && HybridStreamResolver.isCachingEnabled()) {
+                        CustomMediaCacheManager.cacheWaveTrack(nextSong, null, vibeTag = vibeTag)
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
-                }
-                if (isWave && HybridStreamResolver.isCachingEnabled()) {
-                    CustomMediaCacheManager.cacheWaveTrack(nextSong, null, vibeTag = vibeTag)
+                } finally {
+                    if (preResolvingVideoId == nextSong.id) {
+                        preResolvingVideoId = null
+                    }
                 }
             }
     }
@@ -805,7 +839,9 @@ class PlayerConnection(
         val artist = (song.canonicalArtists ?: song.artists).joinToString(", ") { it.name }.trim()
         val songTitle = (song.canonicalTitle ?: song.title).trim()
         HybridStreamResolver.invalidateTrack(song.id, artist, songTitle)
-        lastPreResolvedVideoId = null
+        preResolveJob?.cancel()
+        preResolvedVideoId = null
+        preResolvingVideoId = null
         service.playQueue(
             items,
             currentIndex,
