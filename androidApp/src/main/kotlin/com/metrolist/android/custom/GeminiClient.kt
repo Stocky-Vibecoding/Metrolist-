@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap
 data class AiTrackSuggestion(
     val artist: String,
     val title: String,
+    val isFreshSlot: Boolean = false,
 )
 
 class GeminiClient(
@@ -23,6 +24,7 @@ class GeminiClient(
     private val cooldownUntilMs = ConcurrentHashMap<String, Long>()
     private val consecutive429 = ConcurrentHashMap<String, Int>()
     private val unavailableModels = ConcurrentHashMap.newKeySet<String>()
+    private val modelsRejectingThinkingConfig = ConcurrentHashMap.newKeySet<String>()
 
     @Volatile
     private var lastUsedApiKey: String = ""
@@ -43,18 +45,28 @@ class GeminiClient(
         sharedInstance = this
     }
 
+    /** Возвращает true только если в кулдауне ВСЕ доступные модели каскада, а не одна из них. */
     fun hasActiveCooldown(): Boolean {
         val now = System.currentTimeMillis()
-        return cooldownUntilMs.values.any { it > now }
+        val candidates = resolveCandidateModels(configStore.current.geminiModelMode)
+        if (candidates.isEmpty()) return true
+        return candidates.all { (cooldownUntilMs[it] ?: 0L) > now }
     }
 
     suspend fun generateTrackList(
         prompt: String,
         count: Int,
+        includeFreshTag: Boolean = false,
     ): Result<List<AiTrackSuggestion>> {
+        val formatDesc =
+            if (includeFreshTag) {
+                "Формат каждого объекта: {\"artist\":\"Имя артиста\",\"title\":\"Название трека\",\"fresh\":true/false}."
+            } else {
+                "Формат каждого объекта: {\"artist\":\"Имя артиста\",\"title\":\"Название трека\"}."
+            }
         val systemInstruction =
             "Ты музыкальный куратор. Отвечай СТРОГО валидным JSON-массивом объектов без пояснений и без markdown. " +
-                "Формат каждого объекта: {\"artist\":\"Имя артиста\",\"title\":\"Название трека\"}. " +
+                "$formatDesc " +
                 "Верни ровно $count реальных, существующих треков без дубликатов."
 
         return generateText(
@@ -62,6 +74,8 @@ class GeminiClient(
             systemInstruction = systemInstruction,
             expectJson = true,
             temperature = 0.85,
+            timeoutMs = 14_000,
+            disableThinking = true,
         ).mapCatching { raw ->
             parseTrackSuggestions(raw).also { list ->
                 check(list.isNotEmpty()) { "Gemini вернул пустой список треков" }
@@ -90,6 +104,9 @@ class GeminiClient(
                 systemInstruction = systemInstruction,
                 expectJson = true,
                 temperature = 0.0,
+                timeoutMs = 7_000,
+                disableThinking = true,
+                maxOutputTokens = 32,
             ).getOrNull() ?: return null
 
         return runCatching {
@@ -113,24 +130,30 @@ class GeminiClient(
             buildString {
                 append("Сейчас играет трек: $artist — $title.")
                 if (!moodHint.isNullOrBlank()) append(" Настроение волны: $moodHint.")
-                append(" Напиши одну короткую (до 9 слов), живую и слегка ироничную фразу на русском о звучании или вайбе этого трека. Без кавычек, без эмодзи, без вступлений.")
+                append(" Напиши одну короткую (5–9 слов), живую и слегка ироничную фразу на русском именно про звучание, подачу или атмосферу этого трека. ")
+                append("Без кавычек, без эмодзи, без вступлений и БЕЗ шаблонов про кнопку, плеер или ИИ.")
             }
 
         return generateText(
             prompt = prompt,
             systemInstruction = null,
             expectJson = false,
-            temperature = 0.9,
+            temperature = 0.95,
+            timeoutMs = 7_000,
+            disableThinking = true,
+            maxOutputTokens = 80,
         ).getOrNull()
             ?.replace("\"", "")
+            ?.replace("«", "")
+            ?.replace("»", "")
             ?.replace("\n", " ")
             ?.trim()
-            ?.takeIf { it.length in 6..110 }
+            ?.takeIf { it.length in 6..110 && !isBoringMetaPhrase(it) }
     }
 
     suspend fun generateMascotPhrasePack(
         moodHint: String? = null,
-        count: Int = 10,
+        count: Int = 12,
     ): List<String> {
         val cfg = configStore.current
         if (cfg.geminiApiKey.isBlank()) return emptyList()
@@ -141,9 +164,9 @@ class GeminiClient(
 
         val prompt =
             buildString {
-                append("Придумай $count коротких (до 9 слов каждая), живых и слегка ироничных фраз на русском от лица музыкального маскота в плеере")
-                if (!moodHint.isNullOrBlank()) append(" под настроение «$moodHint»")
-                append(". Без упоминания конкретных треков, без эмодзи, без кавычек внутри строк, чтобы подходили под разные композиции.")
+                append("Придумай $count коротких (5–9 слов каждая), живых и слегка дерзких/ироничных фраз на русском от лица девушки-маскота в музыкальном плеере")
+                if (!moodHint.isNullOrBlank()) append(" под вайб «$moodHint»")
+                append(". Про музыку, бит, бас, дорогу или настроение. Без упоминания конкретных треков, без эмодзи, без фраз про кнопку или ИИ.")
             }
 
         val raw =
@@ -152,9 +175,11 @@ class GeminiClient(
                 systemInstruction = systemInstruction,
                 expectJson = true,
                 temperature = 0.95,
+                timeoutMs = 9_000,
+                disableThinking = true,
             ).getOrNull() ?: return emptyList()
 
-        return parseStringArray(raw)
+        return parseStringArray(raw).filterNot(::isBoringMetaPhrase)
     }
 
     suspend fun testConnection(apiKeyOverride: String? = null): Result<String> {
@@ -168,6 +193,9 @@ class GeminiClient(
             expectJson = false,
             temperature = 0.0,
             apiKeyOverride = key,
+            timeoutMs = 8_000,
+            disableThinking = true,
+            maxOutputTokens = 16,
         ).map {
             val used = _activeModel.value ?: DEFAULT_MODELS.first()
             val total = discoveredModels.size
@@ -181,6 +209,7 @@ class GeminiClient(
             cooldownUntilMs.clear()
             consecutive429.clear()
             unavailableModels.clear()
+            modelsRejectingThinkingConfig.clear()
         }
     }
 
@@ -195,7 +224,7 @@ class GeminiClient(
         val found =
             try {
                 val url = "${apiBaseUrl()}/models?pageSize=100"
-                val resp = CustomHttp.get(url, headers = mapOf("x-goog-api-key" to apiKey), timeoutMs = 8_000)
+                val resp = CustomHttp.get(url, headers = mapOf("x-goog-api-key" to apiKey), timeoutMs = 6_000)
                 if (!resp.isSuccess) {
                     emptyList()
                 } else {
@@ -207,6 +236,7 @@ class GeminiClient(
                             listOf(
                                 "embedding",
                                 "imagen",
+                                "image",
                                 "veo",
                                 "tts",
                                 "audio",
@@ -218,6 +248,7 @@ class GeminiClient(
                                 "transcribe",
                                 "vision",
                                 "nano",
+                                "thinking",
                             )
                         val candidates = mutableListOf<String>()
                         for (i in 0 until arr.length()) {
@@ -257,24 +288,37 @@ class GeminiClient(
         }
     }
 
+    /** В приоритете — самые быстрые и свежие доступные Flash / Flash-Lite модели, Pro и Gemma строго в резерве. */
     private fun modelPriority(name: String): Int {
         val lower = name.lowercase()
         return when {
-            lower == "gemini-2.5-flash" -> 1
-            lower == "gemini-2.5-flash-lite" -> 2
-            lower.contains("3") && lower.contains("flash-lite") -> 3
-            lower.contains("3") && lower.contains("flash") -> 4
-            lower == "gemini-2.0-flash" -> 5
-            lower == "gemini-2.0-flash-lite" -> 6
-            lower.contains("flash-lite") -> 7
-            lower.contains("flash") -> 8
-            lower.contains("2.5-pro") -> 12
-            lower.contains("pro") -> 14
-            lower.startsWith("gemma-3-27b") -> 20
-            lower.startsWith("gemma-3-12b") -> 21
-            lower.startsWith("gemma-3-") -> 22
+            lower == "gemini-3.5-flash-lite" || lower == "gemini-3.1-flash-lite" -> 1
+            lower.startsWith("gemini-3") && lower.contains("flash-lite") && !lower.contains("preview") -> 2
+            lower == "gemini-3.5-flash" || lower == "gemini-3.1-flash" -> 3
+            lower.startsWith("gemini-3") && lower.contains("flash") && !lower.contains("preview") -> 4
+            lower == "gemini-2.5-flash-lite" -> 5
+            lower == "gemini-2.5-flash" -> 6
+            lower.startsWith("gemini-3") && lower.contains("flash-lite") -> 7
+            lower.startsWith("gemini-3") && lower.contains("flash") -> 8
+            lower == "gemini-2.0-flash-lite" -> 9
+            lower == "gemini-2.0-flash" -> 10
+            lower.contains("flash-lite") -> 11
+            lower.contains("flash") -> 12
+            lower.contains("2.5-pro") -> 16
+            lower.contains("pro") -> 18
+            lower.startsWith("gemma-3-27b") -> 22
+            lower.startsWith("gemma-3-12b") -> 23
+            lower.startsWith("gemma-3-") -> 24
             else -> 30
         }
+    }
+
+    private fun shouldDisableThinking(model: String): Boolean {
+        val lower = model.lowercase()
+        if (lower.startsWith("gemma-")) return false
+        if (lower.contains("pro")) return false
+        if (lower.contains("1.5") || lower.contains("2.0")) return false
+        return lower.contains("flash")
     }
 
     private suspend fun generateText(
@@ -283,6 +327,9 @@ class GeminiClient(
         expectJson: Boolean,
         temperature: Double,
         apiKeyOverride: String? = null,
+        timeoutMs: Int = 14_000,
+        disableThinking: Boolean = true,
+        maxOutputTokens: Int? = null,
     ): Result<String> {
         val cfg = configStore.current
         val apiKey = (apiKeyOverride ?: cfg.geminiApiKey).trim()
@@ -300,77 +347,107 @@ class GeminiClient(
         val attempts = mutableListOf<String>()
 
         for (model in modelsToTry) {
-            val payload = buildRequestPayload(model, prompt, systemInstruction, expectJson, temperature)
-            val url = "${apiBaseUrl()}/models/$model:generateContent"
+            var includeThinkingOff =
+                disableThinking &&
+                    shouldDisableThinking(model) &&
+                    model !in modelsRejectingThinkingConfig
+            var retriedWithoutThinking = false
 
-            val response =
-                try {
-                    CustomHttp.postJson(
-                        url = url,
-                        jsonBody = payload,
-                        headers = mapOf("x-goog-api-key" to apiKey),
-                        timeoutMs = 25_000,
+            while (true) {
+                val payload =
+                    buildRequestPayload(
+                        model = model,
+                        prompt = prompt,
+                        systemInstruction = systemInstruction,
+                        expectJson = expectJson,
+                        temperature = temperature,
+                        disableThinking = includeThinkingOff,
+                        maxOutputTokens = maxOutputTokens,
                     )
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (err: Exception) {
-                    attempts.add("${shortName(model)}:net")
-                    Log.w(TAG, "Network error on $model: ${err.message}")
-                    continue
-                }
+                val url = "${apiBaseUrl()}/models/$model:generateContent"
 
-            when {
-                response.isSuccess -> {
-                    val text = extractResponseText(response.body)
-                    if (!text.isNullOrBlank()) {
-                        consecutive429.remove(model)
-                        cooldownUntilMs.remove(model)
-                        _activeModel.value = model
-                        return Result.success(text)
+                val response =
+                    try {
+                        CustomHttp.postJson(
+                            url = url,
+                            jsonBody = payload,
+                            headers = mapOf("x-goog-api-key" to apiKey),
+                            timeoutMs = timeoutMs,
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (err: Exception) {
+                        attempts.add("${shortName(model)}:net")
+                        Log.w(TAG, "Network error on $model: ${err.message}")
+                        break
                     }
-                    attempts.add("${shortName(model)}:empty")
-                }
 
-                response.code == 429 -> {
-                    val hits = (consecutive429[model] ?: 0) + 1
-                    consecutive429[model] = hits
-                    val waitMs =
-                        response.retryAfterSeconds?.let { (it * 1_000L).coerceAtMost(COOLDOWN_LONG_MS) }
-                            ?: if (hits >= 2) COOLDOWN_LONG_MS else COOLDOWN_SHORT_MS
-                    cooldownUntilMs[model] = System.currentTimeMillis() + waitMs
-                    attempts.add("${shortName(model)}:429")
-                    Log.w(TAG, "Model $model hit 429 (hits=$hits), cooldown ${waitMs / 1000}s")
-                }
+                when {
+                    response.isSuccess -> {
+                        val text = extractResponseText(response.body)
+                        if (!text.isNullOrBlank()) {
+                            consecutive429.remove(model)
+                            cooldownUntilMs.remove(model)
+                            _activeModel.value = model
+                            return Result.success(text)
+                        }
+                        attempts.add("${shortName(model)}:empty")
+                        break
+                    }
 
-                response.code == 503 || response.code == 500 -> {
-                    cooldownUntilMs[model] = System.currentTimeMillis() + COOLDOWN_SHORT_MS
-                    attempts.add("${shortName(model)}:${response.code}")
-                    Log.w(TAG, "Model $model returned ${response.code}")
-                }
+                    response.code == 429 -> {
+                        val hits = (consecutive429[model] ?: 0) + 1
+                        consecutive429[model] = hits
+                        val waitMs =
+                            response.retryAfterSeconds?.let { (it * 1_000L).coerceAtMost(COOLDOWN_LONG_MS) }
+                                ?: if (hits >= 2) COOLDOWN_LONG_MS else COOLDOWN_SHORT_MS
+                        cooldownUntilMs[model] = System.currentTimeMillis() + waitMs
+                        attempts.add("${shortName(model)}:429")
+                        Log.w(TAG, "Model $model hit 429 (hits=$hits), cooldown ${waitMs / 1000}s")
+                        break
+                    }
 
-                response.code == 404 -> {
-                    unavailableModels.add(model)
-                    attempts.add("${shortName(model)}:404")
-                    Log.w(TAG, "Model $model not found (404)")
-                }
+                    response.code == 503 || response.code == 500 -> {
+                        cooldownUntilMs[model] = System.currentTimeMillis() + COOLDOWN_SHORT_MS
+                        attempts.add("${shortName(model)}:${response.code}")
+                        Log.w(TAG, "Model $model returned ${response.code}")
+                        break
+                    }
 
-                response.code == 401 || response.code == 403 -> {
-                    val msg = extractErrorMessage(response.body) ?: "HTTP ${response.code}"
-                    return Result.failure(IllegalStateException("Ошибка ключа Gemini: $msg"))
-                }
+                    response.code == 404 -> {
+                        unavailableModels.add(model)
+                        attempts.add("${shortName(model)}:404")
+                        Log.w(TAG, "Model $model not found (404)")
+                        break
+                    }
 
-                response.code == 400 -> {
-                    val msg = extractErrorMessage(response.body).orEmpty()
-                    if (msg.contains("API key", ignoreCase = true) || msg.contains("API_KEY", ignoreCase = true)) {
+                    response.code == 401 || response.code == 403 -> {
+                        val msg = extractErrorMessage(response.body) ?: "HTTP ${response.code}"
                         return Result.failure(IllegalStateException("Ошибка ключа Gemini: $msg"))
                     }
-                    unavailableModels.add(model)
-                    attempts.add("${shortName(model)}:400")
-                    Log.w(TAG, "Model $model rejected payload (400): $msg")
-                }
 
-                else -> {
-                    attempts.add("${shortName(model)}:${response.code}")
+                    response.code == 400 -> {
+                        val msg = extractErrorMessage(response.body).orEmpty()
+                        if (msg.contains("API key", ignoreCase = true) || msg.contains("API_KEY", ignoreCase = true)) {
+                            return Result.failure(IllegalStateException("Ошибка ключа Gemini: $msg"))
+                        }
+                        if (includeThinkingOff && !retriedWithoutThinking) {
+                            modelsRejectingThinkingConfig.add(model)
+                            includeThinkingOff = false
+                            retriedWithoutThinking = true
+                            Log.d(TAG, "Retrying $model without thinkingConfig after 400: $msg")
+                            continue
+                        }
+                        unavailableModels.add(model)
+                        attempts.add("${shortName(model)}:400")
+                        Log.w(TAG, "Model $model rejected payload (400): $msg")
+                        break
+                    }
+
+                    else -> {
+                        attempts.add("${shortName(model)}:${response.code}")
+                        break
+                    }
                 }
             }
         }
@@ -392,6 +469,7 @@ class GeminiClient(
             (discoveredModels + DEFAULT_MODELS)
                 .distinct()
                 .filterNot { it in unavailableModels }
+                .sortedBy { modelPriority(it) }
                 .ifEmpty { DEFAULT_MODELS }
 
         val ordered =
@@ -412,6 +490,8 @@ class GeminiClient(
         systemInstruction: String?,
         expectJson: Boolean,
         temperature: Double,
+        disableThinking: Boolean,
+        maxOutputTokens: Int?,
     ): String {
         val isGemma = model.startsWith("gemma-", ignoreCase = true)
         val root = JSONObject()
@@ -443,6 +523,12 @@ class GeminiClient(
         if (expectJson && !isGemma) {
             genConfig.put("responseMimeType", "application/json")
         }
+        if (disableThinking && !isGemma) {
+            genConfig.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+        }
+        if (maxOutputTokens != null && maxOutputTokens > 0) {
+            genConfig.put("maxOutputTokens", maxOutputTokens)
+        }
         root.put("generationConfig", genConfig)
         return root.toString()
     }
@@ -457,11 +543,23 @@ class GeminiClient(
                     ?.optJSONObject("content")
                     ?.optJSONArray("parts")
                     ?: return@runCatching null
-            buildString {
-                for (i in 0 until parts.length()) {
-                    append(parts.optJSONObject(i)?.optString("text").orEmpty())
-                }
-            }.trim()
+            val visibleText =
+                buildString {
+                    for (i in 0 until parts.length()) {
+                        val part = parts.optJSONObject(i) ?: continue
+                        if (part.optBoolean("thought", false)) continue
+                        append(part.optString("text").orEmpty())
+                    }
+                }.trim()
+            if (visibleText.isNotBlank()) {
+                visibleText
+            } else {
+                buildString {
+                    for (i in 0 until parts.length()) {
+                        append(parts.optJSONObject(i)?.optString("text").orEmpty())
+                    }
+                }.trim()
+            }
         }.getOrNull()
 
     private fun extractErrorMessage(body: String): String? =
@@ -477,6 +575,14 @@ class GeminiClient(
             .removePrefix(fence)
             .removeSuffix(fence)
             .trim()
+    }
+
+    private fun isBoringMetaPhrase(line: String): Boolean {
+        val lower = line.lowercase()
+        return lower.contains("просто кнопка") ||
+            lower.contains("я кнопка") ||
+            lower.contains("я бот") ||
+            lower.contains("нейросет")
     }
 
     private fun parseTrackSuggestions(raw: String): List<AiTrackSuggestion> =
@@ -496,7 +602,13 @@ class GeminiClient(
                     if (artist.isBlank() || title.isBlank()) continue
                     val key = "${artist.lowercase()}::${title.lowercase()}"
                     if (seen.add(key)) {
-                        add(AiTrackSuggestion(artist = artist, title = title))
+                        add(
+                            AiTrackSuggestion(
+                                artist = artist,
+                                title = title,
+                                isFreshSlot = obj.optBoolean("fresh", false),
+                            ),
+                        )
                     }
                 }
             }
@@ -516,6 +628,8 @@ class GeminiClient(
                         array
                             .optString(i)
                             .replace("\"", "")
+                            .replace("«", "")
+                            .replace("»", "")
                             .replace("\n", " ")
                             .trim()
                     if (line.length in 6..110) add(line)
@@ -540,8 +654,8 @@ class GeminiClient(
 
         val DEFAULT_MODELS =
             listOf(
-                "gemini-2.5-flash",
                 "gemini-2.5-flash-lite",
+                "gemini-2.5-flash",
                 "gemini-3-flash-preview",
                 "gemini-2.0-flash",
                 "gemini-2.0-flash-lite",
@@ -557,12 +671,10 @@ class MascotPhraseBank(
 ) {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val prefsLock = Any()
+    private val recentShownLines = ArrayDeque<String>()
 
     @Volatile
     private var lastShownLine: String? = null
-
-    @Volatile
-    private var tracksSinceMoodLine = 1
 
     suspend fun nextPhraseForTrack(
         artist: String,
@@ -570,42 +682,39 @@ class MascotPhraseBank(
         moodKey: String,
         moodLabel: String,
         hasGeminiKey: Boolean,
+        forceFresh: Boolean = false,
     ): String? =
         withContext(Dispatchers.IO) {
             val trackKey = "${artist.trim().lowercase()}::${title.trim().lowercase()}"
 
-            synchronized(prefsLock) {
-                loadTrackCache().optString(trackKey).takeIf { it.isNotBlank() }
-            }?.let { cached ->
-                lastShownLine = cached
-                tracksSinceMoodLine = 0
-                return@withContext cached
+            if (!forceFresh) {
+                synchronized(prefsLock) {
+                    loadTrackCache().optString(trackKey).takeIf { it.isNotBlank() }
+                }?.takeIf { it != lastShownLine }?.let { cached ->
+                    rememberShown(cached)
+                    return@withContext cached
+                }
             }
 
             val now = System.currentTimeMillis()
             val lastTrackAiMs = prefs.getLong(KEY_LAST_TRACK_AI_MS, 0L)
+            val minCooldown = if (forceFresh) FORCE_REFRESH_COOLDOWN_MS else TRACK_AI_COOLDOWN_MS
 
-            if (hasGeminiKey && !geminiClient.hasActiveCooldown() && now - lastTrackAiMs >= TRACK_AI_COOLDOWN_MS) {
-                prefs.edit().putLong(KEY_LAST_TRACK_AI_MS, now).apply()
+            if (hasGeminiKey && !geminiClient.hasActiveCooldown() && now - lastTrackAiMs >= minCooldown) {
                 val generated = geminiClient.generateMascotLine(artist = artist, title = title, moodHint = moodLabel)
+                prefs.edit().putLong(KEY_LAST_TRACK_AI_MS, System.currentTimeMillis()).apply()
                 if (!generated.isNullOrBlank()) {
                     saveTrackPhrase(trackKey, generated)
-                    lastShownLine = generated
-                    tracksSinceMoodLine = 0
+                    rememberShown(generated)
                     return@withContext generated
                 }
-            }
-
-            tracksSinceMoodLine += 1
-            if (tracksSinceMoodLine < 2) {
-                return@withContext null
             }
 
             var pool = synchronized(prefsLock) { loadMoodPool(moodKey) }
             val lastPackMs = prefs.getLong(KEY_LAST_PACK_PREFIX + moodKey, 0L)
             if (hasGeminiKey && !geminiClient.hasActiveCooldown() && pool.size < MIN_POOL_SIZE && now - lastPackMs >= PACK_REFRESH_COOLDOWN_MS) {
-                prefs.edit().putLong(KEY_LAST_PACK_PREFIX + moodKey, now).apply()
-                val fresh = geminiClient.generateMascotPhrasePack(moodHint = moodLabel, count = 10)
+                val fresh = geminiClient.generateMascotPhrasePack(moodHint = moodLabel, count = 12)
+                prefs.edit().putLong(KEY_LAST_PACK_PREFIX + moodKey, System.currentTimeMillis()).apply()
                 if (fresh.isNotEmpty()) {
                     pool = (fresh + pool).distinct().take(MAX_MOOD_POOL)
                     saveMoodPool(moodKey, pool)
@@ -614,12 +723,27 @@ class MascotPhraseBank(
 
             if (pool.isEmpty()) return@withContext null
 
-            val candidates = pool.filterNot { it == lastShownLine }.ifEmpty { pool }
+            val recentSnapshot = synchronized(prefsLock) { recentShownLines.toSet() }
+            val candidates =
+                pool
+                    .filterNot { it in recentSnapshot }
+                    .ifEmpty { pool.filterNot { it == lastShownLine } }
+                    .ifEmpty { pool }
             val chosen = candidates.random()
-            lastShownLine = chosen
-            tracksSinceMoodLine = 0
+            rememberShown(chosen)
             chosen
         }
+
+    private fun rememberShown(phrase: String) {
+        lastShownLine = phrase
+        synchronized(prefsLock) {
+            recentShownLines.remove(phrase)
+            recentShownLines.addLast(phrase)
+            while (recentShownLines.size > MAX_RECENT_SHOWN) {
+                recentShownLines.removeFirst()
+            }
+        }
+    }
 
     private fun loadTrackCache(): JSONObject =
         runCatching {
@@ -670,14 +794,16 @@ class MascotPhraseBank(
 
     companion object {
         private const val PREFS_NAME = "metrolist_mascot_phrases"
-        private const val KEY_TRACK_CACHE = "track_cache"
-        private const val KEY_MOOD_POOL_PREFIX = "mood_pool_"
-        private const val KEY_LAST_TRACK_AI_MS = "last_track_ai_ms"
-        private const val KEY_LAST_PACK_PREFIX = "last_pack_ai_ms_"
-        private const val MAX_TRACK_CACHE = 120
-        private const val MAX_MOOD_POOL = 25
-        private const val MIN_POOL_SIZE = 4
-        private const val TRACK_AI_COOLDOWN_MS = 8 * 60 * 1_000L
-        private const val PACK_REFRESH_COOLDOWN_MS = 30 * 60 * 1_000L
+        private const val KEY_TRACK_CACHE = "track_cache_v2"
+        private const val KEY_MOOD_POOL_PREFIX = "mood_pool_v2_"
+        private const val KEY_LAST_TRACK_AI_MS = "last_track_ai_ms_v2"
+        private const val KEY_LAST_PACK_PREFIX = "last_pack_ai_ms_v2_"
+        private const val MAX_TRACK_CACHE = 150
+        private const val MAX_MOOD_POOL = 30
+        private const val MIN_POOL_SIZE = 6
+        private const val MAX_RECENT_SHOWN = 10
+        private const val TRACK_AI_COOLDOWN_MS = 25 * 1_000L
+        private const val FORCE_REFRESH_COOLDOWN_MS = 3 * 1_000L
+        private const val PACK_REFRESH_COOLDOWN_MS = 10 * 60 * 1_000L
     }
 }
