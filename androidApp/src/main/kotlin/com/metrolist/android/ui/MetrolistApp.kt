@@ -355,6 +355,7 @@ import com.metrolist.shared.ui.navigation.toEntries
 import com.metrolist.shared.ui.navigation.visibleSidebarScreens
 import com.metrolist.shared.ui.navigation.withPointerInput
 import com.metrolist.shared.ui.playback.LocalPlaybackController
+import com.metrolist.shared.ui.player.CustomQueueBridge
 import com.metrolist.shared.ui.player.LocalPlayerPlatform
 import com.metrolist.shared.ui.player.PlayerScreen
 import com.metrolist.shared.ui.player.shouldShowMusicVideoSurface
@@ -421,6 +422,11 @@ fun MetrolistApp(
     val yandexProvider: YandexMusicProvider = koinInject()
     val vkProvider: VkMusicProvider = koinInject()
     val customCfg by customConfigStore.config.collectAsState()
+
+    DisposableEffect(aiWaveEngine) {
+        CustomQueueBridge.onDislikeSong = { song -> aiWaveEngine.recordDislike(song) }
+        onDispose { CustomQueueBridge.onDislikeSong = null }
+    }
 
     val materialYouEnabled = Settings.shared.materialYouEnabled
     val songArtworkColorsEnabled = materialYouEnabled && Settings.shared.dynamicTheme
@@ -1131,6 +1137,11 @@ fun MetrolistApp(
                     }
 
                     val isInPipMode = LocalIsInPipMode.current
+                    val isWaveVideoActiveState = remember { mutableStateOf(true) }
+                    SideEffect {
+                        isWaveVideoActiveState.value = isWaveTabActive && !isPlayerExpandedOrExpanding && !isInPipMode
+                    }
+
                     val contentObscured by remember(playerBottomSheetState) {
                         derivedStateOf { playerBackgroundOpaque && playerBottomSheetState.isSettledExpanded }
                     }
@@ -1667,6 +1678,7 @@ fun MetrolistApp(
                                                             libraryScrollToTopEvents,
                                                             libraryViewModel,
                                                             playerConnection,
+                                                            isWaveVideoActiveState,
                                                         ) {
                                                             getEntryProvider(
                                                                 navigator = navigator,
@@ -1686,6 +1698,7 @@ fun MetrolistApp(
                                                                 yandexProvider = yandexProvider,
                                                                 vkProvider = vkProvider,
                                                                 playerConnection = playerConnection,
+                                                                isWaveVideoActiveState = isWaveVideoActiveState,
                                                                 onExpandPlayer = {
                                                                     coroutineScope.launch { playerBottomSheetState.expandSoft() }
                                                                 },
@@ -2466,6 +2479,7 @@ fun getEntryProvider(
     yandexProvider: YandexMusicProvider,
     vkProvider: VkMusicProvider,
     playerConnection: PlayerConnection,
+    isWaveVideoActiveState: State<Boolean>,
     onExpandPlayer: () -> Unit,
     onSearchResultsVisible: (Boolean) -> Unit = {},
 ): (NavKey) -> NavEntry<NavKey> =
@@ -2480,6 +2494,7 @@ fun getEntryProvider(
                 playerConnection = playerConnection,
                 bottomInset = floatingActionsBottomInset.value,
                 onExpandPlayer = onExpandPlayer,
+                isScreenActive = isWaveVideoActiveState.value,
             )
         }
 
@@ -2821,7 +2836,7 @@ fun getEntryProvider(
                     if (!navigator.state.topLevelRoute.isVisibleNavigationScreen()) navigator.navigate(target)
                 },
                 onNavigateToDownloads = { navigator.navigate(Screen.AutoPlaylist("downloaded")) },
-                onNavigateToArtist = { navigator.navigate(Screen.Artist(it)) },
+                onNavigateToArtist = { artistId -> navigator.navigate(Screen.Artist(artistId)) },
             )
         }
 
