@@ -85,18 +85,15 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
@@ -120,18 +117,23 @@ import com.metrolist.shared.ui.utils.desktopArrowScroll
 import com.metrolist.shared.ui.utils.segmentedGroupShape
 import kotlinx.coroutines.delay
 import org.jetbrains.compose.resources.stringResource
-import kotlin.math.absoluteValue
-import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.milliseconds
+
+private const val CUSTOM_ENGINE_PAGE_KEY = "__custom_engine_page__"
 
 @Composable
 fun SharedSettingsScreen(
     host: SharedSettingsHost,
     modifier: Modifier = Modifier,
+    hiddenPages: Set<SettingsPageId> = emptySet(),
+    customSectionGroupTitle: String? = null,
+    customEngineTitle: String? = null,
+    customEngineSubtitle: String? = null,
+    customEngineContent: (@Composable () -> Unit)? = null,
 ) {
     val settingsHost =
         host.copy(
-            availablePages = host.availablePages + SettingsPageId.EQUALIZER,
+            availablePages = (host.availablePages + SettingsPageId.EQUALIZER) - hiddenPages,
             pageContent = { page, onBack, onNavigate ->
                 if (page == SettingsPageId.EQUALIZER) {
                     MetroEqScreen(
@@ -145,7 +147,15 @@ fun SharedSettingsScreen(
                 }
             },
         )
-    SharedSettingsRegistryScreen(settingsHost, modifier) { settingsRevision ->
+    SharedSettingsRegistryScreen(
+        host = settingsHost,
+        modifier = modifier,
+        hiddenPages = hiddenPages,
+        customSectionGroupTitle = customSectionGroupTitle,
+        customEngineTitle = customEngineTitle,
+        customEngineSubtitle = customEngineSubtitle,
+        customEngineContent = customEngineContent,
+    ) { settingsRevision ->
         rememberMetrolistSettingsRegistry(settingsHost, settingsRevision)
     }
 }
@@ -166,23 +176,30 @@ fun rememberSettingsPageScrollBehavior(compactTopBar: Boolean = false): TopAppBa
 internal fun SharedSettingsRegistryScreen(
     host: SharedSettingsHost,
     modifier: Modifier = Modifier,
+    hiddenPages: Set<SettingsPageId> = emptySet(),
+    customSectionGroupTitle: String? = null,
+    customEngineTitle: String? = null,
+    customEngineSubtitle: String? = null,
+    customEngineContent: (@Composable () -> Unit)? = null,
     registryFactory: @Composable (Int) -> SettingsUiRegistry,
 ) {
     var settingsRevision by remember { mutableIntStateOf(0) }
     var pageStack by rememberSaveable {
-        mutableStateOf(host.initialPage?.let { listOf(it.name) }.orEmpty())
+        mutableStateOf(host.initialPage?.takeUnless { it in hiddenPages }?.let { listOf(it.name) }.orEmpty())
     }
+    var showingCustomEngine by rememberSaveable { mutableStateOf(false) }
     var highlightedItemId by rememberSaveable { mutableStateOf<String?>(null) }
     val registry = registryFactory(settingsRevision)
     LaunchedEffect(host.initialPage, registry) {
-        val initialPage = host.initialPage
+        val initialPage = host.initialPage?.takeUnless { it in hiddenPages }
         if (initialPage != null && pageStack == listOf(initialPage.name)) {
             pageStack = registry.settingsPageStack(initialPage)
         }
     }
+    val hasCustomEngine = !customEngineTitle.isNullOrBlank() && customEngineContent != null
     val selectedPageName = pageStack.lastOrNull()
     val selectedPageId = selectedPageName?.let { runCatching { SettingsPageId.valueOf(it) }.getOrNull() }
-    SideEffect { host.onPageChanged(selectedPageId) }
+    SideEffect { host.onPageChanged(if (showingCustomEngine) null else selectedPageId) }
     val navigationMotion = rememberNavigationMotion()
     val compactStateHolder = rememberSaveableStateHolder()
     val homeListState = rememberLazyListState()
@@ -193,19 +210,30 @@ internal fun SharedSettingsRegistryScreen(
         parentPageId: SettingsPageId? = null,
         highlightedId: String? = null,
     ) {
-        if (registry[pageId] == null) return
+        if (pageId in hiddenPages || registry[pageId] == null) return
         val nextStack = registry.settingsPageStackOnNavigate(pageStack, pageId, parentPageId, host.externalPages)
         if (nextStack == null) {
             host.onOpenPage(pageId)
         } else {
+            showingCustomEngine = false
             highlightedItemId = highlightedId
             pageStack = nextStack
         }
     }
 
-    fun closePage() {
+    fun openCustomEngine() {
+        if (!hasCustomEngine) return
         highlightedItemId = null
-        pageStack = pageStack.dropLast(1)
+        showingCustomEngine = true
+    }
+
+    fun closePage() {
+        if (showingCustomEngine) {
+            showingCustomEngine = false
+        } else {
+            highlightedItemId = null
+            pageStack = pageStack.dropLast(1)
+        }
     }
 
     var containerWidth by remember { mutableIntStateOf(0) }
@@ -218,8 +246,27 @@ internal fun SharedSettingsRegistryScreen(
                 .onSizeChanged { containerWidth = it.width },
     ) {
         val previousPageId = pageStack.dropLast(1).lastOrNull()?.let { runCatching { SettingsPageId.valueOf(it) }.getOrNull() }
+        val firstVisiblePageId =
+            registry.rootGroups
+                .asSequence()
+                .flatMap { it.pages.asSequence() }
+                .firstOrNull { it !in hiddenPages && registry[it] != null }
+                ?: registry.pages.firstOrNull { !it.custom && it.id !in hiddenPages }?.id
+
         if (expanded) {
-            val detailPageId = selectedPageId ?: registry.pages.firstOrNull { !it.custom }?.id
+            val detailPageId = selectedPageId ?: firstVisiblePageId
+            val expandedTargetKey =
+                if (showingCustomEngine && hasCustomEngine) {
+                    CUSTOM_ENGINE_PAGE_KEY
+                } else {
+                    detailPageId?.name
+                }
+            val expandedPreviousKey =
+                if (showingCustomEngine && hasCustomEngine) {
+                    detailPageId?.name
+                } else {
+                    (previousPageId ?: firstVisiblePageId)?.name
+                }
             Row(
                 modifier =
                     Modifier
@@ -229,7 +276,18 @@ internal fun SharedSettingsRegistryScreen(
             ) {
                 SettingsNavigationPane(
                     registry = registry,
-                    selectedPageId = registry.pages.firstOrNull { it.id.name == pageStack.firstOrNull() }?.id ?: detailPageId,
+                    hiddenPages = hiddenPages,
+                    selectedPageId =
+                        if (showingCustomEngine) {
+                            null
+                        } else {
+                            registry.pages.firstOrNull { it.id.name == pageStack.firstOrNull() }?.id ?: detailPageId
+                        },
+                    customSectionGroupTitle = customSectionGroupTitle,
+                    customEngineTitle = customEngineTitle,
+                    customEngineSubtitle = customEngineSubtitle,
+                    customEngineSelected = showingCustomEngine,
+                    onCustomEngineSelected = ::openCustomEngine,
                     bottomContentPadding = host.bottomContentPadding,
                     onPageSelected = { openPage(it) },
                     onSearchResultSelected = { pageId, itemId ->
@@ -244,20 +302,30 @@ internal fun SharedSettingsRegistryScreen(
                         modifier = Modifier.fillMaxWidth().height(80.dp).padding(start = 32.dp, end = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        if (canNavigateBackFromSettings(pageStack, expanded = true)) {
+                        if (showingCustomEngine || canNavigateBackFromSettings(pageStack, expanded = true)) {
                             IconButton(onClick = ::closePage, shapes = IconButtonDefaults.shapes()) {
                                 Icon(MetrolistIcons.AutoMirrored.Filled.ArrowBack, stringResource(Res.string.back))
                             }
                         }
                         AnimatedContent(
-                            targetState = detailPageId,
+                            targetState = expandedTargetKey,
                             transitionSpec = { navigationMotion.transition() },
                             contentAlignment = Alignment.CenterStart,
                             label = "desktopSettingsTitle",
                             modifier = Modifier.weight(1f),
-                        ) { pageId ->
+                        ) { targetKey ->
+                            val titleText =
+                                if (targetKey == CUSTOM_ENGINE_PAGE_KEY) {
+                                    customEngineTitle.orEmpty()
+                                } else {
+                                    targetKey
+                                        ?.let { runCatching { SettingsPageId.valueOf(it) }.getOrNull() }
+                                        ?.let(registry::get)
+                                        ?.title
+                                        .orEmpty()
+                                }
                             Text(
-                                text = pageId?.let(registry::get)?.title.orEmpty(),
+                                text = titleText,
                                 style = MaterialTheme.typography.headlineMediumEmphasized,
                                 maxLines = 1,
                                 modifier = Modifier.singleLineMarquee(),
@@ -273,23 +341,37 @@ internal fun SharedSettingsRegistryScreen(
                         color = MaterialTheme.colorScheme.surfaceContainerLow,
                     ) {
                         PredictiveNavigationContent(
-                            targetState = detailPageId,
-                            previousState = previousPageId ?: registry.pages.firstOrNull { !it.custom }?.id,
-                            backEnabled = canNavigateBackFromSettings(pageStack, expanded = true),
+                            targetState = expandedTargetKey,
+                            previousState = expandedPreviousKey,
+                            backEnabled = showingCustomEngine || canNavigateBackFromSettings(pageStack, expanded = true),
                             onBack = ::closePage,
                             modifier = Modifier.fillMaxSize(),
-                        ) { pageId ->
+                        ) { targetKey ->
                             Box(Modifier.fillMaxSize()) {
-                                pageId?.let(registry::get)?.let { page ->
-                                    SettingsDetailPane(
-                                        page = page,
-                                        listState = pageListStates.getValue(page.id),
-                                        host = host,
-                                        onBack = ::closePage,
-                                        highlightedItemId = highlightedItemId,
-                                        onNavigate = { openPage(it, parentPageId = page.id) },
-                                        onSettingValueChanged = { settingsRevision++ },
-                                    )
+                                if (targetKey == CUSTOM_ENGINE_PAGE_KEY && customEngineContent != null) {
+                                    Box(
+                                        modifier =
+                                            Modifier
+                                                .fillMaxSize()
+                                                .padding(top = 12.dp, bottom = host.bottomContentPadding),
+                                    ) {
+                                        customEngineContent()
+                                    }
+                                } else {
+                                    targetKey
+                                        ?.let { runCatching { SettingsPageId.valueOf(it) }.getOrNull() }
+                                        ?.let(registry::get)
+                                        ?.let { page ->
+                                            SettingsDetailPane(
+                                                page = page,
+                                                listState = pageListStates.getValue(page.id),
+                                                host = host,
+                                                onBack = ::closePage,
+                                                highlightedItemId = highlightedItemId,
+                                                onNavigate = { openPage(it, parentPageId = page.id) },
+                                                onSettingValueChanged = { settingsRevision++ },
+                                            )
+                                        }
                                 }
                             }
                         }
@@ -297,45 +379,79 @@ internal fun SharedSettingsRegistryScreen(
                 }
             }
         } else {
-            val compactContent: @Composable (SettingsPageId?, String?) -> Unit = { pageId, itemId ->
-                if (pageId == null) {
-                    CompactSettingsHome(
-                        registry = registry,
-                        listState = homeListState,
-                        host = host,
-                        onPageSelected = { openPage(it) },
-                        onSearchResultSelected = { resultPageId, resultItemId ->
-                            openPage(resultPageId, highlightedId = resultItemId)
-                        },
-                    )
+            val compactTargetKey =
+                if (showingCustomEngine && hasCustomEngine) {
+                    CUSTOM_ENGINE_PAGE_KEY
                 } else {
-                    registry[pageId]?.let { page ->
-                        CompactSettingsDetail(
-                            page = page,
-                            listState = pageListStates.getValue(page.id),
+                    selectedPageId?.name
+                }
+            val compactPreviousKey =
+                if (showingCustomEngine && hasCustomEngine) {
+                    null
+                } else {
+                    previousPageId?.name
+                }
+
+            val compactContent: @Composable (String?, String?) -> Unit = { targetKey, itemId ->
+                when {
+                    targetKey == CUSTOM_ENGINE_PAGE_KEY && customEngineContent != null -> {
+                        CompactCustomEngineDetail(
+                            title = customEngineTitle.orEmpty(),
                             bottomContentPadding = host.bottomContentPadding,
-                            pageContent = host.pageContent,
-                            lyricsPreview = host.lyricsPreview,
-                            highlightedItemId = itemId,
                             onBack = ::closePage,
-                            onNavigate = { openPage(it, parentPageId = page.id) },
-                            onSettingValueChanged = { settingsRevision++ },
+                            content = customEngineContent,
                         )
+                    }
+
+                    targetKey == null -> {
+                        CompactSettingsHome(
+                            registry = registry,
+                            hiddenPages = hiddenPages,
+                            customSectionGroupTitle = customSectionGroupTitle,
+                            customEngineTitle = customEngineTitle,
+                            customEngineSubtitle = customEngineSubtitle,
+                            onCustomEngineSelected = if (hasCustomEngine) ::openCustomEngine else null,
+                            listState = homeListState,
+                            host = host,
+                            onPageSelected = { openPage(it) },
+                            onSearchResultSelected = { resultPageId, resultItemId ->
+                                openPage(resultPageId, highlightedId = resultItemId)
+                            },
+                        )
+                    }
+
+                    else -> {
+                        runCatching { SettingsPageId.valueOf(targetKey) }
+                            .getOrNull()
+                            ?.let(registry::get)
+                            ?.let { page ->
+                                CompactSettingsDetail(
+                                    page = page,
+                                    listState = pageListStates.getValue(page.id),
+                                    bottomContentPadding = host.bottomContentPadding,
+                                    pageContent = host.pageContent,
+                                    lyricsPreview = host.lyricsPreview,
+                                    highlightedItemId = itemId,
+                                    onBack = ::closePage,
+                                    onNavigate = { openPage(it, parentPageId = page.id) },
+                                    onSettingValueChanged = { settingsRevision++ },
+                                )
+                            }
                     }
                 }
             }
             val previousContent: @Composable () -> Unit = {
-                compactContent(previousPageId, null)
+                compactContent(compactPreviousKey, null)
             }
             PredictiveNavigationContent(
-                targetState = selectedPageId,
-                previousState = previousPageId,
-                backEnabled = canNavigateBackFromSettings(pageStack, expanded = false),
+                targetState = compactTargetKey,
+                previousState = compactPreviousKey,
+                backEnabled = showingCustomEngine || canNavigateBackFromSettings(pageStack, expanded = false),
                 onBack = ::closePage,
                 modifier = Modifier.fillMaxSize(),
-            ) { pageId ->
-                compactStateHolder.SaveableStateProvider(pageId?.name ?: "settingsRoot") {
-                    if (pageId == null) {
+            ) { targetKey ->
+                compactStateHolder.SaveableStateProvider(targetKey ?: "settingsRoot") {
+                    if (targetKey == null) {
                         compactContent(null, highlightedItemId)
                     } else {
                         SwipeBackLayout(
@@ -343,7 +459,7 @@ internal fun SharedSettingsRegistryScreen(
                             onBack = ::closePage,
                             previousContent = previousContent,
                         ) {
-                            compactContent(pageId, highlightedItemId)
+                            compactContent(targetKey, highlightedItemId)
                         }
                     }
                 }
@@ -353,8 +469,65 @@ internal fun SharedSettingsRegistryScreen(
 }
 
 @Composable
+private fun CompactCustomEngineDetail(
+    title: String,
+    bottomContentPadding: Dp,
+    onBack: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val isTv = LocalIsTv.current
+    val contentFocusRequester = remember { FocusRequester() }
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    Scaffold(
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        containerColor = MaterialTheme.colorScheme.surface,
+        topBar = {
+            LargeFlexibleTopAppBar(
+                title = { Text(title, fontWeight = MaterialTheme.typography.titleLargeEmphasized.fontWeight) },
+                navigationIcon = {
+                    IconButton(
+                        onClick = onBack,
+                        modifier =
+                            Modifier.focusProperties {
+                                if (isTv) down = contentFocusRequester
+                            },
+                        shapes = IconButtonDefaults.shapes(),
+                    ) {
+                        Icon(MetrolistIcons.AutoMirrored.Filled.ArrowBack, stringResource(Res.string.back))
+                    }
+                },
+                colors =
+                    TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        scrolledContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    ),
+                scrollBehavior = scrollBehavior,
+            )
+        },
+    ) { padding ->
+        Box(
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .then(if (isTv) Modifier.focusRequester(contentFocusRequester).focusGroup() else Modifier)
+                    .padding(
+                        top = padding.calculateTopPadding(),
+                        bottom = bottomContentPadding,
+                    ),
+        ) {
+            content()
+        }
+    }
+}
+
+@Composable
 private fun CompactSettingsHome(
     registry: SettingsUiRegistry,
+    hiddenPages: Set<SettingsPageId>,
+    customSectionGroupTitle: String?,
+    customEngineTitle: String?,
+    customEngineSubtitle: String?,
+    onCustomEngineSelected: (() -> Unit)?,
     listState: LazyListState,
     host: SharedSettingsHost,
     onPageSelected: (SettingsPageId) -> Unit,
@@ -417,6 +590,11 @@ private fun CompactSettingsHome(
         Box(if (isTv) Modifier.focusRequester(contentFocusRequester).focusGroup() else Modifier) {
             SettingsHomeList(
                 registry = registry,
+                hiddenPages = hiddenPages,
+                customSectionGroupTitle = customSectionGroupTitle,
+                customEngineTitle = customEngineTitle,
+                customEngineSubtitle = customEngineSubtitle,
+                onCustomEngineSelected = onCustomEngineSelected,
                 listState = listState,
                 customPageIcons = host.customPageIcons,
                 onPageSelected = onPageSelected,
@@ -528,7 +706,13 @@ private fun CompactSettingsDetail(
 @Composable
 private fun SettingsNavigationPane(
     registry: SettingsUiRegistry,
+    hiddenPages: Set<SettingsPageId>,
     selectedPageId: SettingsPageId?,
+    customSectionGroupTitle: String?,
+    customEngineTitle: String?,
+    customEngineSubtitle: String?,
+    customEngineSelected: Boolean,
+    onCustomEngineSelected: () -> Unit,
     bottomContentPadding: Dp,
     onPageSelected: (SettingsPageId) -> Unit,
     onSearchResultSelected: (SettingsPageId, String?) -> Unit,
@@ -546,25 +730,47 @@ private fun SettingsNavigationPane(
                 contentPadding = PaddingValues(bottom = bottomContentPadding),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                registry.rootGroups.filter { it.pages.isNotEmpty() }.forEach { group ->
-                    item(group.title) {
+                if (!customEngineTitle.isNullOrBlank()) {
+                    item("custom_engine_group_header") {
                         Text(
-                            text = group.title,
+                            text = customSectionGroupTitle ?: "ИИ и источники",
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 8.dp),
+                            modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp),
                         )
                     }
-                    items(group.pages.size, key = { group.pages[it].name }) { index ->
-                        val pageId = group.pages[index]
-                        registry[pageId]?.let { page ->
-                            NavigationPaneItem(
-                                page = page,
-                                selected = pageId == selectedPageId,
-                                first = index == 0,
-                                last = index == group.pages.lastIndex,
-                                onClick = { onPageSelected(pageId) },
+                    item("custom_engine_nav_item") {
+                        NavigationPaneCustomItem(
+                            title = customEngineTitle,
+                            subtitle = customEngineSubtitle,
+                            icon = MetrolistIcons.Outlined.AutoAwesome,
+                            selected = customEngineSelected,
+                            onClick = onCustomEngineSelected,
+                        )
+                    }
+                }
+                registry.rootGroups.forEach { group ->
+                    val visiblePages = group.pages.filterNot { it in hiddenPages }
+                    if (visiblePages.isNotEmpty()) {
+                        item(group.title) {
+                            Text(
+                                text = group.title,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 8.dp),
                             )
+                        }
+                        items(visiblePages.size, key = { visiblePages[it].name }) { index ->
+                            val pageId = visiblePages[index]
+                            registry[pageId]?.let { page ->
+                                NavigationPaneItem(
+                                    page = page,
+                                    selected = pageId == selectedPageId,
+                                    first = index == 0,
+                                    last = index == visiblePages.lastIndex,
+                                    onClick = { onPageSelected(pageId) },
+                                )
+                            }
                         }
                     }
                 }
@@ -573,7 +779,9 @@ private fun SettingsNavigationPane(
             SettingsSearchResults(
                 registry = registry,
                 query = query,
-                onResultSelected = onSearchResultSelected,
+                onResultSelected = { pageId, itemId ->
+                    if (pageId !in hiddenPages) onSearchResultSelected(pageId, itemId)
+                },
                 compact = true,
                 contentPadding = PaddingValues(bottom = bottomContentPadding),
             )
@@ -584,6 +792,11 @@ private fun SettingsNavigationPane(
 @Composable
 private fun SettingsHomeList(
     registry: SettingsUiRegistry,
+    hiddenPages: Set<SettingsPageId>,
+    customSectionGroupTitle: String?,
+    customEngineTitle: String?,
+    customEngineSubtitle: String?,
+    onCustomEngineSelected: (() -> Unit)?,
     listState: LazyListState,
     customPageIcons: Map<SettingsPageId, @Composable (Color) -> Unit>,
     onPageSelected: (SettingsPageId) -> Unit,
@@ -591,7 +804,8 @@ private fun SettingsHomeList(
     contentPadding: PaddingValues,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
-    val searchResults = rememberSettingsSearchResults(registry, query)
+    val searchResults =
+        rememberSettingsSearchResults(registry, query).filterNot { it.page.id in hiddenPages }
     DragScrollableColumn(
         state = listState,
         modifier = Modifier.fillMaxSize().desktopArrowScroll(listState),
@@ -606,9 +820,38 @@ private fun SettingsHomeList(
             )
         }
         if (query.isBlank()) {
-            registry.rootGroups.filter { it.pages.isNotEmpty() }.forEach { group ->
-                item(group.title) {
-                    SettingsRootGroup(group, registry, customPageIcons, onPageSelected)
+            if (!customEngineTitle.isNullOrBlank() && onCustomEngineSelected != null) {
+                item("custom_engine_root_group") {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = customSectionGroupTitle ?: "ИИ и источники",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(start = 16.dp, end = 32.dp, top = 8.dp, bottom = 12.dp),
+                        )
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            SettingsNavigationRow(
+                                title = customEngineTitle,
+                                subtitle = customEngineSubtitle,
+                                icon = MetrolistIcons.Outlined.AutoAwesome,
+                                first = true,
+                                last = true,
+                                onClick = onCustomEngineSelected,
+                            )
+                        }
+                    }
+                }
+            }
+            registry.rootGroups.forEach { group ->
+                val visiblePages = group.pages.filterNot { it in hiddenPages }
+                if (visiblePages.isNotEmpty()) {
+                    item(group.title) {
+                        SettingsRootGroup(group.title, visiblePages, registry, customPageIcons, onPageSelected)
+                    }
                 }
             }
         } else if (searchResults.isNotEmpty()) {
@@ -622,7 +865,9 @@ private fun SettingsHomeList(
                 SettingsSearchResults(
                     registry = registry,
                     query = query,
-                    onResultSelected = onSearchResultSelected,
+                    onResultSelected = { pageId, itemId ->
+                        if (pageId !in hiddenPages) onSearchResultSelected(pageId, itemId)
+                    },
                     modifier = Modifier.padding(horizontal = 16.dp),
                 )
             }
@@ -882,14 +1127,15 @@ private fun SettingsPageList(
 
 @Composable
 private fun SettingsRootGroup(
-    group: SettingsRootGroupRegistration,
+    title: String,
+    pages: List<SettingsPageId>,
     registry: SettingsUiRegistry,
     customPageIcons: Map<SettingsPageId, @Composable (Color) -> Unit>,
     onPageSelected: (SettingsPageId) -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         Text(
-            text = group.title,
+            text = title,
             style = MaterialTheme.typography.titleSmall,
             color = MaterialTheme.colorScheme.primary,
             fontWeight = FontWeight.Medium,
@@ -899,7 +1145,7 @@ private fun SettingsRootGroup(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            group.pages.forEachIndexed { index, pageId ->
+            pages.forEachIndexed { index, pageId ->
                 registry[pageId]?.let { page ->
                     SettingsNavigationRow(
                         title = page.title,
@@ -907,7 +1153,7 @@ private fun SettingsRootGroup(
                         icon = page.icon,
                         customIcon = customPageIcons[pageId],
                         first = index == 0,
-                        last = index == group.pages.lastIndex,
+                        last = index == pages.lastIndex,
                         onClick = { onPageSelected(pageId) },
                     )
                 }
@@ -1294,6 +1540,55 @@ private fun NavigationPaneItem(
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
             )
             page.subtitle?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NavigationPaneCustomItem(
+    title: String,
+    subtitle: String?,
+    icon: ImageVector,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val background by animateColorAsState(
+        if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainer,
+        label = "settingsNavigationCustomItem",
+    )
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 64.dp)
+                .clip(connectedShape(first = true, last = true, outer = 20.dp, inner = 5.dp))
+                .background(background)
+                .selectable(selected = selected, role = Role.Tab, onClick = onClick)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(modifier = Modifier.size(32.dp), contentAlignment = Alignment.Center) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(24.dp),
+            )
+        }
+        Spacer(Modifier.width(16.dp))
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            )
+            subtitle?.let {
                 Text(
                     it,
                     style = MaterialTheme.typography.bodyMedium,
