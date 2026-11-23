@@ -255,7 +255,6 @@ class App :
         }
         Timber.tag(TAG).d("Koin init complete elapsed=%dms", SystemClock.elapsedRealtime() - koinStart)
 
-        // Ранняя инициализация нашего 4 ГБ кэша, дискового кэша Главной и хуков WebView/YouTube/Last.fm
         CustomMediaCacheManager.init(applicationContext)
         CustomCatalogProvider.initDiskCache(applicationContext)
         CustomAuthWebViewHelper.registerContext(applicationContext)
@@ -265,7 +264,7 @@ class App :
                     .getPlaylist(
                         playlistId = "LM",
                         applyContentFilters = false,
-                        allowOfflineFallback = false,
+                        allowOfflineFallback = true,
                     ).playlistSongs()
             songs.map { song ->
                 ExternalCatalogTrack(
