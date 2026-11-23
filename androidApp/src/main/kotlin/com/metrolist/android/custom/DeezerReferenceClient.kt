@@ -1,6 +1,7 @@
 package com.metrolist.android.custom
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -25,6 +26,9 @@ data class HttpResult(
 }
 
 object CustomHttp {
+    private const val DEFAULT_USER_AGENT =
+        "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+
     suspend fun get(
         url: String,
         headers: Map<String, String> = emptyMap(),
@@ -37,6 +41,9 @@ object CustomHttp {
                 conn.connectTimeout = timeoutMs
                 conn.readTimeout = timeoutMs
                 conn.instanceFollowRedirects = true
+                if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
+                    conn.setRequestProperty("User-Agent", DEFAULT_USER_AGENT)
+                }
                 headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
                 readResult(conn)
             } finally {
@@ -51,16 +58,21 @@ object CustomHttp {
         timeoutMs: Int = 25_000,
     ): HttpResult =
         withContext(Dispatchers.IO) {
+            val payload = jsonBody.toByteArray(Charsets.UTF_8)
             val conn = (URL(url).openConnection() as HttpURLConnection)
             try {
                 conn.requestMethod = "POST"
                 conn.connectTimeout = timeoutMs
                 conn.readTimeout = timeoutMs
                 conn.doOutput = true
+                conn.setFixedLengthStreamingMode(payload.size)
                 conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
+                    conn.setRequestProperty("User-Agent", DEFAULT_USER_AGENT)
+                }
                 headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
                 conn.outputStream.use { out ->
-                    out.write(jsonBody.toByteArray(Charsets.UTF_8))
+                    out.write(payload)
                 }
                 readResult(conn)
             } finally {
@@ -135,8 +147,8 @@ class DeezerReferenceClient {
 
         val fetched = searchBestCandidate(cleanArtist, cleanTitle, fallbackDurationSec)
 
-        val resolved =
-            if (fetched != null) {
+        if (fetched != null) {
+            val resolved =
                 TrackReference(
                     title = fetched.title.ifBlank { cleanTitle },
                     artist = fetched.artist.ifBlank { cleanArtist },
@@ -146,13 +158,13 @@ class DeezerReferenceClient {
                     coverXlUrl = fetched.coverXl,
                     deezerId = fetched.id.takeIf { it.isNotBlank() },
                 )
-            } else {
-                fallback
-            }
+            if (cache.size > 600) cache.clear()
+            cache[cacheKey] = resolved
+            return resolved
+        }
 
-        if (cache.size > 600) cache.clear()
-        cache[cacheKey] = resolved
-        return resolved
+        // Не кэшируем сетевые промахи, чтобы при появлении сети трек смог получить эталон и HD-обложку
+        return fallback
     }
 
     /** Строгий поиск карточки в Deezer для каскада волны — без случайного фоллбэка. */
@@ -169,6 +181,7 @@ class DeezerReferenceClient {
         if (best.id.isBlank()) return null
 
         val cacheKey = "${cleanArtist.lowercase()}::${cleanTitle.lowercase()}"
+        if (cache.size > 600) cache.clear()
         cache[cacheKey] =
             TrackReference(
                 title = best.title.ifBlank { cleanTitle },
@@ -194,12 +207,12 @@ class DeezerReferenceClient {
     /** Чарт Deezer для единого блока «Чарты» на Главной. */
     suspend fun fetchChart(limit: Int = 25): List<ExternalCatalogTrack> =
         withContext(Dispatchers.IO) {
-            runCatching {
+            try {
                 val safeLimit = limit.coerceIn(1, 50)
                 val url = "${apiBaseUrl()}/chart/0/tracks?limit=$safeLimit"
                 val response = CustomHttp.get(url, timeoutMs = 8_000)
-                if (!response.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
-                val data = JSONObject(response.body).optJSONArray("data") ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                if (!response.isSuccess) return@withContext emptyList()
+                val data = JSONObject(response.body).optJSONArray("data") ?: return@withContext emptyList()
                 buildList {
                     for (i in 0 until data.length()) {
                         val item = data.optJSONObject(i) ?: continue
@@ -224,7 +237,11 @@ class DeezerReferenceClient {
                         )
                     }
                 }
-            }.getOrDefault(emptyList())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
 
     /** Свежие релизы конкретного артиста для «Радара новинок». */
@@ -236,14 +253,14 @@ class DeezerReferenceClient {
         withContext(Dispatchers.IO) {
             val cleanArtist = TrackMatcher.cleanSearchTerm(artistName)
             if (cleanArtist.length < 2) return@withContext emptyList()
-            runCatching {
+            try {
                 val artistResp =
                     CustomHttp.get(
                         url = "${apiBaseUrl()}/search/artist?q=${CustomHttp.urlEncode(cleanArtist)}&limit=3",
                         timeoutMs = 5_000,
                     )
-                if (!artistResp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
-                val artistData = JSONObject(artistResp.body).optJSONArray("data") ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                if (!artistResp.isSuccess) return@withContext emptyList()
+                val artistData = JSONObject(artistResp.body).optJSONArray("data") ?: return@withContext emptyList()
                 val normTarget = TrackMatcher.normalize(cleanArtist)
                 var artistId: String? = null
                 var resolvedName = cleanArtist
@@ -251,21 +268,23 @@ class DeezerReferenceClient {
                     val obj = artistData.optJSONObject(i) ?: continue
                     val name = obj.optString("name").trim()
                     val normCand = TrackMatcher.normalize(name)
-                    if (normCand == normTarget || normCand.contains(normTarget) || normTarget.contains(normCand)) {
+                    if (normCand == normTarget ||
+                        (normTarget.length >= 4 && (normCand.contains(normTarget) || normTarget.contains(normCand)))
+                    ) {
                         artistId = obj.optString("id").trim().takeIf { it.isNotBlank() }
                         resolvedName = name.ifBlank { cleanArtist }
                         break
                     }
                 }
-                val id = artistId ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                val id = artistId ?: return@withContext emptyList()
 
                 val albumsResp =
                     CustomHttp.get(
                         url = "${apiBaseUrl()}/artist/$id/albums?limit=8",
                         timeoutMs = 5_000,
                     )
-                if (!albumsResp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
-                val albums = JSONObject(albumsResp.body).optJSONArray("data") ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                if (!albumsResp.isSuccess) return@withContext emptyList()
+                val albums = JSONObject(albumsResp.body).optJSONArray("data") ?: return@withContext emptyList()
 
                 val cutoffMs = System.currentTimeMillis() - maxAgeDays.toLong() * 24L * 3600L * 1_000L
                 val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
@@ -298,7 +317,11 @@ class DeezerReferenceClient {
                     .sortedByDescending { it.first }
                     .take(limit)
                     .map { it.second }
-            }.getOrDefault(emptyList())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
 
     private suspend fun searchBestCandidate(
@@ -306,36 +329,46 @@ class DeezerReferenceClient {
         cleanTitle: String,
         targetDurationSec: Long?,
     ): DeezerCandidate? =
-        runCatching {
+        try {
             val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
             val url = "${apiBaseUrl()}/search/track?q=${CustomHttp.urlEncode(query)}&limit=8"
             val response = CustomHttp.get(url, timeoutMs = 4_000)
-            if (!response.isSuccess) return@runCatching null
-            val data = JSONObject(response.body).optJSONArray("data") ?: return@runCatching null
-            val candidates =
-                buildList {
-                    for (i in 0 until data.length()) {
-                        val item = data.optJSONObject(i) ?: continue
-                        val albumObj = item.optJSONObject("album")
-                        val cover =
-                            albumObj?.optString("cover_xl")?.takeIf { it.isNotBlank() }
-                                ?: albumObj?.optString("cover_big")?.takeIf { it.isNotBlank() }
-                        add(
-                            DeezerCandidate(
-                                id = item.optString("id").trim(),
-                                title = item.optString("title").trim(),
-                                artist = item.optJSONObject("artist")?.optString("name").orEmpty().trim(),
-                                duration = item.optLong("duration", 0L),
-                                explicit = item.optBoolean("explicit_lyrics", false),
-                                coverXl = cover,
-                            ),
-                        )
-                    }
+            if (!response.isSuccess) {
+                null
+            } else {
+                val data = JSONObject(response.body).optJSONArray("data")
+                if (data == null) {
+                    null
+                } else {
+                    val candidates =
+                        buildList {
+                            for (i in 0 until data.length()) {
+                                val item = data.optJSONObject(i) ?: continue
+                                val albumObj = item.optJSONObject("album")
+                                val cover =
+                                    albumObj?.optString("cover_xl")?.takeIf { it.isNotBlank() }
+                                        ?: albumObj?.optString("cover_big")?.takeIf { it.isNotBlank() }
+                                add(
+                                    DeezerCandidate(
+                                        id = item.optString("id").trim(),
+                                        title = item.optString("title").trim(),
+                                        artist = item.optJSONObject("artist")?.optString("name").orEmpty().trim(),
+                                        duration = item.optLong("duration", 0L),
+                                        explicit = item.optBoolean("explicit_lyrics", false),
+                                        coverXl = cover,
+                                    ),
+                                )
+                            }
+                        }
+                    pickBestDeezerMatch(candidates, cleanArtist, cleanTitle, targetDurationSec)
                 }
-            pickBestDeezerMatch(candidates, cleanArtist, cleanTitle, targetDurationSec)
-        }.onFailure { error ->
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (error: Exception) {
             Log.d(TAG, "Deezer lookup skipped for $cleanArtist - $cleanTitle: ${error.message}")
-        }.getOrNull()
+            null
+        }
 
     private fun pickBestDeezerMatch(
         candidates: List<DeezerCandidate>,
@@ -376,9 +409,8 @@ class DeezerReferenceClient {
 }
 
 object TrackMatcher {
-    private val stopWords =
+    private val stopSubstrings =
         listOf(
-            "clean",
             "censored",
             "radio edit",
             "sped up",
@@ -386,16 +418,8 @@ object TrackMatcher {
             "slowed",
             "reverb",
             "nightcore",
-            "8d",
             "karaoke",
             "instrumental",
-            "minus",
-            "минус",
-            "cover",
-            "кавер",
-            "remix",
-            "ремикс",
-            "live",
             "acoustic",
             "акустика",
             "mashup",
@@ -403,6 +427,21 @@ object TrackMatcher {
             "tiktok",
             "bass boosted",
         )
+
+    private val stopWordRegexes =
+        listOf(
+            "clean",
+            "8d",
+            "minus",
+            "минус",
+            "cover",
+            "кавер",
+            "remix",
+            "ремикс",
+            "live",
+        ).map { word ->
+            word to Regex("(?<![a-zа-яё0-9])${Regex.escape(word)}(?![a-zа-яё0-9])")
+        }
 
     private val noiseKeywords =
         listOf("official", "video", "audio", "lyrics", "lyric", "visualizer", "hd", "4k", "hq", "mv", "prod.", "feat.", "ft.")
@@ -437,8 +476,11 @@ object TrackMatcher {
     ): Boolean {
         val reqLower = requestedTitle.lowercase()
         val candLower = candidateTitle.lowercase()
-        return stopWords.any { word ->
-            candLower.contains(word) && !reqLower.contains(word)
+        if (stopSubstrings.any { word -> candLower.contains(word) && !reqLower.contains(word) }) {
+            return true
+        }
+        return stopWordRegexes.any { (_, regex) ->
+            regex.containsMatchIn(candLower) && !regex.containsMatchIn(reqLower)
         }
     }
 
@@ -474,7 +516,7 @@ object TrackMatcher {
                 30
             } else {
                 val direct = tokenOverlapScore(tArtist, cArtist)
-                val inTitle = if (cTitle.contains(tArtist)) 50 else 0
+                val inTitle = if (tArtist.length >= 4 && cTitle.contains(tArtist)) 50 else 0
                 maxOf(direct, inTitle)
             }
         if (tArtist.isNotBlank() && artistScore < 30) return 0
@@ -496,10 +538,15 @@ object TrackMatcher {
         b: String,
     ): Int {
         if (a == b) return 100
-        if (a.contains(b) || b.contains(a)) return 85
-        val tokensA = a.split(' ').filter { it.length > 1 }.toSet()
-        val tokensB = b.split(' ').filter { it.length > 1 }.toSet()
+        val minLen = minOf(a.length, b.length)
+        if (minLen >= 4 && (a.contains(b) || b.contains(a))) return 85
+        val rawA = a.split(' ').filter { it.isNotBlank() }
+        val rawB = b.split(' ').filter { it.isNotBlank() }
+        val tokensA = rawA.filter { it.length > 1 }.ifEmpty { rawA }.toSet()
+        val tokensB = rawB.filter { it.length > 1 }.ifEmpty { rawB }.toSet()
         if (tokensA.isEmpty() || tokensB.isEmpty()) return 0
+        if (tokensA.size == 1 && tokensA.single() in tokensB) return 85
+        if (tokensB.size == 1 && tokensB.single() in tokensA) return 85
         val intersection = tokensA.intersect(tokensB).size
         val union = tokensA.union(tokensB).size
         return (intersection * 100) / union
