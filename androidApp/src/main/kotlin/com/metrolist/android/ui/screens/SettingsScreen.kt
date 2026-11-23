@@ -88,6 +88,7 @@ import com.metrolist.shared.state.applyContentRegion
 import com.metrolist.shared.state.contentCountryCodes
 import com.metrolist.shared.ui.navigation.LocalNavigator
 import com.metrolist.shared.ui.navigation.Screen
+import com.metrolist.shared.ui.settings.LocalSettingsPageBottomPadding
 import com.metrolist.shared.ui.settings.PlayerLyricsSettingsPreview
 import com.metrolist.shared.ui.settings.SettingsChangeEffect
 import com.metrolist.shared.ui.settings.SettingsChoice
@@ -130,6 +131,7 @@ fun SettingsScreen(
     val yandexProvider: YandexMusicProvider = koinInject()
     val vkProvider: VkMusicProvider = koinInject()
     val geminiClient: GeminiClient = koinInject()
+    val customCfg by customConfigStore.config.collectAsState()
     val homeViewModel: HomeViewModel = koinViewModel()
     val homeState by homeViewModel.shared.uiState.collectAsState()
     val searchViewModel: SearchViewModel = koinViewModel()
@@ -317,25 +319,11 @@ fun SettingsScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Убираем лишние и неактуальные для форка разделы из стоковых настроек
-    val hiddenPages =
-        remember {
-            setOf(
-                SettingsPageId.LYRICS,
-                SettingsPageId.LYRICS_SOURCES,
-                SettingsPageId.LYRICS_AI_TRANSLATION,
-                SettingsPageId.LYRICS_ROMANIZATION,
-                SettingsPageId.LYRICS_AI_SETUP,
-                SettingsPageId.BACKUP_RESTORE,
-                SettingsPageId.UPDATES,
-                SettingsPageId.UPDATE_DETAILS,
-                SettingsPageId.SUPPORTED_LINKS,
-                SettingsPageId.ABOUT,
-            )
-        }
-
+    // Включаем штатный CUSTOM_ENGINE из реестра и убираем неактуальные для форка страницы
+    // (Бэкап/Импорт, Обновления, Поддерживаемые ссылки, О Metrolist, Текст песни)
     val availablePages =
         buildSet {
+            add(SettingsPageId.CUSTOM_ENGINE)
             add(SettingsPageId.FONTS)
             add(SettingsPageId.PLAYER_STYLE)
             add(SettingsPageId.PLAYER_ARTWORK)
@@ -352,23 +340,13 @@ fun SettingsScreen(
             add(SettingsPageId.ANDROID_AUTO)
         }
 
+    val isLastFmConnected =
+        SharedPreferences.shared.lastFmSession.isNotBlank() ||
+            SharedPreferences.shared.lastFmUsername.isNotBlank() ||
+            customCfg.lastFmUsername.isNotBlank()
+
     Box(Modifier.fillMaxSize()) {
         SharedSettingsScreen(
-            hiddenPages = hiddenPages,
-            customSectionGroupTitle = "ИИ и источники",
-            customEngineTitle = "Источники и ИИ-движок",
-            customEngineSubtitle = "Вход (VK, Яндекс, YouTube, Last.fm), Gemini, кэш 4 ГБ, бэкап",
-            customEngineContent = {
-                CustomEngineSettingsContent(
-                    configStore = customConfigStore,
-                    yandexProvider = yandexProvider,
-                    vkProvider = vkProvider,
-                    geminiClient = geminiClient,
-                    isYouTubeLoggedIn = authManager.isLoggedIn,
-                    onOpenYouTubeLogin = { navigator?.navigate(Screen.Login) },
-                    onOpenLastFmLogin = { navigator?.navigate(Screen.LastFm) },
-                )
-            },
             host =
                 SharedSettingsHost(
                     platform = SettingsPlatform.ANDROID,
@@ -400,7 +378,7 @@ fun SettingsScreen(
                         },
                     updateSummary = "",
                     availablePages = availablePages,
-                    initialPage = initialPage?.takeUnless { it in hiddenPages },
+                    initialPage = initialPage,
                     externalPages = emptySet(),
                     onPageChanged = { page ->
                         if (page != currentPage) {
@@ -478,6 +456,21 @@ fun SettingsScreen(
                             LocalViewModelStoreOwner provides rememberViewModelStoreOwner(page, pageViewModels),
                         ) {
                             when (page) {
+                                SettingsPageId.CUSTOM_ENGINE -> {
+                                    CustomEngineSettingsContent(
+                                        configStore = customConfigStore,
+                                        yandexProvider = yandexProvider,
+                                        vkProvider = vkProvider,
+                                        geminiClient = geminiClient,
+                                        isYouTubeLoggedIn = authManager.isLoggedIn,
+                                        isLastFmLoggedIn = isLastFmConnected,
+                                        onOpenYouTubeLogin = { navigator?.navigate(Screen.Login) },
+                                        onOpenLastFmLogin = { navigator?.navigate(Screen.LastFm) },
+                                        bottomPadding = LocalSettingsPageBottomPadding.current,
+                                        showTitleHeader = false,
+                                    )
+                                }
+
                                 SettingsPageId.ANDROID_AUTO -> {
                                     AndroidAutoScreen(onNavigateBack = onBack)
                                 }
