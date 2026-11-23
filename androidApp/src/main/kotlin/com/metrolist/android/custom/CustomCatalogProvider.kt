@@ -162,10 +162,6 @@ class CustomCatalogProvider(
         )
     }
 
-    /**
-     * «Радар новинок» по локальному топу артистов пользователя (Deezer + Яндекс),
-     * чтобы видеть свежие релизы любимых артистов — включая вырезанные цензурой в РФ.
-     */
     suspend fun fetchReleaseRadar(
         limit: Int = 20,
         preloadedYandexNew: List<ExternalCatalogTrack>? = null,
@@ -224,9 +220,6 @@ class CustomCatalogProvider(
             combined
         }
 
-    /**
-     * Загружает персональные подборки Яндекс.Музыки («Плейлист дня», «Премьера», «Дежавю»).
-     */
     private suspend fun fetchYandexPersonalMixes(): Pair<Pair<String, List<ExternalCatalogTrack>>, Pair<String, List<ExternalCatalogTrack>>> =
         withContext(Dispatchers.IO) {
             val emptyResult = ("Плейлист дня" to emptyList<ExternalCatalogTrack>()) to ("Премьера" to emptyList<ExternalCatalogTrack>())
@@ -329,25 +322,45 @@ class CustomCatalogProvider(
         }
 
     /**
-     * Загружает 3 отдельные полки для вкладки VK с паузой 400 мс (без риска VK #6).
+     * Загружает 3 отдельные полки для вкладки VK через веб-сессию (`web.api.vk.ru`, `6287487`).
      */
     private suspend fun fetchVkHomeBundle(): Triple<List<ExternalCatalogTrack>, List<ExternalCatalogTrack>, List<ExternalCatalogTrack>> =
         withContext(Dispatchers.IO) {
-            val token = sanitizeVkToken(configStore.current.vkToken)
-            if (token.isBlank()) return@withContext Triple(emptyList(), emptyList(), emptyList())
-            val encodedToken = CustomHttp.urlEncode(token)
+            val rawStored = configStore.current.vkToken
+            var token = VkWebSession.resolveAccessToken(rawStored) ?: return@withContext Triple(emptyList(), emptyList(), emptyList())
 
-            suspend fun callVk(urls: List<Pair<String, String>>): List<ExternalCatalogTrack> {
-                for ((url, ua) in urls) {
-                    val found =
+            suspend fun callVk(
+                calls: List<Triple<String, String, Map<String, String>>>,
+                allowRefresh: Boolean = true,
+            ): List<ExternalCatalogTrack> {
+                for ((host, method, params) in calls) {
+                    val ver = if (method.startsWith("catalog.")) "5.236" else "5.131"
+                    val res =
                         try {
-                            val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to ua), timeoutMs = 10_000)
+                            val resp =
+                                VkWebSession.postApiMethod(
+                                    host = host,
+                                    method = method,
+                                    apiVersion = ver,
+                                    params = params,
+                                    accessToken = token,
+                                    timeoutMs = 10_000,
+                                )
                             if (!resp.isSuccess) {
-                                emptyList()
+                                null
                             } else {
                                 val root = JSONObject(resp.body)
                                 if (root.has("error")) {
-                                    emptyList()
+                                    val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
+                                    if (code == 5 && allowRefresh) {
+                                        VkWebSession.invalidateCachedToken()
+                                        val fresh = VkWebSession.resolveAccessToken(rawStored, forceRefresh = true)
+                                        if (!fresh.isNullOrBlank()) {
+                                            token = fresh
+                                            return callVk(calls, allowRefresh = false)
+                                        }
+                                    }
+                                    null
                                 } else {
                                     val respObj = root.optJSONObject("response")
                                     val arr =
@@ -360,9 +373,9 @@ class CustomCatalogProvider(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (_: Exception) {
-                            emptyList()
+                            null
                         }
-                    if (found.isNotEmpty()) return found
+                    if (!res.isNullOrEmpty()) return res
                 }
                 return emptyList()
             }
@@ -370,27 +383,25 @@ class CustomCatalogProvider(
             val recs =
                 callVk(
                     listOf(
-                        "${vkApiBase()}/audio.getRecommendations?count=24&shuffle=1&access_token=$encodedToken&v=5.95" to KATE_CLASSIC_UA,
-                        "${vkApiBase()}/audio.getRecommendations?count=24&shuffle=1&access_token=$encodedToken&v=5.131" to KATE_CLASSIC_UA,
-                        "${vkApiBase()}/audio.getRecommendations?count=24&shuffle=1&access_token=$encodedToken&v=5.95" to KATE_MODERN_UA,
+                        Triple(WEB_API_RU_HOST, "audio.getRecommendations", mapOf("count" to "24", "shuffle" to "1")),
+                        Triple(WEB_API_RU_HOST, "catalog.getAudio", mapOf("need_blocks" to "1")),
+                        Triple(API_VK_COM_HOST, "audio.getRecommendations", mapOf("count" to "24", "shuffle" to "1")),
                     ),
                 )
-            delay(400L)
+            delay(380L)
             val popular =
                 callVk(
                     listOf(
-                        "${vkApiBase()}/audio.getPopular?count=24&access_token=$encodedToken&v=5.95" to KATE_CLASSIC_UA,
-                        "${vkApiBase()}/audio.getPopular?count=24&access_token=$encodedToken&v=5.131" to KATE_CLASSIC_UA,
-                        "${vkApiBase()}/audio.getPopular?count=24&access_token=$encodedToken&v=5.95" to KATE_MODERN_UA,
+                        Triple(WEB_API_RU_HOST, "audio.getPopular", mapOf("count" to "24")),
+                        Triple(API_VK_COM_HOST, "audio.getPopular", mapOf("count" to "24")),
                     ),
                 )
-            delay(400L)
+            delay(380L)
             val myMusic =
                 callVk(
                     listOf(
-                        "${vkApiBase()}/audio.get?count=24&offset=0&access_token=$encodedToken&v=5.95" to KATE_CLASSIC_UA,
-                        "${vkApiBase()}/audio.get?count=24&offset=0&access_token=$encodedToken&v=5.131" to KATE_CLASSIC_UA,
-                        "${vkApiBase()}/audio.get?count=24&offset=0&access_token=$encodedToken&v=5.95" to KATE_MODERN_UA,
+                        Triple(WEB_API_RU_HOST, "audio.get", mapOf("count" to "24", "offset" to "0")),
+                        Triple(API_VK_COM_HOST, "audio.get", mapOf("count" to "24", "offset" to "0")),
                     ),
                 )
             Triple(recs, popular, myMusic)
@@ -442,22 +453,30 @@ class CustomCatalogProvider(
             val clean = query.trim()
             if (clean.isBlank()) return@withContext emptyList()
             if (System.currentTimeMillis() < vkSearchFloodUntilMs) return@withContext emptyList()
-            val token = sanitizeVkToken(configStore.current.vkToken)
-            if (token.isBlank()) return@withContext emptyList()
+            val rawStored = configStore.current.vkToken
+            var token = VkWebSession.resolveAccessToken(rawStored) ?: return@withContext emptyList()
 
-            val encodedQuery = CustomHttp.urlEncode(clean)
-            val encodedToken = CustomHttp.urlEncode(token)
             val attempts =
                 listOf(
-                    "${vkApiBase()}/audio.search?q=$encodedQuery&count=$limit&sort=2&auto_complete=1&lang=ru&access_token=$encodedToken&v=5.95" to KATE_CLASSIC_UA,
-                    "${vkApiBase()}/audio.search?q=$encodedQuery&count=$limit&sort=2&auto_complete=1&lang=ru&access_token=$encodedToken&v=5.131" to KATE_CLASSIC_UA,
-                    "${vkApiBase()}/catalog.getAudioSearch?query=$encodedQuery&need_blocks=1&lang=ru&access_token=$encodedToken&v=5.131" to VK_ANDROID_UA,
+                    Triple(WEB_API_RU_HOST, "catalog.getAudioSearch", mapOf("query" to clean, "need_blocks" to "1", "lang" to "ru")),
+                    Triple(WEB_API_RU_HOST, "audio.search", mapOf("q" to clean, "count" to limit.toString(), "sort" to "2", "auto_complete" to "1", "lang" to "ru")),
+                    Triple(API_VK_COM_HOST, "audio.search", mapOf("q" to clean, "count" to limit.toString(), "sort" to "2", "auto_complete" to "1", "lang" to "ru")),
                 )
 
-            for ((url, ua) in attempts) {
+            var retriedRefresh = false
+            for ((host, method, params) in attempts) {
+                val ver = if (method.startsWith("catalog.")) "5.236" else "5.131"
                 val found =
                     try {
-                        val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to ua), timeoutMs = 8_000)
+                        val resp =
+                            VkWebSession.postApiMethod(
+                                host = host,
+                                method = method,
+                                apiVersion = ver,
+                                params = params,
+                                accessToken = token,
+                                timeoutMs = 8_000,
+                            )
                         if (!resp.isSuccess) {
                             null
                         } else {
@@ -467,6 +486,35 @@ class CustomCatalogProvider(
                                 if (code == 9) {
                                     vkSearchFloodUntilMs = System.currentTimeMillis() + 3 * 60 * 1_000L
                                     emptyList()
+                                } else if (code == 5 && !retriedRefresh) {
+                                    retriedRefresh = true
+                                    VkWebSession.invalidateCachedToken()
+                                    val fresh = VkWebSession.resolveAccessToken(rawStored, forceRefresh = true)
+                                    if (!fresh.isNullOrBlank()) {
+                                        token = fresh
+                                        val retryResp =
+                                            VkWebSession.postApiMethod(
+                                                host = host,
+                                                method = method,
+                                                apiVersion = ver,
+                                                params = params,
+                                                accessToken = token,
+                                                timeoutMs = 8_000,
+                                            )
+                                        val retryRoot = if (retryResp.isSuccess) JSONObject(retryResp.body) else null
+                                        val retryObj = retryRoot?.takeUnless { it.has("error") }?.optJSONObject("response")
+                                        val retryArr = retryObj?.optJSONArray("audios") ?: retryObj?.optJSONArray("items")
+                                        if (retryObj != null) {
+                                            parseVkAudioArray(retryArr, rejectUnavailableUrl = true)
+                                                .take(limit)
+                                                .map { it.toSongItem() }
+                                                .distinctBy { it.id }
+                                        } else {
+                                            null
+                                        }
+                                    } else {
+                                        null
+                                    }
                                 } else {
                                     null
                                 }
@@ -475,7 +523,7 @@ class CustomCatalogProvider(
                                 if (respObj == null) {
                                     emptyList()
                                 } else {
-                                    val arr = respObj.optJSONArray("items") ?: respObj.optJSONArray("audios")
+                                    val arr = respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
                                     parseVkAudioArray(arr, rejectUnavailableUrl = true)
                                         .take(limit)
                                         .map { it.toSongItem() }
@@ -527,11 +575,11 @@ class CustomCatalogProvider(
         onProgress: (LibraryImportProgress) -> Unit,
     ): Result<LibraryImportSummary> =
         try {
-            val token = sanitizeVkToken(configStore.current.vkToken)
-            require(token.isNotBlank()) { "Сначала войди в ВК или укажи токен" }
+            val rawStored = configStore.current.vkToken.trim()
+            require(rawStored.isNotBlank()) { "Сначала войди в ВК" }
 
             onProgress(LibraryImportProgress("Загружаю медиатеку ВК…"))
-            val tracks = fetchAllVkAudioTracks(token) { fetched, total ->
+            val tracks = fetchAllVkAudioTracks(rawStored) { fetched, total ->
                 val suffix = if (total > 0) " из $total" else ""
                 onProgress(LibraryImportProgress("VK: загружено $fetched$suffix треков…", fetchedCount = fetched))
             }
@@ -581,7 +629,7 @@ class CustomCatalogProvider(
     suspend fun scanExternalTasteProfile(): Int =
         coroutineScope {
             val yandexToken = sanitizeYandexToken(configStore.current.yandexToken)
-            val vkToken = sanitizeVkToken(configStore.current.vkToken)
+            val vkStored = configStore.current.vkToken.trim()
 
             val ymTask =
                 async(Dispatchers.IO) {
@@ -604,12 +652,12 @@ class CustomCatalogProvider(
 
             val vkTask =
                 async(Dispatchers.IO) {
-                    if (vkToken.isBlank()) {
+                    if (vkStored.isBlank()) {
                         emptyList()
                     } else {
                         try {
                             fetchAllVkAudioTracks(
-                                token = vkToken,
+                                rawStored = vkStored,
                                 maxTracksCap = BACKGROUND_SCAN_CAP,
                                 onPageFetched = { _, _ -> },
                             )
@@ -968,31 +1016,37 @@ class CustomCatalogProvider(
         }
 
     private suspend fun fetchAllVkAudioTracks(
-        token: String,
+        rawStored: String,
         maxTracksCap: Int = 5_000,
         onPageFetched: (fetched: Int, total: Int) -> Unit,
     ): List<ExternalCatalogTrack> =
         withContext(Dispatchers.IO) {
+            var token =
+                VkWebSession.resolveAccessToken(rawStored)
+                    ?: error("Сессия ВК истекла — обнови вход в ВК")
             val allTracks = mutableListOf<ExternalCatalogTrack>()
-            val versionsToTry = listOf("5.95", "5.131")
-            var workingVersion: String? = null
+            val hostsToTry = listOf(WEB_API_RU_HOST, API_VK_COM_HOST)
+            var workingHost: String? = null
             var totalCount = -1
             var offset = 0
             val pageSize = minOf(200, maxTracksCap)
 
             while (offset < maxTracksCap) {
-                val versions = workingVersion?.let { listOf(it) } ?: versionsToTry
+                val hosts = workingHost?.let { listOf(it) } ?: hostsToTry
                 var pageItems: List<ExternalCatalogTrack>? = null
                 var lastErr: String? = null
+                var refreshedOnce = false
 
-                for (ver in versions) {
-                    val url =
-                        "${vkApiBase()}/audio.get" +
-                            "?count=$pageSize" +
-                            "&offset=$offset" +
-                            "&access_token=${CustomHttp.urlEncode(token)}" +
-                            "&v=$ver"
-                    val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to KATE_CLASSIC_UA), timeoutMs = 12_000)
+                for (host in hosts) {
+                    val resp =
+                        VkWebSession.postApiMethod(
+                            host = host,
+                            method = "audio.get",
+                            apiVersion = "5.131",
+                            params = mapOf("count" to pageSize.toString(), "offset" to offset.toString()),
+                            accessToken = token,
+                            timeoutMs = 12_000,
+                        )
                     if (!resp.isSuccess) {
                         lastErr = "VK HTTP ${resp.code}"
                         continue
@@ -1007,13 +1061,22 @@ class CustomCatalogProvider(
                             error("VK #9: Флуд-контроль — подожди пару минут и повтори")
                         }
                         if (code == 5) {
-                            error("Токен ВК истёк (#5) — обнови через «Обновить ВК»")
+                            if (!refreshedOnce) {
+                                refreshedOnce = true
+                                VkWebSession.invalidateCachedToken()
+                                val fresh = VkWebSession.resolveAccessToken(rawStored, forceRefresh = true)
+                                if (!fresh.isNullOrBlank()) {
+                                    token = fresh
+                                    continue
+                                }
+                            }
+                            error("Сессия ВК истекла (#5) — обнови через «Обновить ВК»")
                         }
                         lastErr = "VK #$code: $msg"
                         continue
                     }
 
-                    workingVersion = ver
+                    workingHost = host
                     val respObj = root.optJSONObject("response")
                     if (respObj != null) {
                         if (totalCount < 0) totalCount = respObj.optInt("count", -1)
@@ -1156,24 +1219,11 @@ class CustomCatalogProvider(
     private fun sanitizeYandexToken(raw: String): String =
         raw.trim().removePrefix("OAuth ").removePrefix("Bearer ").trim()
 
-    private fun sanitizeVkToken(raw: String): String {
-        val trimmed = raw.trim()
-        return if (trimmed.contains("access_token=")) {
-            trimmed.substringAfter("access_token=").substringBefore("&").substringBefore("#").trim()
-        } else {
-            trimmed
-        }
-    }
-
     companion object {
         private const val TAG = "CustomCatalog"
         private const val YANDEX_UA = "Yandex-Music-API"
-        private const val KATE_CLASSIC_UA =
-            "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)"
-        private const val KATE_MODERN_UA =
-            "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
-        private const val VK_ANDROID_UA =
-            "VKAndroidApp/5.52-4543 (Android 5.1.1; SDK 22; x86_64; unknown Android SDK built for x86_64; en; 320x240)"
+        private const val WEB_API_RU_HOST = "web.api.vk.ru"
+        private const val API_VK_COM_HOST = "api.vk.com"
         private const val HOME_SHELVES_TTL_MS = 3L * 60 * 60 * 1_000L
         private const val BACKGROUND_SCAN_CAP = 200
         private const val HOME_CACHE_FILE_NAME = "custom_home_snapshot_v1.json"
@@ -1374,7 +1424,7 @@ class CustomCatalogProvider(
                     add(
                         HomeShelf(
                             key = "custom_vk_popular",
-                            title = "Чарт и рекомендации VK",
+                            title = "Рекомендации VK",
                             items = vkSongs,
                             style = HomeShelfStyle.SONG_GRID,
                             headerAction = HomeShelfHeaderAction.PLAY_ALL,
@@ -1490,8 +1540,5 @@ class CustomCatalogProvider(
 
         private fun yandexApiBase(): String =
             "https://" + listOf("api", "music", "yandex", "net").joinToString(".")
-
-        private fun vkApiBase(): String =
-            "https://" + listOf("api", "vk", "com").joinToString(".") + "/method"
     }
 }
