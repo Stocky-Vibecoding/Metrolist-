@@ -28,6 +28,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -35,6 +36,7 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Locale
 
 data class ExternalCatalogTrack(
@@ -1147,11 +1149,31 @@ class CustomCatalogProvider(
     }
 
     private fun parseYandexAlbumRelease(albums: JSONArray?): Pair<Int?, Long?> {
-        val firstAlb = albums?.optJSONObject(0) ?: return null to null
-        val rawDate = firstAlb.optString("releaseDate").trim()
-        val yearFromField = firstAlb.optInt("year", 0).takeIf { it in 1900..2100 }
-        val yearFromDate = rawDate.takeIf { it.length >= 4 }?.take(4)?.toIntOrNull()?.takeIf { it in 1900..2100 }
-        return (yearFromField ?: yearFromDate) to parseIsoDateMs(rawDate)
+        if (albums == null || albums.length() == 0) return null to null
+        val nonCompilations = mutableListOf<Pair<Int?, Long?>>()
+        val allParsed = mutableListOf<Pair<Int?, Long?>>()
+        for (i in 0 until albums.length()) {
+            val alb = albums.optJSONObject(i) ?: continue
+            val rawDate = alb.optString("releaseDate").trim()
+            val yearFromField = alb.optInt("year", 0).takeIf { it in 1900..2100 }
+            val yearFromDate = rawDate.takeIf { it.length >= 4 }?.take(4)?.toIntOrNull()?.takeIf { it in 1900..2100 }
+            val year = yearFromField ?: yearFromDate
+            val ms = parseIsoDateMs(rawDate)
+            if (year == null && ms == null) continue
+            val pair = year to ms
+            allParsed.add(pair)
+            if (!alb.optString("type").trim().equals("compilation", ignoreCase = true)) {
+                nonCompilations.add(pair)
+            }
+        }
+        val pool = nonCompilations.ifEmpty { allParsed }
+        if (pool.isEmpty()) return null to null
+        return pool.minWithOrNull(
+            compareBy<Pair<Int?, Long?>>(
+                { it.first ?: Int.MAX_VALUE },
+                { it.second ?: Long.MAX_VALUE },
+            ),
+        ) ?: pool.first()
     }
 
     private fun parseIsoDateMs(rawDate: String?): Long? {
@@ -1259,6 +1281,7 @@ class CustomCatalogProvider(
         private const val API_VK_COM_HOST = "api.vk.com"
         private const val HOME_SHELVES_TTL_MS = 3L * 60 * 60 * 1_000L
         private const val FRESH_POOL_TTL_MS = 2L * 60 * 60 * 1_000L
+        private const val DAY_MS = 24L * 3600L * 1_000L
         private const val BACKGROUND_SCAN_CAP = 200
         private const val HOME_CACHE_FILE_NAME = "custom_home_snapshot_v1.json"
 
@@ -1300,8 +1323,7 @@ class CustomCatalogProvider(
         private var lastSearchedQuery: String = ""
 
         /**
-         * Возвращает кэшированный пул реальных релизов любимых артистов пользователя за последний год (<= 365 дней)
-         * для подмешивания в свежую квоту волны (25% РУ + 25% зарубежка) и в фильтр «Свежее».
+         * Возвращает кэшированный пул реальных релизов любимых артистов пользователя за последний год (<= 365 дней).
          */
         suspend fun getCachedFreshArtistReleases(
             configStore: CustomConfigStore,
@@ -1346,6 +1368,110 @@ class CustomCatalogProvider(
                 }
                 fetched.take(limit)
             }
+        }
+
+        /**
+         * Быстрый пул реально вышедших свежих треков (<= maxAgeDays) из «Премьеры», «Новых релизов»,
+         * свежей части чартов Яндекса/Deezer и радара любимых артистов.
+         */
+        suspend fun getLiveFreshCatalogPool(
+            configStore: CustomConfigStore,
+            maxAgeDays: Int = 366,
+            limit: Int = 48,
+        ): List<ExternalCatalogTrack> =
+            coroutineScope {
+                val existingSnapshot = _homeSnapshot.value
+                val snapshotTask =
+                    async(Dispatchers.IO) {
+                        if (existingSnapshot.isNotEmpty) {
+                            existingSnapshot
+                        } else {
+                            withTimeoutOrNull(2_400L) {
+                                val provider = CustomCatalogProvider(configStore)
+                                val ymChart = async { provider.fetchYandexChart(24) }
+                                val ymNew = async { provider.fetchYandexNewReleases(20) }
+                                val dzChart = async { (HybridStreamResolver.getDeezerClient() ?: fallbackDeezerClient).fetchChart(24) }
+                                HomeCatalogSnapshot(
+                                    yandexChart = ymChart.await(),
+                                    yandexNewReleases = ymNew.await(),
+                                    deezerChart = dzChart.await(),
+                                    updatedAtMs = System.currentTimeMillis(),
+                                )
+                            } ?: existingSnapshot
+                        }
+                    }
+
+                val artistFreshTask =
+                    async(Dispatchers.IO) {
+                        if (cachedFreshArtistReleases.isNotEmpty()) {
+                            cachedFreshArtistReleases
+                        } else {
+                            withTimeoutOrNull(1_600L) {
+                                getCachedFreshArtistReleases(
+                                    configStore = configStore,
+                                    maxAgeDays = maxAgeDays,
+                                    limit = 20,
+                                )
+                            }.orEmpty()
+                        }
+                    }
+
+                val snap = snapshotTask.await()
+                val artistFresh = artistFreshTask.await()
+
+                val seen = HashSet<String>()
+                val out = ArrayList<ExternalCatalogTrack>(limit)
+
+                fun addFiltered(
+                    source: List<ExternalCatalogTrack>,
+                    trustWithoutDate: Boolean,
+                ) {
+                    for (t in source) {
+                        if (out.size >= limit) break
+                        if (t.artist.isBlank() || t.title.isBlank()) continue
+                        if (!isTrackFreshForCatalog(t, maxAgeDays = maxAgeDays, trustWithoutDate = trustWithoutDate)) continue
+                        val key = CustomConfigStore.buildTrackKey(t.artist, t.title)
+                        if (key.isNotBlank() && seen.add(key)) {
+                            out.add(t)
+                        }
+                    }
+                }
+
+                // Сначала персональные свежие источники, потом свежая часть чартов
+                addFiltered(artistFresh, trustWithoutDate = true)
+                addFiltered(snap.yandexPremiereTracks, trustWithoutDate = true)
+                addFiltered(snap.releaseRadar, trustWithoutDate = true)
+                addFiltered(snap.yandexChart, trustWithoutDate = false)
+                addFiltered(snap.deezerChart, trustWithoutDate = false)
+                addFiltered(snap.yandexNewReleases, trustWithoutDate = true)
+                out
+            }
+
+        private fun isTrackFreshForCatalog(
+            track: ExternalCatalogTrack,
+            maxAgeDays: Int,
+            trustWithoutDate: Boolean,
+        ): Boolean {
+            val nowMs = System.currentTimeMillis()
+            val relMs = track.releaseDateMs
+            if (relMs != null && relMs > 0L) {
+                return (nowMs - relMs) <= maxAgeDays.toLong() * DAY_MS
+            }
+            val relYear = track.releaseYear
+            if (relYear != null && relYear in 1900..2100) {
+                val cal = Calendar.getInstance()
+                val currentYear = cal.get(Calendar.YEAR)
+                val currentMonth = cal.get(Calendar.MONTH) + 1
+                val cutoffCal = Calendar.getInstance().apply { timeInMillis = nowMs - maxAgeDays.toLong() * DAY_MS }
+                val cutoffYear = cutoffCal.get(Calendar.YEAR)
+                return when {
+                    relYear >= currentYear -> true
+                    relYear < cutoffYear -> false
+                    maxAgeDays <= 366 && currentMonth >= 10 -> false
+                    else -> true
+                }
+            }
+            return trustWithoutDate
         }
 
         fun initDiskCache(appContext: Context) {
