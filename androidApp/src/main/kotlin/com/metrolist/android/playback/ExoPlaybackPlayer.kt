@@ -1047,6 +1047,7 @@ class ExoPlaybackPlayer(
                     Settings.shared.audioNormalization to Settings.shared.loudnessLevel,
                 )
             }.combine(AudioSpectrumMeter.hasConsumers) { _, _ -> Unit }
+                .combine(SmartLoudnessController.enabled) { _, _ -> Unit }
                 .collect { applyAudioPreferences() }
         }
         attachPlayerListeners(exo)
@@ -2247,7 +2248,8 @@ class ExoPlaybackPlayer(
             }
         val normalizationGain = normalizationProcessors[player]?.normalizationGain
         val canOffload =
-            player === exo && normalizationGain != null &&
+            !SmartLoudnessController.isEnabled &&
+                player === exo && normalizationGain != null &&
                 (nextPlaylistIndex == C.INDEX_UNSET || nextResource.normalizationGain() == 1f) &&
                 AudioOffloadEligibility(
                     equalizer = EqualizerProfiles.configuration,
@@ -2313,25 +2315,14 @@ class ExoPlaybackPlayer(
     }
 
     private fun PlaybackResource?.normalizationGain(): Float {
-        val baseGain =
-            playbackNormalizationGain(
-                loudnessDb = this?.loudnessDb,
-                enabled = Settings.shared.audioNormalization,
-                level = Settings.shared.loudnessLevel,
-                perceptualLoudnessDb = this?.perceptualLoudnessDb,
-            )
-        if (this == null || this.loudnessDb != null || this.perceptualLoudnessDb != null) {
-            return baseGain
-        }
-        if (!Settings.shared.audioNormalization) return baseGain
-        // Компенсация базовой громкости VK и Я.Музыки при отсутствии loudnessDb, чтобы не было скачков с YTM
-        val sourceCompensation =
-            when (this.clientName) {
-                "vk" -> 0.72f
-                "yandex" -> 0.78f
-                else -> 1.0f
-            }
-        return (baseGain * sourceCompensation).coerceIn(0.1f, 1.0f)
+        // Когда включена наша умная PCM-нормализация, штатный приглушающий нормалайзер отдаёт чистый 1.0f
+        if (SmartLoudnessController.isEnabled) return 1f
+        return playbackNormalizationGain(
+            loudnessDb = this?.loudnessDb,
+            enabled = Settings.shared.audioNormalization,
+            level = Settings.shared.loudnessLevel,
+            perceptualLoudnessDb = this?.perceptualLoudnessDb,
+        )
     }
 
     override fun startNextPlayback(): Boolean {
