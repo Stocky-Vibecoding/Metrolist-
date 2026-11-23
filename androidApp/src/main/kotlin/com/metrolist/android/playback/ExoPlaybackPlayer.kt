@@ -2,7 +2,6 @@ package com.metrolist.android.playback
 
 import android.app.AppOpsManager
 import android.content.Context
-import android.content.Intent
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.Uri
@@ -92,6 +91,7 @@ import com.metrolist.shared.youtube.logging.MetrolistInnerTubeLogger
 import com.metrolist.shared.youtube.playback.PlaybackBandwidthMeter
 import com.metrolist.shared.youtube.playback.PlaybackEventKind
 import com.metrolist.shared.youtube.playback.PlaybackEventLog
+import com.metrolist.shared.youtube.playback.PlaybackNetworkStateStore
 import com.metrolist.shared.youtube.playback.PlaybackResource
 import com.metrolist.shared.youtube.playback.matchingLiveState
 import com.metrolist.shared.youtube.playback.sabrAudioPlaybackChunks
@@ -145,6 +145,7 @@ private const val BUFFERING_STALL_TIMEOUT_MS = 5_500L
 private const val VK_NETWORK_RECOVERY_DEBOUNCE_MS = 2_500L
 
 private const val SMOOTH_PAUSE_FADE_MS = 160L
+private const val SMOOTH_PAUSE_DRAIN_MS = 48L
 private const val SMOOTH_RESUME_FADE_MS = 200L
 private const val SMOOTH_SWITCH_FADEOUT_MS = 180L
 private const val SMOOTH_TRACK_FADEIN_MS = 240L
@@ -306,8 +307,6 @@ internal enum class AndroidPlaybackPlayerRole(
     SECONDARY(false),
 }
 
-// Users who deny the take-audio-focus app op to mix with other apps could play in v13. Media3 refuses to play
-// when the focus request fails, so skip its focus handling for them.
 internal fun appMayTakeAudioFocus(context: Context): Boolean =
     runCatching {
         val appOps = context.getSystemService(AppOpsManager::class.java) ?: return true
@@ -340,7 +339,6 @@ internal fun replaceAudioOutput(
     incoming.volume = 0f
     outgoing.volume = 0f
     outgoing.pause()
-    // Volume and pause messages use separate playback threads; release must finish before unmuting.
     releaseOutgoing()
     promoteIncoming()
 }
@@ -721,7 +719,7 @@ class ExoPlaybackPlayer(
         isFadingOutForPause = false
         if (resetGain) {
             smoothFadeGain = 1f
-            applyPlaybackGains()
+            applyOutputVolumesOnly()
         }
     }
 
@@ -745,10 +743,10 @@ class ExoPlaybackPlayer(
         isFadingOutForPause = false
         val startGain = fromGain.coerceIn(0f, 1f)
         smoothFadeGain = startGain
-        applyPlaybackGains()
+        applyOutputVolumesOnly()
         if (startGain >= 0.99f || durationMs <= 0L) {
             smoothFadeGain = 1f
-            applyPlaybackGains()
+            applyOutputVolumesOnly()
             return
         }
         smoothFadeJob =
@@ -759,12 +757,12 @@ class ExoPlaybackPlayer(
                     val t = (elapsed.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
                     val eased = 1f - (1f - t) * (1f - t)
                     smoothFadeGain = (startGain + (1f - startGain) * eased).coerceIn(0f, 1f)
-                    applyPlaybackGains()
+                    applyOutputVolumesOnly()
                     if (t >= 1f) break
                     delay(SMOOTH_FADE_STEP_MS.milliseconds)
                 }
                 smoothFadeGain = 1f
-                applyPlaybackGains()
+                applyOutputVolumesOnly()
                 smoothFadeJob = null
             }
     }
@@ -793,9 +791,12 @@ class ExoPlaybackPlayer(
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (source !== exo || controllerClock != null) return
                 if (isFadingOutForRequest || isFadingOutForPause) return
-                if (isPlaying && pendingFadeInOnStart) {
-                    pendingFadeInOnStart = false
-                    animateSmoothFadeIn(SMOOTH_TRACK_FADEIN_MS, fromGain = 0f)
+                if (isPlaying) {
+                    pendingNetworkRecovery = null
+                    if (pendingFadeInOnStart) {
+                        pendingFadeInOnStart = false
+                        animateSmoothFadeIn(SMOOTH_TRACK_FADEIN_MS, fromGain = 0f)
+                    }
                 }
                 _isPlaying.value = isPlaying
                 sabrPlaybackCache.setPlaying(isPlaying)
@@ -967,7 +968,6 @@ class ExoPlaybackPlayer(
                         is AudioSink.WriteException -> PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED
                         else -> return
                     }
-                // Media3 can retry recoverable sink errors forever without calling onPlayerError.
                 reportPlaybackFailure(PlaybackException("Audio offload output failed", audioSinkError, errorCode))
             }
 
@@ -1062,7 +1062,7 @@ class ExoPlaybackPlayer(
                 }
         }
 
-        // Сторож зависшего потока: если сетевая буферизация висит >5.5 сек — уходим на следующий источник по каскаду
+        // Сторож зависшего потока: если сетевая буферизация стоит на месте >5.5 сек — уходим на следующий источник
         scope.launch {
             combine(_playbackState, _wantsPlayback, playbackTransitions.pending) { state, wants, pending ->
                 Triple(state, wants, pending)
@@ -1074,39 +1074,53 @@ class ExoPlaybackPlayer(
                 if (watchedResource.clientName == "local" || watchedResource.profileId?.startsWith("custom_cache_") == true) {
                     return@collectLatest
                 }
-                delay(BUFFERING_STALL_TIMEOUT_MS.milliseconds)
-                if (
-                    exo.playbackState == Player.STATE_BUFFERING &&
-                    exo.playWhenReady &&
-                    !exo.isPlaying &&
-                    currentInstance == watchedInstance &&
-                    currentResource === watchedResource &&
-                    !playbackTransitions.pending.value &&
-                    !isFadingOutForRequest &&
-                    !isFadingOutForPause
-                ) {
-                    Timber.tag(MUSIC_VIDEO_TAG).w(
-                        "Stream buffering watchdog triggered after %dms videoId=%s client=%s",
-                        BUFFERING_STALL_TIMEOUT_MS,
-                        watchedResource.videoId,
-                        watchedResource.clientName,
-                    )
-                    emitPlaybackFailure(
-                        PlaybackFailure(
-                            stage = "buffering_watchdog",
-                            message = "Stream buffering stalled after ${BUFFERING_STALL_TIMEOUT_MS}ms",
-                            cause = TimeoutException("Buffering watchdog exceeded ${BUFFERING_STALL_TIMEOUT_MS}ms"),
-                            sourceName = "Media3",
-                            videoId = watchedResource.videoId,
-                            playbackInstanceId = watchedInstance,
-                            playbackPositionMs = getRealtimePositionMs(),
-                            resumePlayback = wantsPlayback,
-                            isMediaSourceFailure = true,
-                            shouldExcludePlaybackProfile = true,
-                            category = PlaybackFailureCategory.TIMEOUT,
-                        ),
-                    )
+                var lastBufferedMs = exo.bufferedPosition.coerceAtLeast(0L)
+                var graceWindowsLeft = 1
+                while (isActive) {
+                    delay(BUFFERING_STALL_TIMEOUT_MS.milliseconds)
+                    if (
+                        exo.playbackState != Player.STATE_BUFFERING ||
+                        !exo.playWhenReady ||
+                        exo.isPlaying ||
+                        exo.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE ||
+                        currentInstance != watchedInstance ||
+                        currentResource !== watchedResource ||
+                        playbackTransitions.pending.value ||
+                        isFadingOutForRequest ||
+                        isFadingOutForPause
+                    ) {
+                        return@collectLatest
+                    }
+                    val nowBufferedMs = exo.bufferedPosition.coerceAtLeast(0L)
+                    if (nowBufferedMs > lastBufferedMs + 500L && graceWindowsLeft > 0) {
+                        // На медленной сети буфер реально растёт — даём ещё одно окно перед отказом
+                        lastBufferedMs = nowBufferedMs
+                        graceWindowsLeft -= 1
+                        continue
+                    }
+                    break
                 }
+                if (!PlaybackNetworkStateStore.current.connected) return@collectLatest
+                Timber.tag(MUSIC_VIDEO_TAG).w(
+                    "Stream buffering watchdog triggered videoId=%s client=%s",
+                    watchedResource.videoId,
+                    watchedResource.clientName,
+                )
+                emitPlaybackFailure(
+                    PlaybackFailure(
+                        stage = "buffering_watchdog",
+                        message = "Stream buffering stalled after ${BUFFERING_STALL_TIMEOUT_MS}ms",
+                        cause = TimeoutException("Buffering watchdog exceeded ${BUFFERING_STALL_TIMEOUT_MS}ms"),
+                        sourceName = "Media3",
+                        videoId = watchedResource.videoId,
+                        playbackInstanceId = watchedInstance,
+                        playbackPositionMs = getRealtimePositionMs(),
+                        resumePlayback = wantsPlayback,
+                        isMediaSourceFailure = true,
+                        shouldExcludePlaybackProfile = true,
+                        category = PlaybackFailureCategory.TIMEOUT,
+                    ),
+                )
             }
         }
 
@@ -1130,7 +1144,6 @@ class ExoPlaybackPlayer(
                     playback
                 }.collectLatest { (sampleProgress, visible, speed) ->
                     updateProgressState(reportSample = true)
-                    // UI consumers interpolate between samples per frame; faster publishing redraws the window on every tick.
                     while (sampleProgress && controllerClock == null) {
                         val pollIntervalMs =
                             playbackPollIntervalMs(
@@ -1219,7 +1232,19 @@ class ExoPlaybackPlayer(
         flushPendingRequestFadeStop()
         pendingFadeInOnStart = false
         logCommand("pause")
-        if (exo.isPlaying && audioOutputEnabled && !nextStarted && !isFadingOutForPause) {
+        if (isFadingOutForPause) {
+            smoothFadeJob?.cancel()
+            smoothFadeJob = null
+            smoothFadeGain = 0f
+            applyOutputVolumesOnly()
+            exo.pause()
+            isFadingOutForPause = false
+            _wantsPlayback.value = false
+            _isPlaying.value = false
+            maybeRecoverAudioOutput(userAction = AudioOutputUserAction.PAUSE)
+            return
+        }
+        if (exo.isPlaying && audioOutputEnabled && !nextStarted) {
             isFadingOutForPause = true
             _wantsPlayback.value = false
             _isPlaying.value = false
@@ -1232,14 +1257,20 @@ class ExoPlaybackPlayer(
                         val elapsed = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)
                         val t = (elapsed.toFloat() / SMOOTH_PAUSE_FADE_MS.toFloat()).coerceIn(0f, 1f)
                         smoothFadeGain = (startGain * (1f - t)).coerceIn(0f, 1f)
-                        applyPlaybackGains()
+                        applyOutputVolumesOnly()
                         if (t >= 1f) break
                         delay(SMOOTH_FADE_STEP_MS.milliseconds)
                     }
+                    smoothFadeGain = 0f
+                    applyOutputVolumesOnly()
                     exo.pause()
+                    // Даём AudioTrack доиграть тихий хвост буфера, чтобы не было щелчка при возврате громкости
+                    delay(SMOOTH_PAUSE_DRAIN_MS.milliseconds)
                     isFadingOutForPause = false
-                    smoothFadeGain = 1f
-                    applyPlaybackGains()
+                    if (!exo.playWhenReady) {
+                        smoothFadeGain = 1f
+                        applyOutputVolumesOnly()
+                    }
                     smoothFadeJob = null
                 }
         } else {
@@ -1276,7 +1307,10 @@ class ExoPlaybackPlayer(
         val shouldFadeIn = !exo.isPlaying && audioOutputEnabled && !nextStarted
         if (shouldFadeIn) {
             smoothFadeGain = 0.05f
-            applyPlaybackGains()
+            applyOutputVolumesOnly()
+        } else if (smoothFadeGain < 1f) {
+            smoothFadeGain = 1f
+            applyOutputVolumesOnly()
         }
         exo.play()
         if (shouldFadeIn) {
@@ -1293,6 +1327,7 @@ class ExoPlaybackPlayer(
         flushPendingRequestFadeStop()
         cancelSmoothFade()
         pendingFadeInOnStart = false
+        pendingNetworkRecovery = null
         outputRecoveryState = outputRecoveryState.cancelUserRecovery()
         controllerClock = null
         displayVolumeState.value = _volume.value
@@ -1400,12 +1435,12 @@ class ExoPlaybackPlayer(
     override fun setVolume(level: Float) {
         _volume.value = level.coerceIn(0f, 1f)
         if (controllerClock == null) displayVolumeState.value = _volume.value
-        applyPlaybackGains()
+        applyOutputVolumesOnly()
     }
 
     override fun setSleepTimerGain(gain: Float) {
         sleepTimerGain = gain.coerceIn(0f, 1f)
-        applyPlaybackGains()
+        applyOutputVolumesOnly()
     }
 
     override fun applyAudioPreferences() {
@@ -1415,7 +1450,7 @@ class ExoPlaybackPlayer(
 
     override fun setAudioOutputEnabled(enabled: Boolean) {
         audioOutputEnabled = enabled
-        applyPlaybackGains()
+        applyOutputVolumesOnly()
     }
 
     override fun playbackSpeed() = _playbackSpeed.value
@@ -2015,7 +2050,6 @@ class ExoPlaybackPlayer(
                             error: IOException,
                             wasCanceled: Boolean,
                         ) {
-                            // A paused preload may never drain its buffer and surface onPlayerError.
                             if (wasCanceled) reportFailure(error)
                         }
                     },
@@ -2213,12 +2247,12 @@ class ExoPlaybackPlayer(
 
     override fun setTransitionVolume(level: Float) {
         transitionGain = (level / 100f).coerceIn(0f, 1f)
-        applyPlaybackGains()
+        applyOutputVolumesOnly()
     }
 
     override fun setNextVolume(level: Float) {
         nextTransitionGain = (level / 100f).coerceIn(0f, 1f)
-        applyPlaybackGains()
+        applyOutputVolumesOnly()
     }
 
     private fun setPlaybackParameters(
@@ -2284,20 +2318,10 @@ class ExoPlaybackPlayer(
     ) {
         transitionGain = (outgoingLevel / 100f).coerceIn(0f, 1f)
         nextTransitionGain = (incomingLevel / 100f).coerceIn(0f, 1f)
-        applyPlaybackGains()
+        applyOutputVolumesOnly()
     }
 
-    private fun applyPlaybackGains() {
-        normalizationProcessors[exo]?.let {
-            it.resource = currentResource
-        }
-        nextPlayer?.let { player ->
-            normalizationProcessors[player]?.let {
-                it.resource = nextResource
-            }
-        }
-        updateOffloadPreferences(exo)
-        nextPlayer?.let { updateOffloadPreferences(it) }
+    private fun applyOutputVolumesOnly() {
         exo.volume =
             playbackOutputGain(
                 effectivePlaybackVolume(_volume.value, audioOutputEnabled),
@@ -2312,6 +2336,20 @@ class ExoPlaybackPlayer(
                     nextTransitionGain,
                 )
         }
+    }
+
+    private fun applyPlaybackGains() {
+        normalizationProcessors[exo]?.let {
+            it.resource = currentResource
+        }
+        nextPlayer?.let { player ->
+            normalizationProcessors[player]?.let {
+                it.resource = nextResource
+            }
+        }
+        updateOffloadPreferences(exo)
+        nextPlayer?.let { updateOffloadPreferences(it) }
+        applyOutputVolumesOnly()
     }
 
     private fun PlaybackResource?.normalizationGain(): Float {
@@ -2413,7 +2451,6 @@ class ExoPlaybackPlayer(
     private fun removeFinishedPlaylistItems() {
         val currentIndex = exo.currentMediaItemIndex
         if (currentIndex <= 0) return
-        // Queue promotion can run later, so keep its preload index aligned with the trimmed playlist.
         if (nextPlaylistIndex != C.INDEX_UNSET) nextPlaylistIndex -= currentIndex
         exo.removeMediaItems(0, currentIndex)
     }
@@ -2553,6 +2590,7 @@ class ExoPlaybackPlayer(
         val previousPosition = nextPlaylistPreviousPositionMs ?: previous.currentPosition.coerceAtLeast(0L)
         val shouldPlay = previous.playWhenReady
         pendingFadeInOnStart = false
+        pendingNetworkRecovery = null
         cancelSmoothFade(resetGain = false)
         smoothFadeGain = 1f
         if (usesPlaylist) {
@@ -2657,7 +2695,8 @@ class ExoPlaybackPlayer(
         HybridStreamResolver.invalidateVkSessionStreams()
         val resource = currentResource
         val isLiveVkStream =
-            resource != null &&
+            PlaybackNetworkStateStore.current.connected &&
+                resource != null &&
                 resource.clientName == "vk" &&
                 resource.profileId?.startsWith("custom_cache_") != true &&
                 currentInstance > 0L &&
@@ -2937,6 +2976,7 @@ class ExoPlaybackPlayer(
                 ),
             )
             var sourceCommitted = false
+            var mutedForFadeIn = false
             var sourceSeekPending = false
             val sourceSeekListener =
                 object : Player.Listener {
@@ -3167,6 +3207,7 @@ class ExoPlaybackPlayer(
                     smoothFadeJob?.cancel()
                     smoothFadeJob = null
                     smoothFadeGain = 0f
+                    mutedForFadeIn = true
                 }
 
                 if (prepareInBackground) {
@@ -3182,7 +3223,6 @@ class ExoPlaybackPlayer(
                     val surface = activeVideoSurface
                     removeVideoSurface(previousPlayer, surface)
                     detachPlayerListeners(previousPlayer)
-                    // Keep the shared effects session open while the outgoing player releases.
                     if (!freshAudioSession) systemAudioEffects.attach(candidate)
                     replaceAudioOutput(
                         outgoing = previousPlayer,
@@ -3284,8 +3324,8 @@ class ExoPlaybackPlayer(
                 previousAudioSource?.closePlaybackSource()
                 previousVideoSource?.closePlaybackSource()
                 currentResource = preparedResource
+                pendingNetworkRecovery = null
                 applyPlaybackGains()
-                // Cold counterpart readiness can suspend; never restore the intent captured before it.
                 if (!prepareInBackground) candidate.playWhenReady = targetPlaying()
                 _wantsPlayback.value = candidate.playWhenReady
                 if (shouldFadeInNewTrack && candidate.isPlaying) {
@@ -3371,6 +3411,10 @@ class ExoPlaybackPlayer(
                 previousPlayer.removeListener(sourceSeekListener)
                 if (candidate !== exo) releasePlayer(candidate)
                 if (!sourceCommitted) {
+                    if (mutedForFadeIn && smoothFadeGain == 0f) {
+                        smoothFadeGain = 1f
+                        applyOutputVolumesOnly()
+                    }
                     nextAudioSource?.closePlaybackSource()
                     nextVideoSource?.closePlaybackSource()
                 }
@@ -3385,7 +3429,6 @@ class ExoPlaybackPlayer(
         if (visible) {
             sabr.resumeProducer(exo.currentPosition.coerceAtLeast(0L))
         } else if (activeVideoSourcePrepared || exo.playbackState == Player.STATE_READY) {
-            // Merged sources still need their initial container probe before audio can become ready.
             activeVideoSourcePrepared = true
             setVideoTrackEnabled(exo, false)
             sabr.suspendProducer()
@@ -3417,6 +3460,7 @@ class ExoPlaybackPlayer(
         cancelNextInternal()
         val startPositionMs = positionMs.coerceAtLeast(0L)
         requestCounter++
+        pendingNetworkRecovery = null
         outputRecoveryState = outputRecoveryState.cancelUserRecovery()
         queueTrackChangePending = true
         playbackTransitions.beginQueue()
@@ -3432,7 +3476,6 @@ class ExoPlaybackPlayer(
             activeAudioSource = null
             activeVideoSource = null
             currentResource = null
-            updateOffloadPreferences(exo)
             currentInstance = 0L
             eofInstance = 0L
             liveSessionStartElapsedRealtimeMs = 0L
@@ -3443,6 +3486,7 @@ class ExoPlaybackPlayer(
             isFadingOutForRequest = true
             pendingRequestFadeStop = {
                 stopForPlaybackRequest(exo, resumePlayback)
+                updateOffloadPreferences(exo)
                 sabrPlaybackCache.release(oldAudio)
                 oldAudio?.closePlaybackSource()
                 oldVideo?.closePlaybackSource()
@@ -3456,7 +3500,7 @@ class ExoPlaybackPlayer(
                         val elapsed = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)
                         val t = (elapsed.toFloat() / SMOOTH_SWITCH_FADEOUT_MS.toFloat()).coerceIn(0f, 1f)
                         smoothFadeGain = (startGain * (1f - t)).coerceIn(0f, 1f)
-                        applyPlaybackGains()
+                        applyOutputVolumesOnly()
                         if (t >= 1f) break
                         delay(SMOOTH_FADE_STEP_MS.milliseconds)
                     }
@@ -4033,7 +4077,6 @@ internal fun playbackIntentForPreparation(
     preserveCurrentIntent: Boolean,
     playWhenReadyProvider: (() -> Boolean)? = null,
 ): () -> Boolean {
-    // Queue requests establish intent before discovery; only standalone cold loads initialize it here.
     if (!preserveCurrentIntent) player.playWhenReady = playWhenReadyProvider?.invoke() ?: resumePlayback
     return playWhenReadyProvider ?: { player.playWhenReady }
 }
@@ -4073,7 +4116,6 @@ internal suspend fun awaitPlayerReady(
         player.stop()
         throw cancelled
     } finally {
-        // Stay on the caller's player dispatcher; cancellation handlers run on the cancelling thread.
         player.removeListener(listener)
     }
 }
@@ -4206,7 +4248,6 @@ internal class PlaybackLoadErrorHandlingPolicy(
 
     override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long =
         if (keepBufferDuringNetworkRecovery && PlaybackNetworkRecovery.handles(loadErrorInfo.exception.media3PlaybackFailureCategory())) {
-            // Active playback owns the bounded reconnect wait; keep Media3's buffered samples meanwhile.
             (loadErrorInfo.errorCount * 1_000L).coerceAtMost(10_000L)
         } else if (shouldRetryPlaybackLoad(loadErrorInfo.exception, loadErrorInfo.errorCount)) {
             super.getRetryDelayMsFor(loadErrorInfo)
@@ -4232,7 +4273,6 @@ internal fun buildStreamingMediaSource(
     val type = Util.inferContentTypeForUriAndMimeType(checkNotNull(item.localConfiguration).uri, mimeType)
     val factory =
         if (type == C.CONTENT_TYPE_OTHER) {
-            // The default 1 MiB check interval can parse a minute of audio before applying backpressure.
             ProgressiveMediaSource
                 .Factory(dataSourceFactory)
                 .setContinueLoadingCheckIntervalBytes(65_536)
@@ -4535,7 +4575,6 @@ internal fun shouldCompleteStuckPlayback(
 internal fun Throwable.media3PlaybackFailureCategory(): PlaybackFailureCategory =
     findSabrProtocolException()?.kind?.let(::playbackFailureCategoryFromSabr)
         ?: findMedia3HttpStatusCode()?.let(PlaybackFailureClassifier::fromHttpStatus)
-        // Media3 wraps stuck playback in ERROR_CODE_TIMEOUT, outside its source-error range.
         ?: stuckPlayerCause()?.let {
             when (it.stuckType) {
                 StuckPlayerException.STUCK_BUFFERING_NOT_LOADING,
