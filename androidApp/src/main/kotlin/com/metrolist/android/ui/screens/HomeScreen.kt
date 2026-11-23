@@ -23,7 +23,6 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -59,7 +58,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -163,6 +161,7 @@ fun HomeScreen(
             .distinctUntilChanged()
     }.collectAsStateWithLifecycle(initialValue = emptySet())
 
+    val customCacheStats by CustomMediaCacheManager.stats.collectAsState()
     val snapshot by CustomCatalogProvider.homeSnapshot.collectAsState()
     val isLoadingShelves = CustomHomeShelvesBridge.isLoading
 
@@ -177,7 +176,6 @@ fun HomeScreen(
     val deezerSongs = remember(snapshot.deezerChart) { snapshot.deezerChart.map { it.toSongItem() } }
     val radarSongs = remember(snapshot.releaseRadar) { snapshot.releaseRadar.map { it.toSongItem() } }
 
-    // Автоматически переключаемся на первый непустой чарт, если текущий пуст
     LaunchedEffect(yandexSongs.size, vkSongs.size, deezerSongs.size) {
         val currentEmpty =
             when (selectedChart) {
@@ -204,7 +202,7 @@ fun HomeScreen(
         }
 
     val offlineCachedSongs =
-        remember(isOffline, cachedSongIds.size) {
+        remember(isOffline, customCacheStats.waveCacheCount, customCacheStats.likedDownloadsCount) {
             if (isOffline) CustomMediaCacheManager.getOfflineCachedSongs(limit = 24) else emptyList()
         }
 
@@ -318,7 +316,6 @@ fun HomeScreen(
                         .focusGroup()
                         .focusRestorer(),
             ) {
-                // Офлайн-подборка из локального 4 ГБ кэша (показывается, когда нет сети)
                 if (isOffline && offlineCachedSongs.isNotEmpty()) {
                     item(key = "home_offline_cached") {
                         HomeOfflineCacheSection(
@@ -330,12 +327,12 @@ fun HomeScreen(
                     }
                 }
 
-                // 1. Единый блок «Чарты» с чипами Яндекс / VK / Deezer
                 item(key = "home_unified_charts") {
                     HomeChartsSection(
                         selectedTab = selectedChart,
                         onSelectTab = { selectedChart = it },
                         songs = activeChartSongs,
+                        isOffline = isOffline,
                         isLoading = isLoadingShelves && activeChartSongs.isEmpty(),
                         currentSongId = currentSong?.id,
                         isSongPlayable = isSongPlayable,
@@ -350,7 +347,6 @@ fun HomeScreen(
                     )
                 }
 
-                // 2. Блок «Радар новинок» (свежие релизы любимых артистов)
                 if (radarSongs.isNotEmpty() || isLoadingShelves) {
                     item(key = "home_release_radar") {
                         HomeReleaseRadarSection(
@@ -428,6 +424,7 @@ private fun HomeChartsSection(
     selectedTab: HomeChartTab,
     onSelectTab: (HomeChartTab) -> Unit,
     songs: List<SongItem>,
+    isOffline: Boolean,
     isLoading: Boolean,
     currentSongId: String?,
     isSongPlayable: (SongItem) -> Boolean,
@@ -507,16 +504,18 @@ private fun HomeChartsSection(
                     ) {
                         Text(
                             text =
-                                if (selectedTab == HomeChartTab.VK) {
-                                    "Войди в ВК в настройках волны, чтобы видеть чарт VK"
-                                } else {
-                                    "Чарт пока не загружен"
+                                when {
+                                    isOffline -> "Нет сети — чарт обновится при подключении"
+                                    selectedTab == HomeChartTab.VK -> "Войди в ВК в настройках волны, чтобы видеть чарт VK"
+                                    else -> "Чарт пока не загружен"
                                 },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        TextButton(onClick = onRetry) {
-                            Text("Обновить")
+                        if (!isOffline) {
+                            TextButton(onClick = onRetry) {
+                                Text("Обновить")
+                            }
                         }
                     }
                 }
