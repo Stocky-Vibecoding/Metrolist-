@@ -44,12 +44,16 @@ data class ExternalCatalogTrack(
 ) {
     fun toSongItem(): SongItem {
         val parsedArtists =
-            artist
-                .split(",", "&")
-                .map { it.trim() }
-                .filter { it.isNotBlank() }
+            CustomConfigStore
+                .splitArtistNames(artist)
                 .map { ArtistTiny(id = null, name = it) }
-                .ifEmpty { listOf(ArtistTiny(id = null, name = "Неизвестный")) }
+                .ifEmpty {
+                    artist
+                        .trim()
+                        .takeIf { it.isNotBlank() }
+                        ?.let { listOf(ArtistTiny(id = null, name = it)) }
+                        ?: listOf(ArtistTiny(id = null, name = "Неизвестный"))
+                }
         val safeId =
             externalId.ifBlank {
                 "${source}_${TrackMatcher.normalize(artist)}_${TrackMatcher.normalize(title)}".take(64)
@@ -202,16 +206,16 @@ class CustomCatalogProvider(
                     put("Accept-Language", "ru")
                     if (token.isNotBlank()) put("Authorization", "OAuth $token")
                 }
-            runCatching<List<SongItem>> {
+            try {
                 val url = "${yandexApiBase()}/search?text=${CustomHttp.urlEncode(clean)}&type=track&page=0"
                 val resp = CustomHttp.get(url, headers = headers, timeoutMs = 8_000)
-                if (!resp.isSuccess) return@runCatching emptyList<SongItem>()
+                if (!resp.isSuccess) return@withContext emptyList()
                 val arr =
                     JSONObject(resp.body)
                         .optJSONObject("result")
                         ?.optJSONObject("tracks")
                         ?.optJSONArray("results")
-                        ?: return@runCatching emptyList<SongItem>()
+                        ?: return@withContext emptyList()
 
                 buildList {
                     for (i in 0 until minOf(arr.length(), limit)) {
@@ -219,7 +223,11 @@ class CustomCatalogProvider(
                         parseYandexTrack(obj)?.toSongItem()?.let(::add)
                     }
                 }.distinctBy { it.id }
-            }.getOrDefault(emptyList())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
 
     suspend fun searchVkTracks(
@@ -243,22 +251,38 @@ class CustomCatalogProvider(
 
             for (url in urls) {
                 val found =
-                    runCatching<List<SongItem>?> {
+                    try {
                         val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to KATE_UA), timeoutMs = 8_000)
-                        if (!resp.isSuccess) return@runCatching null
-                        val root = JSONObject(resp.body)
-                        if (root.has("error")) {
-                            val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
-                            if (code == 9) {
-                                vkSearchFloodUntilMs = System.currentTimeMillis() + 3 * 60 * 1_000L
-                                return@runCatching emptyList<SongItem>()
+                        if (!resp.isSuccess) {
+                            null
+                        } else {
+                            val root = JSONObject(resp.body)
+                            if (root.has("error")) {
+                                val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
+                                if (code == 9) {
+                                    vkSearchFloodUntilMs = System.currentTimeMillis() + 3 * 60 * 1_000L
+                                    emptyList()
+                                } else {
+                                    null
+                                }
+                            } else {
+                                val respObj = root.optJSONObject("response")
+                                if (respObj == null) {
+                                    emptyList()
+                                } else {
+                                    val arr = respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
+                                    parseVkAudioArray(arr, rejectUnavailableUrl = true)
+                                        .take(limit)
+                                        .map { it.toSongItem() }
+                                        .distinctBy { it.id }
+                                }
                             }
-                            return@runCatching null
                         }
-                        val respObj = root.optJSONObject("response") ?: return@runCatching emptyList<SongItem>()
-                        val arr = respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
-                        parseVkAudioArray(arr).take(limit).map { it.toSongItem() }.distinctBy { it.id }
-                    }.getOrNull()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
 
                 if (found != null) return@withContext found
             }
@@ -269,7 +293,7 @@ class CustomCatalogProvider(
         syncToLibraryLimit: Int,
         onProgress: (LibraryImportProgress) -> Unit,
     ): Result<LibraryImportSummary> =
-        runCatching {
+        try {
             val token = sanitizeYandexToken(configStore.current.yandexToken)
             require(token.isNotBlank()) { "Сначала войди в Яндекс.Музыку или укажи токен" }
 
@@ -279,19 +303,25 @@ class CustomCatalogProvider(
             }
             check(tracks.isNotEmpty()) { "В Яндекс.Музыке не найдено лайкнутых треков" }
 
-            syncFetchedTracks(
-                sourceLabel = "Я.Музыка",
-                tracks = tracks,
-                syncToLibraryLimit = syncToLibraryLimit,
-                onProgress = onProgress,
+            Result.success(
+                syncFetchedTracks(
+                    sourceLabel = "Я.Музыка",
+                    tracks = tracks,
+                    syncToLibraryLimit = syncToLibraryLimit,
+                    onProgress = onProgress,
+                ),
             )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
         }
 
     suspend fun importVkAudios(
         syncToLibraryLimit: Int,
         onProgress: (LibraryImportProgress) -> Unit,
     ): Result<LibraryImportSummary> =
-        runCatching {
+        try {
             val token = sanitizeVkToken(configStore.current.vkToken)
             require(token.isNotBlank()) { "Сначала войди в ВК или укажи токен" }
 
@@ -302,12 +332,18 @@ class CustomCatalogProvider(
             }
             check(tracks.isNotEmpty()) { "В ВК не найдено аудиозаписей (или доступ закрыт)" }
 
-            syncFetchedTracks(
-                sourceLabel = "VK",
-                tracks = tracks,
-                syncToLibraryLimit = syncToLibraryLimit,
-                onProgress = onProgress,
+            Result.success(
+                syncFetchedTracks(
+                    sourceLabel = "VK",
+                    tracks = tracks,
+                    syncToLibraryLimit = syncToLibraryLimit,
+                    onProgress = onProgress,
+                ),
             )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
         }
 
     /** Ручной импорт лайков из YouTube Music (подключается через `externalYouTubeLikesFetcher`). */
@@ -315,26 +351,32 @@ class CustomCatalogProvider(
         syncToLibraryLimit: Int,
         onProgress: (LibraryImportProgress) -> Unit,
     ): Result<LibraryImportSummary> =
-        runCatching {
+        try {
             val fetcher =
                 externalYouTubeLikesFetcher
-                    ?: error("Сначала подключи аккаунт YouTube Music в профиле")
+                    ?: error("Сначала подключи аккаунт YouTube Music в настройках")
 
             onProgress(LibraryImportProgress("Загружаю лайки из YouTube Music…"))
             val tracks = fetcher()
             check(tracks.isNotEmpty()) { "В YouTube Music не найдено лайкнутых треков (или нет входа в аккаунт)" }
 
-            syncFetchedTracks(
-                sourceLabel = "YouTube",
-                tracks = tracks,
-                syncToLibraryLimit = syncToLibraryLimit,
-                onProgress = onProgress,
+            Result.success(
+                syncFetchedTracks(
+                    sourceLabel = "YouTube",
+                    tracks = tracks,
+                    syncToLibraryLimit = syncToLibraryLimit,
+                    onProgress = onProgress,
+                ),
             )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
         }
 
     /**
-     * Фоновый скан вкуса: тихо считывает лайки из Я.Музыки, ВК и YouTube
-     * исключительно в `externalTasteProfile` для вычисления жанров и артистов «Волны».
+     * Одноразовый стартовый скан вкуса: тихо считывает лайки из Я.Музыки, ВК и YouTube
+     * исключительно в `externalTasteProfile` как начальную базу жанров и артистов для «Волны».
      * В локальную Библиотеку («Мне нравится») ничего само не добавляется.
      */
     suspend fun scanExternalTasteProfile(): Int =
@@ -347,13 +389,17 @@ class CustomCatalogProvider(
                     if (yandexToken.isBlank()) {
                         emptyList()
                     } else {
-                        runCatching {
+                        try {
                             fetchAllYandexLikedTracks(
                                 token = yandexToken,
                                 maxTracksCap = BACKGROUND_SCAN_CAP,
                                 onBatchFetched = {},
                             )
-                        }.getOrDefault(emptyList())
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
                     }
                 }
 
@@ -362,20 +408,30 @@ class CustomCatalogProvider(
                     if (vkToken.isBlank()) {
                         emptyList()
                     } else {
-                        runCatching {
+                        try {
                             fetchAllVkAudioTracks(
                                 token = vkToken,
                                 maxTracksCap = BACKGROUND_SCAN_CAP,
                                 onPageFetched = { _, _ -> },
                             )
-                        }.getOrDefault(emptyList())
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
                     }
                 }
 
             val ytTask =
                 async(Dispatchers.IO) {
                     val fetcher = externalYouTubeLikesFetcher ?: return@async emptyList()
-                    runCatching { fetcher().take(BACKGROUND_SCAN_CAP) }.getOrDefault(emptyList())
+                    try {
+                        fetcher().take(BACKGROUND_SCAN_CAP)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
                 }
 
             val combined = ymTask.await() + vkTask.await() + ytTask.await()
@@ -404,15 +460,15 @@ class CustomCatalogProvider(
                     put("Accept-Language", "ru")
                     if (token.isNotBlank()) put("Authorization", "OAuth $token")
                 }
-            runCatching {
+            try {
                 val resp = CustomHttp.get("${yandexApiBase()}/landing3/chart", headers = headers, timeoutMs = 10_000)
-                if (!resp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
+                if (!resp.isSuccess) return@withContext emptyList()
                 val chartTracks =
                     JSONObject(resp.body)
                         .optJSONObject("result")
                         ?.optJSONObject("chart")
                         ?.optJSONArray("tracks")
-                        ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                        ?: return@withContext emptyList()
 
                 buildList {
                     for (i in 0 until minOf(chartTracks.length(), limit)) {
@@ -420,7 +476,11 @@ class CustomCatalogProvider(
                         parseYandexTrack(trackObj)?.let(::add)
                     }
                 }
-            }.getOrDefault(emptyList())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
 
     suspend fun fetchYandexNewReleases(limit: Int = 20): List<ExternalCatalogTrack> =
@@ -432,14 +492,14 @@ class CustomCatalogProvider(
                     put("Accept-Language", "ru")
                     if (token.isNotBlank()) put("Authorization", "OAuth $token")
                 }
-            runCatching {
+            try {
                 val resp = CustomHttp.get("${yandexApiBase()}/landing3/new-releases", headers = headers, timeoutMs = 10_000)
-                if (!resp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
+                if (!resp.isSuccess) return@withContext emptyList()
                 val albumIdsArr =
                     JSONObject(resp.body)
                         .optJSONObject("result")
                         ?.optJSONArray("newReleases")
-                        ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                        ?: return@withContext emptyList()
 
                 val albumIds =
                     buildList {
@@ -448,16 +508,16 @@ class CustomCatalogProvider(
                             if (id.isNotBlank()) add(id)
                         }
                     }
-                if (albumIds.isEmpty()) return@runCatching emptyList<ExternalCatalogTrack>()
+                if (albumIds.isEmpty()) return@withContext emptyList()
 
                 val albumsBody =
                     postForm(
                         url = "${yandexApiBase()}/albums",
                         formBody = "album-ids=${CustomHttp.urlEncode(albumIds.joinToString(","))}",
                         headers = headers,
-                    ) ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                    ) ?: return@withContext emptyList()
 
-                val albumsArr = JSONObject(albumsBody).optJSONArray("result") ?: return@runCatching emptyList<ExternalCatalogTrack>()
+                val albumsArr = JSONObject(albumsBody).optJSONArray("result") ?: return@withContext emptyList()
                 buildList {
                     for (i in 0 until albumsArr.length()) {
                         val obj = albumsArr.optJSONObject(i) ?: continue
@@ -479,7 +539,11 @@ class CustomCatalogProvider(
                         )
                     }
                 }
-            }.getOrDefault(emptyList())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
 
     suspend fun fetchVkPopular(limit: Int = 25): List<ExternalCatalogTrack> =
@@ -500,18 +564,28 @@ class CustomCatalogProvider(
 
             for ((url, ua) in attempts) {
                 val found =
-                    runCatching<List<ExternalCatalogTrack>> {
+                    try {
                         val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to ua), timeoutMs = 10_000)
-                        if (!resp.isSuccess) return@runCatching emptyList<ExternalCatalogTrack>()
-                        val root = JSONObject(resp.body)
-                        if (root.has("error")) return@runCatching emptyList<ExternalCatalogTrack>()
-                        val respObj = root.optJSONObject("response")
-                        val arr =
-                            respObj?.optJSONArray("items")
-                                ?: respObj?.optJSONArray("audios")
-                                ?: root.optJSONArray("response")
-                        parseVkAudioArray(arr).take(safeLimit)
-                    }.getOrDefault(emptyList())
+                        if (!resp.isSuccess) {
+                            emptyList()
+                        } else {
+                            val root = JSONObject(resp.body)
+                            if (root.has("error")) {
+                                emptyList()
+                            } else {
+                                val respObj = root.optJSONObject("response")
+                                val arr =
+                                    respObj?.optJSONArray("items")
+                                        ?: respObj?.optJSONArray("audios")
+                                        ?: root.optJSONArray("response")
+                                parseVkAudioArray(arr, rejectUnavailableUrl = true).take(safeLimit)
+                            }
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
 
                 if (found.isNotEmpty()) {
                     return@withContext found
@@ -535,7 +609,6 @@ class CustomCatalogProvider(
                     thumbnail = item.coverUrl,
                 )
             }
-        // Сразу обогащаем и память вкуса, и бэкап лайков
         configStore.mergeExternalTasteProfile(backupEntries)
         val savedTotal = configStore.mergeImportedLikes(backupEntries)
 
@@ -572,7 +645,6 @@ class CustomCatalogProvider(
                                     matchExternalToSongItem(ext) ?: ext.toSongItem()
                                 }
 
-                            // Сохраняем прямую привязку на диск для быстрого воспроизведения
                             TrackBindingCache.put(song.id, ext.artist, ext.title) { prev ->
                                 prev.copy(
                                     yandexId = if (ext.source == "yandex") ext.externalId.removePrefix("ym_") else prev.yandexId,
@@ -789,9 +861,9 @@ class CustomCatalogProvider(
                     val respObj = root.optJSONObject("response")
                     if (respObj != null) {
                         if (totalCount < 0) totalCount = respObj.optInt("count", -1)
-                        pageItems = parseVkAudioArray(respObj.optJSONArray("items"))
+                        pageItems = parseVkAudioArray(respObj.optJSONArray("items"), rejectUnavailableUrl = false)
                     } else {
-                        pageItems = parseVkAudioArray(root.optJSONArray("response"))
+                        pageItems = parseVkAudioArray(root.optJSONArray("response"), rejectUnavailableUrl = false)
                     }
                     break
                 }
@@ -855,11 +927,18 @@ class CustomCatalogProvider(
         return normalized.replace("%%", "600x600")
     }
 
-    private fun parseVkAudioArray(items: JSONArray?): List<ExternalCatalogTrack> {
+    private fun parseVkAudioArray(
+        items: JSONArray?,
+        rejectUnavailableUrl: Boolean = false,
+    ): List<ExternalCatalogTrack> {
         if (items == null) return emptyList()
         return buildList {
             for (i in 0 until items.length()) {
                 val obj = items.optJSONObject(i) ?: continue
+                if (rejectUnavailableUrl) {
+                    val streamUrl = obj.optString("url").trim()
+                    if (streamUrl.contains("audio_api_unavailable", ignoreCase = true)) continue
+                }
                 val artist = obj.optString("artist").trim()
                 val title = obj.optString("title").trim()
                 if (title.isBlank()) continue
@@ -924,7 +1003,7 @@ class CustomCatalogProvider(
     private fun sanitizeVkToken(raw: String): String {
         val trimmed = raw.trim()
         return if (trimmed.contains("access_token=")) {
-            trimmed.substringAfter("access_token=").substringBefore("&").trim()
+            trimmed.substringAfter("access_token=").substringBefore("&").substringBefore("#").trim()
         } else {
             trimmed
         }
@@ -938,7 +1017,6 @@ class CustomCatalogProvider(
         private const val VK_ANDROID_UA =
             "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)"
         private const val HOME_SHELVES_TTL_MS = 3L * 60 * 60 * 1_000L
-        private const val TASTE_SCAN_TTL_MS = 7L * 24 * 60 * 60 * 1_000L
         private const val BACKGROUND_SCAN_CAP = 200
         private const val HOME_CACHE_FILE_NAME = "custom_home_snapshot_v1.json"
 
@@ -948,7 +1026,7 @@ class CustomCatalogProvider(
         private val _homeSnapshot = MutableStateFlow(HomeCatalogSnapshot())
         val homeSnapshot: StateFlow<HomeCatalogSnapshot> = _homeSnapshot.asStateFlow()
 
-        /** Подключается на Этапе 2 к аккаунту YTM для скана и ручного импорта лайков YouTube. */
+        /** Подключается к аккаунту YTM для скана и ручного импорта лайков YouTube. */
         @Volatile
         var externalYouTubeLikesFetcher: (suspend () -> List<ExternalCatalogTrack>)? = null
 
@@ -983,30 +1061,37 @@ class CustomCatalogProvider(
                     _homeSnapshot.value = restored
                     lastLoadedAtMs = restored.updatedAtMs
                     val shelves = buildHomeShelvesFromSnapshot(restored)
-                    if (shelves.isNotEmpty() && CustomHomeShelvesBridge.shelves.isEmpty()) {
+                    if (shelves.isNotEmpty()) {
                         withContext(Dispatchers.Main) {
-                            CustomHomeShelvesBridge.shelves = shelves
+                            if (CustomHomeShelvesBridge.shelves.isEmpty()) {
+                                CustomHomeShelvesBridge.shelves = shelves
+                            }
                         }
                     }
                 }
             }
         }
 
+        /**
+         * Одноразовый первичный скан вкуса: запускается в фоне только если стартовый профиль вкуса пустой
+         * (или принудительно при `force = true` после нового входа). Каждые 7 дней больше не дёргает.
+         */
         fun triggerBackgroundTasteScan(
             configStore: CustomConfigStore,
             force: Boolean = false,
         ) {
             val cfg = configStore.current
             if (cfg.yandexToken.isBlank() && cfg.vkToken.isBlank() && externalYouTubeLikesFetcher == null) return
-            val now = System.currentTimeMillis()
-            val stale = cfg.externalTasteProfile.isEmpty() || (now - cfg.lastTasteScanMs) > TASTE_SCAN_TTL_MS
-            if (!force && !stale) return
+            val needsInitialScan = cfg.externalTasteProfile.isEmpty()
+            if (!force && !needsInitialScan) return
             if (isTasteScanning) return
 
             isTasteScanning = true
             homeScope.launch {
                 try {
                     CustomCatalogProvider(configStore).scanExternalTasteProfile()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (err: Exception) {
                     Log.w(TAG, "Background taste scan skipped: ${err.message}")
                 } finally {
@@ -1018,20 +1103,21 @@ class CustomCatalogProvider(
         fun bindHomeShelvesBridge(configStore: CustomConfigStore) {
             val provider = CustomCatalogProvider(configStore)
 
-            // Автоматический фоновый скан вкуса при старте (без добавления в Библиотеку)
             triggerBackgroundTasteScan(configStore, force = false)
 
             CustomHomeShelvesBridge.onRefreshRequested = { force ->
                 val cached = _homeSnapshot.value
-                if (CustomHomeShelvesBridge.shelves.isEmpty() && cached.isNotEmpty) {
-                    CustomHomeShelvesBridge.shelves = buildHomeShelvesFromSnapshot(cached)
-                }
                 val now = System.currentTimeMillis()
-                val stale = CustomHomeShelvesBridge.shelves.isEmpty() || now - lastLoadedAtMs > HOME_SHELVES_TTL_MS
+                val stale = !cached.isNotEmpty || now - lastLoadedAtMs > HOME_SHELVES_TTL_MS
                 if ((force || stale) && !isHomeLoading) {
                     isHomeLoading = true
-                    CustomHomeShelvesBridge.isLoading = true
                     homeScope.launch {
+                        withContext(Dispatchers.Main) {
+                            if (CustomHomeShelvesBridge.shelves.isEmpty() && cached.isNotEmpty) {
+                                CustomHomeShelvesBridge.shelves = buildHomeShelvesFromSnapshot(cached)
+                            }
+                            CustomHomeShelvesBridge.isLoading = true
+                        }
                         try {
                             val loaded = provider.loadHomeShelves()
                             if (loaded.isNotEmpty()) {
@@ -1040,6 +1126,8 @@ class CustomCatalogProvider(
                                 }
                                 lastLoadedAtMs = System.currentTimeMillis()
                             }
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (err: Exception) {
                             Log.w(TAG, "Failed to load home shelves: ${err.message}")
                         } finally {
@@ -1054,15 +1142,20 @@ class CustomCatalogProvider(
 
             CustomSearchBridge.onSearchRequested = { rawQuery ->
                 val clean = rawQuery.trim()
-                if (clean.isNotBlank() && !clean.equals(lastSearchedQuery, ignoreCase = true)) {
+                val alreadyHasResults =
+                    clean.equals(lastSearchedQuery, ignoreCase = true) &&
+                        (CustomSearchBridge.isLoading || CustomSearchBridge.yandexSongs.isNotEmpty() || CustomSearchBridge.vkSongs.isNotEmpty())
+                if (clean.isNotBlank() && !alreadyHasResults) {
                     lastSearchedQuery = clean
                     searchJob?.cancel()
-                    CustomSearchBridge.query = clean
-                    CustomSearchBridge.yandexSongs = emptyList()
-                    CustomSearchBridge.vkSongs = emptyList()
-                    CustomSearchBridge.isLoading = true
                     searchJob =
                         homeScope.launch {
+                            withContext(Dispatchers.Main) {
+                                CustomSearchBridge.query = clean
+                                CustomSearchBridge.yandexSongs = emptyList()
+                                CustomSearchBridge.vkSongs = emptyList()
+                                CustomSearchBridge.isLoading = true
+                            }
                             try {
                                 val (ymList, vkList) =
                                     coroutineScope {
