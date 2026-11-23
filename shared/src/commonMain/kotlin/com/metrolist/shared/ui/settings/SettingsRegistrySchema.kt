@@ -29,6 +29,7 @@ enum class SettingsPlatform {
 }
 
 enum class SettingsPageId {
+    CUSTOM_ENGINE,
     APPEARANCE,
     APPEARANCE_NAVIGATION,
     PLAYER,
