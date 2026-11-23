@@ -8,6 +8,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
 data class ResolvedCustomStream(
@@ -48,6 +49,7 @@ class YandexMusicProvider(
     private val configStore: CustomConfigStore,
 ) {
     private val statusCheckMutex = Mutex()
+    private val releaseInfoCache = ConcurrentHashMap<String, Pair<Int?, Long?>>()
 
     suspend fun checkPlusStatus(
         token: String = configStore.current.yandexToken,
@@ -215,6 +217,12 @@ class YandexMusicProvider(
             return null
         }
 
+        val cacheKey = "${cleanArtist.lowercase()}::${cleanTitle.lowercase()}"
+        if (best.releaseYear != null || best.releaseDateMs != null) {
+            if (releaseInfoCache.size > 1_000) releaseInfoCache.clear()
+            releaseInfoCache[cacheKey] = best.releaseYear to best.releaseDateMs
+        }
+
         return ExternalCatalogTrack(
             source = "yandex",
             externalId = "ym_${best.id}",
@@ -226,6 +234,51 @@ class YandexMusicProvider(
             releaseYear = best.releaseYear,
             releaseDateMs = best.releaseDateMs,
         )
+    }
+
+    /**
+     * Быстрая кросс-проверка года и даты выхода трека через каталог Я.Музыки
+     * (используется для проверки свежести треков из VK/YTM, не требует подписки Плюс и не отбрасывает цензурные треки).
+     */
+    suspend fun lookupTrackReleaseInfo(
+        artist: String,
+        title: String,
+    ): Pair<Int?, Long?> {
+        val cleanArtist = TrackMatcher.cleanSearchTerm(artist)
+        val cleanTitle = TrackMatcher.cleanSearchTerm(title)
+        if (cleanTitle.isBlank()) return null to null
+
+        val cacheKey = "${cleanArtist.lowercase()}::${cleanTitle.lowercase()}"
+        releaseInfoCache[cacheKey]?.let { return it }
+
+        val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
+        if (query.isBlank()) return null to null
+
+        val token = sanitizeToken(configStore.current.yandexToken)
+        val candidates = searchTracks(token, query, timeoutMs = 2_500)
+        if (candidates.isEmpty()) return null to null
+
+        val best =
+            candidates
+                .filter { !TrackMatcher.hasForbiddenStopWord(cleanTitle, it.title) }
+                .mapNotNull { cand ->
+                    val score =
+                        TrackMatcher.matchScore(
+                            targetArtist = cleanArtist,
+                            targetTitle = cleanTitle,
+                            targetDurationSec = null,
+                            candidateArtist = cand.artist,
+                            candidateTitle = cand.title,
+                            candidateDurationSec = cand.durationSec,
+                        )
+                    if (score >= 58) cand to score else null
+                }.maxByOrNull { it.second }
+                ?.first
+
+        val result = (best?.releaseYear to best?.releaseDateMs)
+        if (releaseInfoCache.size > 1_000) releaseInfoCache.clear()
+        releaseInfoCache[cacheKey] = result
+        return result
     }
 
     private suspend fun ensurePlusActive(token: String): Boolean {
@@ -243,6 +296,7 @@ class YandexMusicProvider(
     private suspend fun searchTracks(
         token: String,
         query: String,
+        timeoutMs: Int = 4_500,
     ): List<YandexTrackCandidate> =
         try {
             val url = "$API_BASE/search?type=track&text=${CustomHttp.urlEncode(query)}&page=0&nocorrect=false"
@@ -252,7 +306,7 @@ class YandexMusicProvider(
                 } else {
                     mapOf("User-Agent" to CLIENT_USER_AGENT, "Accept-Language" to "ru")
                 }
-            val response = CustomHttp.get(url, headers = headers, timeoutMs = 4_500)
+            val response = CustomHttp.get(url, headers = headers, timeoutMs = timeoutMs)
             if (token.isNotBlank() && (response.code == 401 || response.code == 403)) {
                 configStore.setYandexPlusStatus(YandexPlusStatus.INVALID_TOKEN)
                 emptyList()
@@ -328,20 +382,43 @@ class YandexMusicProvider(
             emptyList()
         }
 
+    /**
+     * Выбирает самую раннюю дату выхода трека среди альбомов (игнорируя сборники `compilation`, если есть оригинальный релиз).
+     */
     private fun parseAlbumRelease(albums: JSONArray?): Pair<Int?, Long?> {
-        val firstAlb = albums?.optJSONObject(0) ?: return null to null
-        val rawDate = firstAlb.optString("releaseDate").trim()
-        val yearFromField = firstAlb.optInt("year", 0).takeIf { it in 1900..2100 }
-        val yearFromDate = rawDate.takeIf { it.length >= 4 }?.take(4)?.toIntOrNull()?.takeIf { it in 1900..2100 }
-        val ms =
-            if (rawDate.length >= 10) {
-                runCatching {
-                    SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(rawDate.take(10))?.time
-                }.getOrNull()
-            } else {
-                null
+        if (albums == null || albums.length() == 0) return null to null
+        val nonCompilations = mutableListOf<Pair<Int?, Long?>>()
+        val allParsed = mutableListOf<Pair<Int?, Long?>>()
+        for (i in 0 until albums.length()) {
+            val alb = albums.optJSONObject(i) ?: continue
+            val rawDate = alb.optString("releaseDate").trim()
+            val yearFromField = alb.optInt("year", 0).takeIf { it in 1900..2100 }
+            val yearFromDate = rawDate.takeIf { it.length >= 4 }?.take(4)?.toIntOrNull()?.takeIf { it in 1900..2100 }
+            val year = yearFromField ?: yearFromDate
+            val ms =
+                if (rawDate.length >= 10) {
+                    runCatching {
+                        SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(rawDate.take(10))?.time
+                    }.getOrNull()
+                } else {
+                    null
+                }
+            if (year == null && ms == null) continue
+            val pair = year to ms
+            allParsed.add(pair)
+            val type = alb.optString("type").trim()
+            if (!type.equals("compilation", ignoreCase = true)) {
+                nonCompilations.add(pair)
             }
-        return (yearFromField ?: yearFromDate) to ms
+        }
+        val pool = nonCompilations.ifEmpty { allParsed }
+        if (pool.isEmpty()) return null to null
+        return pool.minWithOrNull(
+            compareBy<Pair<Int?, Long?>>(
+                { it.first ?: Int.MAX_VALUE },
+                { it.second ?: Long.MAX_VALUE },
+            ),
+        ) ?: pool.first()
     }
 
     private fun pickBestMatch(
