@@ -525,7 +525,6 @@ private fun ServiceOAuthWebViewDialog(
                                         val u = request?.url?.toString() ?: return false
                                         if (checkUrl(u)) return true
                                         val scheme = request.url?.scheme?.lowercase().orEmpty()
-                                        // Не даём ВК перекинуть авторизацию в стороннее приложение через vk:// или intent://
                                         if (scheme != "http" && scheme != "https") {
                                             return true
                                         }
@@ -670,12 +669,11 @@ fun WaveHomeScreen(
     var mascotPhrase by remember { mutableStateOf<String?>(null) }
     var lastPhraseSongId by remember { mutableStateOf<String?>(null) }
     var showWaveSettingsSheet by remember { mutableStateOf(false) }
-    var showEngineSettingsSheet by remember { mutableStateOf(false) }
     var showSourcePickerSheet by remember { mutableStateOf(false) }
 
     // Паузим видео-маскот, когда экран скрыт (другая вкладка, открытый плеер или шторки)
     val isMascotVideoActive =
-        isScreenActive && !showWaveSettingsSheet && !showEngineSettingsSheet && !showSourcePickerSheet
+        isScreenActive && !showWaveSettingsSheet && !showSourcePickerSheet
 
     LaunchedEffect(currentSong?.id) {
         val song = currentSong
@@ -789,33 +787,20 @@ fun WaveHomeScreen(
 
         Column(modifier = Modifier.fillMaxSize()) {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = "Моя волна",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
-                    if (!qualityBadge.isNullOrBlank()) {
-                        NativeSourceBadge(
-                            label = qualityBadge,
-                            onClick = { if (currentSong != null) showSourcePickerSheet = true },
-                        )
-                    }
-                }
-
-                IconButton(onClick = { showEngineSettingsSheet = true }) {
-                    Icon(
-                        imageVector = MetrolistIcons.Outlined.Settings,
-                        contentDescription = "Настройки движка",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                Text(
+                    text = "Моя волна",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                if (!qualityBadge.isNullOrBlank()) {
+                    NativeSourceBadge(
+                        label = qualityBadge,
+                        onClick = { if (currentSong != null) showSourcePickerSheet = true },
                     )
                 }
             }
@@ -1036,25 +1021,6 @@ fun WaveHomeScreen(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
             }
-        }
-    }
-
-    if (showEngineSettingsSheet) {
-        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-        ModalBottomSheet(
-            onDismissRequest = { showEngineSettingsSheet = false },
-            sheetState = sheetState,
-        ) {
-            CustomEngineSettingsContent(
-                configStore = configStore,
-                yandexProvider = yandexProvider,
-                vkProvider = vkProvider,
-                geminiClient = geminiClient,
-                onRefreshWave = {
-                    showEngineSettingsSheet = false
-                    launchFreshWave()
-                },
-            )
         }
     }
 }
@@ -2099,7 +2065,10 @@ private fun WaveFilterSheetContent(
                 onClick = onRefreshWave,
                 modifier = Modifier.weight(1f).height(48.dp),
             ) {
-                Text("Обновить волну", fontWeight = FontWeight.SemiBold)
+                Text(
+                    text = if (hasCustomFilters) "Применить" else "Обновить волну",
+                    fontWeight = FontWeight.SemiBold,
+                )
             }
         }
 
@@ -2122,6 +2091,12 @@ fun CustomEngineSettingsContent(
     yandexProvider: YandexMusicProvider,
     vkProvider: VkMusicProvider,
     geminiClient: GeminiClient,
+    isYouTubeLoggedIn: Boolean = false,
+    isLastFmLoggedIn: Boolean = false,
+    onOpenYouTubeLogin: (() -> Unit)? = null,
+    onOpenLastFmLogin: (() -> Unit)? = null,
+    bottomPadding: Dp = 0.dp,
+    showTitleHeader: Boolean = true,
     onOpenClassicHome: () -> Unit = {},
     onRefreshWave: (() -> Unit)? = null,
 ) {
@@ -2270,21 +2245,12 @@ fun CustomEngineSettingsContent(
                 .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(
-            text = "Источники и ИИ-движок",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-        )
-
-        if (onRefreshWave != null) {
-            Button(
-                onClick = onRefreshWave,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Icon(MetrolistIcons.Outlined.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Обновить волну сейчас", fontWeight = FontWeight.SemiBold)
-            }
+        if (showTitleHeader) {
+            Text(
+                text = "Источники и ИИ-движок",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
 
         SettingSwitchRow(
@@ -2331,7 +2297,7 @@ fun CustomEngineSettingsContent(
 
         HorizontalDivider()
 
-        FilterGroupTitle("Вход в сервисы (встроенный браузер)")
+        FilterGroupTitle("Вход в сервисы")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = { activeOAuthProvider = OAuthProvider.VK },
@@ -2343,16 +2309,39 @@ fun CustomEngineSettingsContent(
             ) {
                 Text(if (yandexInput.isBlank()) "Войти в Яндекс" else "Обновить Яндекс")
             }
+            if (onOpenYouTubeLogin != null) {
+                Button(
+                    onClick = onOpenYouTubeLogin,
+                ) {
+                    Text(if (isYouTubeLoggedIn) "Обновить YouTube" else "Войти в YouTube")
+                }
+            }
+            if (onOpenLastFmLogin != null) {
+                Button(
+                    onClick = onOpenLastFmLogin,
+                ) {
+                    Text(if (isLastFmLoggedIn) "Настроить Last.fm" else "Войти в Last.fm")
+                }
+            }
             OutlinedButton(
                 onClick = { showManualTokens = !showManualTokens },
             ) {
                 Text(if (showManualTokens) "Скрыть токены" else "Вручную")
             }
         }
+        val statusParts =
+            buildList {
+                add("ВК: ${if (vkInput.isNotBlank()) "подключён" else "нет"}")
+                add("Яндекс: ${if (yandexInput.isNotBlank()) "подключён" else "нет"}")
+                if (onOpenYouTubeLogin != null) {
+                    add("YouTube: ${if (isYouTubeLoggedIn) "подключён" else "нет"}")
+                }
+                if (onOpenLastFmLogin != null) {
+                    add("Last.fm: ${if (isLastFmLoggedIn || lfmUserInput.isNotBlank()) "подключён" else "нет"}")
+                }
+            }
         Text(
-            text =
-                "ВК: ${if (vkInput.isNotBlank()) "подключён" else "не подключён"} • " +
-                    "Яндекс: ${if (yandexInput.isNotBlank()) "подключён" else "не подключён"}",
+            text = statusParts.joinToString(" • "),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -2369,6 +2358,27 @@ fun CustomEngineSettingsContent(
                 value = vkInput,
                 onValueChange = { vkInput = it },
                 label = { Text("Токен ВК (или ссылка blank.html#access_token=...)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = lfmKeyInput,
+                onValueChange = { lfmKeyInput = it },
+                label = { Text("Last.fm API Key (необязательно)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = lfmSecretInput,
+                onValueChange = { lfmSecretInput = it },
+                label = { Text("Last.fm Secret (необязательно)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = lfmUserInput,
+                onValueChange = { lfmUserInput = it },
+                label = { Text("Last.fm Username (необязательно)") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -2415,29 +2425,6 @@ fun CustomEngineSettingsContent(
                 Text("Вставить")
             }
         }
-
-        FilterGroupTitle("Last.fm (необязательно — резерв и скробблинг)")
-        OutlinedTextField(
-            value = lfmKeyInput,
-            onValueChange = { lfmKeyInput = it },
-            label = { Text("Last.fm API Key") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = lfmSecretInput,
-            onValueChange = { lfmSecretInput = it },
-            label = { Text("Last.fm Secret") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = lfmUserInput,
-            onValueChange = { lfmUserInput = it },
-            label = { Text("Last.fm Username") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
 
         FilterGroupTitle("Режим моделей Gemini (автопереключение при 429/503)")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -2815,7 +2802,7 @@ fun CustomEngineSettingsContent(
             }
         }
 
-        Spacer(modifier = Modifier.height(20.dp))
+        Spacer(modifier = Modifier.height(24.dp + bottomPadding))
     }
 
     activeOAuthProvider?.let { provider ->
