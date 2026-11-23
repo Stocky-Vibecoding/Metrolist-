@@ -1,6 +1,7 @@
 package com.metrolist.android.custom
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -46,6 +47,10 @@ class VkMusicProvider(
 
     @Volatile
     private var lastAutoRefreshAttemptMs: Long = 0L
+
+    fun resetFloodCooldown() {
+        floodCooldownUntilMs = 0L
+    }
 
     suspend fun checkToken(
         token: String = configStore.current.vkToken,
@@ -108,7 +113,7 @@ class VkMusicProvider(
         for (profile in profilesToTry) {
             if (System.currentTimeMillis() < floodCooldownUntilMs) return null
             val outcome =
-                runCatching {
+                try {
                     val url =
                         "${apiBaseUrl()}/audio.getById" +
                             "?audios=${CustomHttp.urlEncode(audioKey)}" +
@@ -120,24 +125,36 @@ class VkMusicProvider(
                             headers = mapOf("User-Agent" to profile.userAgent),
                             timeoutMs = 6_000,
                         )
-                    if (!response.isSuccess) return@runCatching DirectLookupResult.RetryNext
-                    val root = JSONObject(response.body)
-                    if (root.has("error")) {
-                        val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
-                        return@runCatching when (code) {
-                            9 -> {
-                                floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
+                    if (!response.isSuccess) {
+                        DirectLookupResult.RetryNext
+                    } else {
+                        val root = JSONObject(response.body)
+                        if (root.has("error")) {
+                            val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
+                            when (code) {
+                                9 -> {
+                                    floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
+                                    DirectLookupResult.Stop
+                                }
+                                5 -> DirectLookupResult.TokenExpired
+                                else -> DirectLookupResult.RetryNext
+                            }
+                        } else {
+                            val arr = root.optJSONArray("response")
+                            val candidate = parseAudioArray(arr).firstOrNull()
+                            if (candidate != null) {
+                                activeProfile = profile
+                                DirectLookupResult.Found(candidate, profile.userAgent)
+                            } else {
                                 DirectLookupResult.Stop
                             }
-                            5 -> DirectLookupResult.TokenExpired
-                            else -> DirectLookupResult.RetryNext
                         }
                     }
-                    val arr = root.optJSONArray("response") ?: return@runCatching DirectLookupResult.RetryNext
-                    val candidate = parseAudioArray(arr).firstOrNull() ?: return@runCatching DirectLookupResult.Stop
-                    activeProfile = profile
-                    DirectLookupResult.Found(candidate)
-                }.getOrDefault(DirectLookupResult.RetryNext)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    DirectLookupResult.RetryNext
+                }
 
             when (outcome) {
                 is DirectLookupResult.Found -> {
@@ -146,7 +163,7 @@ class VkMusicProvider(
                     Log.d(TAG, "Direct VK hit (${best.audioKey}, ${if (isHls) "HLS" else "MP3"}): ${best.artist} - ${best.title}")
                     return ResolvedCustomStream(
                         url = best.url,
-                        headers = mapOf("User-Agent" to activeProfile.userAgent),
+                        headers = mapOf("User-Agent" to outcome.userAgent),
                         mimeType = if (isHls) "application/x-mpegURL" else "audio/mpeg",
                         bitrate = null,
                         durationSec = best.durationSec.takeIf { it > 0L },
@@ -184,7 +201,7 @@ class VkMusicProvider(
         val query = listOf(reference.artist, reference.title).filter { it.isNotBlank() }.joinToString(" ")
         if (query.isBlank()) return null
 
-        val candidates = searchAudio(token, query, allowAutoRefresh = true)
+        val (candidates, matchedUserAgent) = searchAudio(token, query, allowAutoRefresh = true)
         val nonBlacklisted =
             candidates.filter { cand ->
                 cand.audioKey.isBlank() ||
@@ -214,7 +231,7 @@ class VkMusicProvider(
         val stream =
             ResolvedCustomStream(
                 url = best.url,
-                headers = mapOf("User-Agent" to activeProfile.userAgent),
+                headers = mapOf("User-Agent" to matchedUserAgent),
                 mimeType = if (isHls) "application/x-mpegURL" else "audio/mpeg",
                 bitrate = null,
                 durationSec = best.durationSec.takeIf { it > 0L },
@@ -241,9 +258,9 @@ class VkMusicProvider(
         val query = listOf(cleanArtist, cleanTitle).filter { it.isNotBlank() }.joinToString(" ")
         if (query.isBlank()) return null
 
+        val (rawCandidates, _) = searchAudio(token, query, allowAutoRefresh = true)
         val candidates =
-            searchAudio(token, query, allowAutoRefresh = true)
-                .filter { it.audioKey.isBlank() || !configStore.isVkAudioBlacklisted(it.audioKey) }
+            rawCandidates.filter { it.audioKey.isBlank() || !configStore.isVkAudioBlacklisted(it.audioKey) }
         if (candidates.isEmpty()) return null
 
         val reference =
@@ -278,7 +295,14 @@ class VkMusicProvider(
             lastAutoRefreshAttemptMs = now
 
             val hook = onTokenExpiredRefreshHook ?: return@withLock null
-            val fresh = runCatching { hook() }.getOrNull()?.let(::sanitizeToken)?.takeIf { it.isNotBlank() }
+            val fresh =
+                try {
+                    hook()?.let(::sanitizeToken)?.takeIf { it.isNotBlank() }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
             if (fresh != null) {
                 Log.i(TAG, "VK token auto-refreshed silently via WebView cookies")
                 configStore.update { it.copy(vkToken = fresh) }
@@ -290,44 +314,51 @@ class VkMusicProvider(
         token: String,
         profile: VkClientProfile,
     ): Result<Int> =
-        runCatching<Result<Int>> {
+        try {
             val url = buildSearchUrl(token = token, query = "Кино Группа крови", count = 3, profile = profile)
             val response = CustomHttp.get(url, headers = mapOf("User-Agent" to profile.userAgent), timeoutMs = 8_000)
             if (!response.isSuccess) {
-                return@runCatching Result.failure<Int>(IllegalStateException("HTTP ${response.code}"))
-            }
-            val root = JSONObject(response.body)
-            if (root.has("error")) {
-                val err = root.optJSONObject("error")
-                val code = err?.optInt("error_code", -1) ?: -1
-                val msg = err?.optString("error_msg").orEmpty()
-                Result.failure<Int>(IllegalStateException("#$code $msg"))
+                Result.failure(IllegalStateException("HTTP ${response.code}"))
             } else {
-                val respObj = root.optJSONObject("response")
-                val arr =
-                    when (profile.endpoint) {
-                        VkSearchEndpoint.CATALOG -> respObj?.optJSONArray("audios") ?: respObj?.optJSONArray("items")
-                        VkSearchEndpoint.LEGACY -> respObj?.optJSONArray("items") ?: respObj?.optJSONArray("audios")
-                    }
-                val parsed = parseAudioArray(arr)
-                if (respObj != null) {
-                    Result.success(parsed.size)
+                val root = JSONObject(response.body)
+                if (root.has("error")) {
+                    val err = root.optJSONObject("error")
+                    val code = err?.optInt("error_code", -1) ?: -1
+                    val msg = err?.optString("error_msg").orEmpty()
+                    Result.failure(IllegalStateException("#$code $msg"))
                 } else {
-                    Result.failure<Int>(IllegalStateException("пустой ответ"))
+                    val respObj = root.optJSONObject("response")
+                    val arr =
+                        when (profile.endpoint) {
+                            VkSearchEndpoint.CATALOG -> respObj?.optJSONArray("audios") ?: respObj?.optJSONArray("items")
+                            VkSearchEndpoint.LEGACY -> respObj?.optJSONArray("items") ?: respObj?.optJSONArray("audios")
+                        }
+                    val parsed = parseAudioArray(arr)
+                    if (respObj != null && parsed.isNotEmpty()) {
+                        Result.success(parsed.size)
+                    } else if (respObj != null) {
+                        Result.failure(IllegalStateException("нет доступных аудио-ссылок (токен без прав audio)"))
+                    } else {
+                        Result.failure(IllegalStateException("пустой ответ"))
+                    }
                 }
             }
-        }.getOrElse { Result.failure(it) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
 
     private suspend fun searchAudio(
         token: String,
         query: String,
         allowAutoRefresh: Boolean,
-    ): List<VkAudioCandidate> {
+    ): Pair<List<VkAudioCandidate>, String> {
         val profilesToTry = (listOf(activeProfile) + CLIENT_PROFILES).distinct()
         for (profile in profilesToTry) {
-            if (System.currentTimeMillis() < floodCooldownUntilMs) return emptyList()
+            if (System.currentTimeMillis() < floodCooldownUntilMs) return emptyList<VkAudioCandidate>() to profile.userAgent
             val outcome =
-                runCatching {
+                try {
                     val url = buildSearchUrl(token = token, query = query, count = 35, profile = profile)
                     val response =
                         CustomHttp.get(
@@ -335,33 +366,45 @@ class VkMusicProvider(
                             headers = mapOf("User-Agent" to profile.userAgent),
                             timeoutMs = 6_000,
                         )
-                    if (!response.isSuccess) return@runCatching SearchOutcome.RetryNext
-                    val root = JSONObject(response.body)
-                    if (root.has("error")) {
-                        val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
-                        Log.w(TAG, "VK ${profile.label}/${profile.endpoint.label} error #$code")
-                        return@runCatching when (code) {
-                            9 -> {
-                                floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
-                                SearchOutcome.Empty
+                    if (!response.isSuccess) {
+                        SearchOutcome.RetryNext
+                    } else {
+                        val root = JSONObject(response.body)
+                        if (root.has("error")) {
+                            val code = root.optJSONObject("error")?.optInt("error_code", -1) ?: -1
+                            Log.w(TAG, "VK ${profile.label}/${profile.endpoint.label} error #$code")
+                            when (code) {
+                                9 -> {
+                                    floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
+                                    SearchOutcome.Empty
+                                }
+                                5 -> SearchOutcome.TokenExpired
+                                else -> SearchOutcome.RetryNext
                             }
-                            5 -> SearchOutcome.TokenExpired
-                            else -> SearchOutcome.RetryNext
+                        } else {
+                            activeProfile = profile
+                            val respObj = root.optJSONObject("response")
+                            if (respObj == null) {
+                                SearchOutcome.Empty
+                            } else {
+                                val array =
+                                    when (profile.endpoint) {
+                                        VkSearchEndpoint.CATALOG -> respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
+                                        VkSearchEndpoint.LEGACY -> respObj.optJSONArray("items") ?: respObj.optJSONArray("audios")
+                                    }
+                                SearchOutcome.Success(parseAudioArray(array), profile.userAgent)
+                            }
                         }
                     }
-                    activeProfile = profile
-                    val respObj = root.optJSONObject("response") ?: return@runCatching SearchOutcome.Empty
-                    val array =
-                        when (profile.endpoint) {
-                            VkSearchEndpoint.CATALOG -> respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
-                            VkSearchEndpoint.LEGACY -> respObj.optJSONArray("items") ?: respObj.optJSONArray("audios")
-                        }
-                    SearchOutcome.Success(parseAudioArray(array))
-                }.getOrDefault(SearchOutcome.RetryNext)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    SearchOutcome.RetryNext
+                }
 
             when (outcome) {
-                is SearchOutcome.Success -> return outcome.items
-                SearchOutcome.Empty -> return emptyList()
+                is SearchOutcome.Success -> return outcome.items to outcome.userAgent
+                SearchOutcome.Empty -> return emptyList<VkAudioCandidate>() to profile.userAgent
                 SearchOutcome.TokenExpired -> {
                     if (allowAutoRefresh) {
                         val refreshed = tryRefreshExpiredToken(token)
@@ -369,12 +412,12 @@ class VkMusicProvider(
                             return searchAudio(refreshed, query, allowAutoRefresh = false)
                         }
                     }
-                    return emptyList()
+                    return emptyList<VkAudioCandidate>() to profile.userAgent
                 }
                 SearchOutcome.RetryNext -> Unit
             }
         }
-        return emptyList()
+        return emptyList<VkAudioCandidate>() to activeProfile.userAgent
     }
 
     private fun buildSearchUrl(
@@ -412,7 +455,7 @@ class VkMusicProvider(
             for (i in 0 until items.length()) {
                 val item = items.optJSONObject(i) ?: continue
                 val streamUrl = item.optString("url").trim()
-                if (streamUrl.isBlank()) continue
+                if (streamUrl.isBlank() || streamUrl.contains("audio_api_unavailable", ignoreCase = true)) continue
                 val ownerId = item.optLong("owner_id", 0L)
                 val id = item.optLong("id", 0L)
                 val audioKey = if (id != 0L) "${ownerId}_$id" else ""
@@ -681,7 +724,7 @@ class VkMusicProvider(
         val trimmed = raw.trim()
         val afterParam =
             if (trimmed.contains("access_token=")) {
-                trimmed.substringAfter("access_token=").substringBefore("&")
+                trimmed.substringAfter("access_token=").substringBefore("&").substringBefore("#")
             } else {
                 trimmed
             }
@@ -689,16 +732,28 @@ class VkMusicProvider(
     }
 
     private sealed interface SearchOutcome {
-        data class Success(val items: List<VkAudioCandidate>) : SearchOutcome
+        data class Success(
+            val items: List<VkAudioCandidate>,
+            val userAgent: String,
+        ) : SearchOutcome
+
         data object Empty : SearchOutcome
+
         data object TokenExpired : SearchOutcome
+
         data object RetryNext : SearchOutcome
     }
 
     private sealed interface DirectLookupResult {
-        data class Found(val candidate: VkAudioCandidate) : DirectLookupResult
+        data class Found(
+            val candidate: VkAudioCandidate,
+            val userAgent: String,
+        ) : DirectLookupResult
+
         data object TokenExpired : DirectLookupResult
+
         data object Stop : DirectLookupResult
+
         data object RetryNext : DirectLookupResult
     }
 
@@ -707,7 +762,7 @@ class VkMusicProvider(
         private const val FLOOD_COOLDOWN_MS = 3 * 60 * 1_000L
         private const val AUTO_REFRESH_COOLDOWN_MS = 30_000L
 
-        /** Вешается на Этапе 2 встроенным WebView-менеджером для тихого перевыпуска токена при #5. */
+        /** Вешается встроенным WebView-менеджером для тихого перевыпуска токена при #5. */
         @Volatile
         var onTokenExpiredRefreshHook: (suspend () -> String?)? = null
 
