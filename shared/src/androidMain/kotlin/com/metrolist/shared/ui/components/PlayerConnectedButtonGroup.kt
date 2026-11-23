@@ -83,15 +83,20 @@ actual fun PlayerConnectedButtonGroup(
 ) {
     val iconSize = if (compact) 20.dp else 24.dp
     val buttonWidth = touchTarget + 2.dp
+    val isTv = LocalIsTv.current
 
     val actions =
         listOfNotNull(
-            PlayerControlAction(
-                icon = MetrolistIcons.AutoMirrored.Rounded.QueueMusic,
-                contentDescription = stringResource(Res.string.queue),
-                onClick = onQueueClick,
-                checked = isQueueActive,
-            ),
+            if (isTv) {
+                PlayerControlAction(
+                    icon = MetrolistIcons.AutoMirrored.Rounded.QueueMusic,
+                    contentDescription = stringResource(Res.string.queue),
+                    onClick = onQueueClick,
+                    checked = isQueueActive,
+                )
+            } else {
+                null
+            },
             onSleepTimerClick?.let {
                 PlayerControlAction(
                     icon = MetrolistIcons.Default.Bedtime,
@@ -125,7 +130,7 @@ actual fun PlayerConnectedButtonGroup(
                     checked = repeatMode != RepeatMode.OFF,
                 )
             },
-            onCastClick?.takeIf { !LocalIsTv.current && Settings.shared.isPlayerCastButtonVisible }?.let {
+            onCastClick?.takeIf { !isTv && Settings.shared.isPlayerCastButtonVisible }?.let {
                 PlayerControlAction(
                     icon = MetrolistIcons.Outlined.Cast,
                     contentDescription = stringResource(Res.string.cast),
