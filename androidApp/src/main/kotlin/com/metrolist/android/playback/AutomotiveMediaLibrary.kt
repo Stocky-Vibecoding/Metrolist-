@@ -10,6 +10,10 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.session.MediaConstants
 import com.metrolist.android.R
 import com.metrolist.android.constants.MediaSessionConstants
+import com.metrolist.android.custom.AiWaveEngine
+import com.metrolist.android.custom.CustomCatalogProvider
+import com.metrolist.android.custom.CustomMascotAssets
+import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.shared.api.PlaylistPage
 import com.metrolist.shared.api.YouTubeRepository
 import com.metrolist.shared.auth.hasSupportedYouTubeAuthCookie
@@ -55,6 +59,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.Base64
@@ -63,6 +68,11 @@ import kotlin.random.Random
 
 internal object AutomotiveMediaIds {
     const val ROOT = "auto:root"
+    const val MY_WAVE = "auto:my-wave"
+    const val MY_WAVE_PLAY = "auto:my-wave:play"
+    const val MY_WAVE_RADAR = "auto:my-wave:radar"
+    const val MY_WAVE_YANDEX_CHART = "auto:my-wave:chart-yandex"
+    const val MY_WAVE_VK_CHART = "auto:my-wave:chart-vk"
     const val HOME = "auto:home"
     const val COLLECTIONS = "auto:collections"
     const val HISTORY = "auto:history"
@@ -415,6 +425,24 @@ internal class AutomotiveMediaLibrary(
 
     private suspend fun homeChildren(): List<MediaItem> =
         homeLock.withLock {
+            // Сначала используем наш локальный кэш чартов и радара новинок (работает быстро и без YTM-блоков)
+            val snapshot = CustomCatalogProvider.homeSnapshot.value
+            if (snapshot.isNotEmpty) {
+                val combined =
+                    (snapshot.releaseRadar + snapshot.yandexChart + snapshot.vkChart + snapshot.deezerChart)
+                        .map { it.toSongItem() }
+                        .distinctBy { it.id }
+                        .let(::filterSongs)
+                if (combined.isNotEmpty()) {
+                    return@withLock combined.map(::song)
+                }
+            }
+
+            if (!isNetworkConnected()) {
+                val offline = CustomMediaCacheManager.getOfflineCachedSongs(limit = 40).let(::filterSongs)
+                if (offline.isNotEmpty()) return@withLock offline.map(::song)
+            }
+
             val identity = currentHomeIdentity()
             if (homeIdentity != identity) {
                 homeIdentity = identity
@@ -478,6 +506,86 @@ internal class AutomotiveMediaLibrary(
             }
         }
 
+    private fun myWaveChildren(): List<MediaItem> {
+        val snapshot = CustomCatalogProvider.homeSnapshot.value
+        val offlineCount = CustomMediaCacheManager.getOfflineCachedSongs(limit = 50).size
+        return buildList {
+            add(myWavePlayItem())
+            if (snapshot.releaseRadar.isNotEmpty()) {
+                add(
+                    myWaveActionItem(
+                        mediaId = AutomotiveMediaIds.MY_WAVE_RADAR,
+                        title = "Радар новинок",
+                        subtitle = "Свежие релизы твоих артистов",
+                        artwork = snapshot.releaseRadar.firstOrNull()?.coverUrl,
+                    ),
+                )
+            }
+            if (snapshot.yandexChart.isNotEmpty()) {
+                add(
+                    myWaveActionItem(
+                        mediaId = AutomotiveMediaIds.MY_WAVE_YANDEX_CHART,
+                        title = "Чарт Я.Музыки",
+                        subtitle = "${snapshot.yandexChart.size} треков",
+                        artwork = snapshot.yandexChart.firstOrNull()?.coverUrl,
+                    ),
+                )
+            }
+            if (snapshot.vkChart.isNotEmpty()) {
+                add(
+                    myWaveActionItem(
+                        mediaId = AutomotiveMediaIds.MY_WAVE_VK_CHART,
+                        title = "Чарт VK",
+                        subtitle = "${snapshot.vkChart.size} треков",
+                        artwork = snapshot.vkChart.firstOrNull()?.coverUrl,
+                    ),
+                )
+            }
+            if (offlineCount > 0) {
+                add(
+                    folder(
+                        mediaId = AutomotiveMediaIds.CACHED,
+                        title = "Доступно офлайн",
+                        mediaType = MediaMetadata.MEDIA_TYPE_PLAYLIST,
+                        subtitle = "Кэш 4 ГБ и лайки ($offlineCount)",
+                    ),
+                )
+            }
+        }
+    }
+
+    private suspend fun buildMyWaveSongs(): List<SongItem> {
+        val engine = AiWaveEngine.sharedInstance
+        if (isNetworkConnected() && engine != null) {
+            val fresh =
+                withTimeoutOrNull(WAVE_AUTO_TIMEOUT_MS) {
+                    runCatching { engine.generateWaveSongs(backgroundLabel = false).getOrNull() }.getOrNull()
+                }?.let(::filterSongs)
+            if (!fresh.isNullOrEmpty()) return fresh
+        }
+
+        val starter = engine?.buildInstantStarterSongs(excludeIds = emptySet()).orEmpty().let(::filterSongs)
+        if (starter.isNotEmpty()) return starter
+
+        val cached = CustomMediaCacheManager.getOfflineCachedSongs(limit = 40).let(::filterSongs)
+        if (cached.isNotEmpty()) return cached.shuffled()
+
+        val liked = autoPlaylistSongs(AutomotiveAutoPlaylist.LIKED)
+        if (liked.isNotEmpty()) return liked.shuffled()
+
+        val snapshot = CustomCatalogProvider.homeSnapshot.value
+        val chartFallback = (snapshot.yandexChart + snapshot.vkChart + snapshot.deezerChart).map { it.toSongItem() }.let(::filterSongs)
+        if (chartFallback.isNotEmpty()) return chartFallback
+
+        return database
+            .dao()
+            .songsByNameAsc(limit = 50, offset = 0)
+            .first()
+            .map { it.toSongItem() }
+            .let(::filterSongs)
+            .shuffled()
+    }
+
     val rootItem: MediaItem =
         folder(
             mediaId = AutomotiveMediaIds.ROOT,
@@ -498,6 +606,18 @@ internal class AutomotiveMediaLibrary(
 
     private fun allRootChildren(browsableOnly: Boolean): List<MediaItem> {
         val pins = Settings.shared.getAutomotivePinnedPlaylists()
+        val waveRootItem =
+            if (browsableOnly) {
+                folder(
+                    mediaId = AutomotiveMediaIds.MY_WAVE,
+                    title = "Моя волна",
+                    mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_MIXED,
+                    artwork = CustomMascotAssets.fallbackCoverUri,
+                    childPlayableStyle = MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM,
+                )
+            } else {
+                myWavePlayItem()
+            }
         val pinnedItems =
             if (pins.isEmpty()) {
                 emptyList()
@@ -513,15 +633,14 @@ internal class AutomotiveMediaLibrary(
             } else {
                 pins.map(::pinnedPlaylist)
             }
-        return pinnedItems +
+        return listOf(waveRootItem) +
+            pinnedItems +
             listOf(
+                folder(AutomotiveMediaIds.LIKED, context.getString(R.string.liked_songs)),
                 folder(AutomotiveMediaIds.HOME, context.getString(R.string.home)),
                 folder(AutomotiveMediaIds.HISTORY, context.getString(R.string.history)),
-                folder(AutomotiveMediaIds.LIKED, context.getString(R.string.liked_songs)),
-                folder(AutomotiveMediaIds.DOWNLOADS, context.getString(R.string.downloads)),
-                folder(AutomotiveMediaIds.TOP, context.getString(R.string.my_top_100)),
                 folder(AutomotiveMediaIds.CACHED, context.getString(R.string.cached_playlist)),
-                folder(AutomotiveMediaIds.UPLOADED, context.getString(R.string.uploaded_playlist_name)),
+                folder(AutomotiveMediaIds.TOP, context.getString(R.string.my_top_100)),
                 folder(AutomotiveMediaIds.SONGS, context.getString(R.string.songs)),
                 folder(AutomotiveMediaIds.ALBUMS, context.getString(R.string.albums), MediaMetadata.MEDIA_TYPE_FOLDER_ALBUMS),
                 folder(AutomotiveMediaIds.ARTISTS, context.getString(R.string.artists), MediaMetadata.MEDIA_TYPE_FOLDER_ARTISTS),
@@ -531,6 +650,8 @@ internal class AutomotiveMediaLibrary(
                     context.getString(R.string.youtube_playlists),
                     MediaMetadata.MEDIA_TYPE_FOLDER_PLAYLISTS,
                 ),
+                folder(AutomotiveMediaIds.DOWNLOADS, context.getString(R.string.downloads)),
+                folder(AutomotiveMediaIds.UPLOADED, context.getString(R.string.uploaded_playlist_name)),
                 folder(AutomotiveMediaIds.PODCASTS, context.getString(R.string.podcasts)),
             )
     }
@@ -549,6 +670,9 @@ internal class AutomotiveMediaLibrary(
         }
         if (parentId == AutomotiveMediaIds.ROOT) {
             return AutomotivePaging.page(rootChildren(rootBrowsableOnly, rootChildLimit), page, pageSize)
+        }
+        if (parentId == AutomotiveMediaIds.MY_WAVE) {
+            return AutomotivePaging.page(myWaveChildren(), page, pageSize)
         }
 
         AutomotiveMediaIds.youtubePlaylistId(parentId)?.let { playlistId ->
@@ -736,6 +860,13 @@ internal class AutomotiveMediaLibrary(
         AutomotiveMediaIds.shuffleParent(mediaId)?.let { return shuffleItem(it) }
         if (mediaId == AutomotiveMediaIds.ROOT) return rootItem
         if (mediaId == AutomotiveMediaIds.COLLECTIONS) return folder(mediaId, context.getString(R.string.library))
+        if (mediaId == AutomotiveMediaIds.MY_WAVE_PLAY) return myWavePlayItem()
+        if (mediaId == AutomotiveMediaIds.MY_WAVE_RADAR ||
+            mediaId == AutomotiveMediaIds.MY_WAVE_YANDEX_CHART ||
+            mediaId == AutomotiveMediaIds.MY_WAVE_VK_CHART
+        ) {
+            return myWaveChildren().firstOrNull { it.mediaId == mediaId }
+        }
         mediaItems[mediaId]?.let { item ->
             val artwork = mediaArtworkUri(context, item.mediaMetadata.artworkUri?.toString())
             return item
@@ -830,7 +961,14 @@ internal class AutomotiveMediaLibrary(
     }
 
     suspend fun resolveVoiceSearch(request: VoiceSearchRequest): AutomotiveVoiceQueue {
+        val loweredQuery = request.matchQuery.trim().lowercase()
+        if (loweredQuery.contains("моя волна") || loweredQuery.contains("мою волну") || loweredQuery.contains("my wave")) {
+            val waveSongs = buildMyWaveSongs()
+            if (waveSongs.isNotEmpty()) return AutomotiveVoiceQueue(waveSongs)
+        }
         if (request.matchQuery.isBlank()) {
+            val waveSongs = buildMyWaveSongs()
+            if (waveSongs.isNotEmpty()) return AutomotiveVoiceQueue(waveSongs)
             return database
                 .dao()
                 .songsByNameAsc()
@@ -949,6 +1087,44 @@ internal class AutomotiveMediaLibrary(
 
     suspend fun resolvePinnedPlaylist(mediaItem: MediaItem): AutomotivePinnedPlaylistQueue? {
         invalidateChangedLikeQueues()
+        when (mediaItem.mediaId) {
+            AutomotiveMediaIds.MY_WAVE_PLAY -> {
+                val songs = buildMyWaveSongs()
+                return AutomotivePinnedPlaylistQueue(
+                    title = "Моя волна",
+                    songs = songs,
+                    shuffle = false,
+                )
+            }
+
+            AutomotiveMediaIds.MY_WAVE_RADAR -> {
+                val songs = CustomCatalogProvider.homeSnapshot.value.releaseRadar.map { it.toSongItem() }.let(::filterSongs)
+                return AutomotivePinnedPlaylistQueue(
+                    title = "Радар новинок",
+                    songs = songs,
+                    shuffle = false,
+                )
+            }
+
+            AutomotiveMediaIds.MY_WAVE_YANDEX_CHART -> {
+                val songs = CustomCatalogProvider.homeSnapshot.value.yandexChart.map { it.toSongItem() }.let(::filterSongs)
+                return AutomotivePinnedPlaylistQueue(
+                    title = "Чарт Я.Музыки",
+                    songs = songs,
+                    shuffle = false,
+                )
+            }
+
+            AutomotiveMediaIds.MY_WAVE_VK_CHART -> {
+                val songs = CustomCatalogProvider.homeSnapshot.value.vkChart.map { it.toSongItem() }.let(::filterSongs)
+                return AutomotivePinnedPlaylistQueue(
+                    title = "Чарт VK",
+                    songs = songs,
+                    shuffle = false,
+                )
+            }
+        }
+
         val sourceAndId =
             AutomotiveMediaIds.pinnedLocalPlaylistId(mediaItem.mediaId)?.let { AutomotivePlaylistSource.LOCAL to it }
                 ?: AutomotiveMediaIds.pinnedYoutubePlaylistId(mediaItem.mediaId)?.let { AutomotivePlaylistSource.YOUTUBE to it }
@@ -1250,7 +1426,8 @@ internal class AutomotiveMediaLibrary(
             }
 
             AutomotiveAutoPlaylist.CACHED -> {
-                cachedSongs(KIND_CACHE)
+                (CustomMediaCacheManager.getOfflineCachedSongs(limit = 100) + cachedSongs(KIND_CACHE))
+                    .distinctBy { it.id }
             }
 
             AutomotiveAutoPlaylist.UPLOADED -> {
@@ -1409,6 +1586,44 @@ internal class AutomotiveMediaLibrary(
         }
     }
 
+    private fun myWavePlayItem(): MediaItem =
+        myWaveActionItem(
+            mediaId = AutomotiveMediaIds.MY_WAVE_PLAY,
+            title = "Моя волна",
+            subtitle = "Бесконечный ИИ-поток под твой вкус",
+            artwork = CustomMascotAssets.fallbackCoverUri,
+        )
+
+    private fun myWaveActionItem(
+        mediaId: String,
+        title: String,
+        subtitle: String,
+        artwork: String?,
+    ): MediaItem =
+        MediaItem
+            .Builder()
+            .setMediaId(mediaId)
+            .setMediaMetadata(
+                MediaMetadata
+                    .Builder()
+                    .setTitle(title)
+                    .setDisplayTitle(title)
+                    .setSubtitle(subtitle)
+                    .setArtworkUri(mediaArtworkUri(context, artwork ?: CustomMascotAssets.fallbackCoverUri))
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_PLAYLIST)
+                    .setIsBrowsable(false)
+                    .setIsPlayable(true)
+                    .setExtras(
+                        Bundle().apply {
+                            putInt(
+                                MediaConstants.EXTRAS_KEY_CONTENT_STYLE_SINGLE_ITEM,
+                                MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM,
+                            )
+                        },
+                    ).build(),
+            ).build()
+            .also { cacheMediaItem(it) }
+
     private fun shuffleItem(parentId: String): MediaItem =
         MediaItem
             .Builder()
@@ -1553,5 +1768,6 @@ internal class AutomotiveMediaLibrary(
         const val MAX_REMOTE_PLAYLIST_PAGES = 100
         const val MAX_QUEUE_CONTEXT_SONGS = 2_000
         const val PINNED_PLAYLIST_INITIAL_SONGS = 50
+        const val WAVE_AUTO_TIMEOUT_MS = 4_000L
     }
 }
