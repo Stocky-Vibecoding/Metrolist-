@@ -418,7 +418,7 @@ class ExoPlaybackPlayer(
     private var lastVkNetworkRecoveryMs = 0L
 
     private fun createPlayer(
-        bufferForPlaybackMs: Int = 2_000,
+        bufferForPlaybackMs: Int = 900,
         role: AndroidPlaybackPlayerRole = AndroidPlaybackPlayerRole.PRIMARY,
         audioSessionId: Int = sharedAudioSessionId,
     ): ExoPlayer {
@@ -4326,7 +4326,11 @@ private fun buildDirectDataSourceFactory(
     return DefaultDataSource.Factory(
         context,
         StatusReportingHttpDataSourceFactory(
-            DefaultHttpDataSource.Factory().setDefaultRequestProperties(resource.headers),
+            DefaultHttpDataSource.Factory()
+                .setConnectTimeoutMs(6_000)
+                .setReadTimeoutMs(10_000)
+                .setAllowCrossProtocolRedirects(true)
+                .setDefaultRequestProperties(resource.headers),
             onResponseStatus,
         ),
     )
@@ -4421,7 +4425,7 @@ private fun removeVideoSurface(
         is Surface -> player.clearVideoSurface(surface)
         is SurfaceHolder -> player.clearVideoSurfaceHolder(surface)
         is SurfaceView -> player.clearVideoSurfaceView(surface)
-        is TextureView -> player.clearVideoTextureView(surface)
+        is TextureView -> player.clearVideoSurfaceView(surface)
         else -> player.clearVideoSurface()
     }
 }
