@@ -74,10 +74,13 @@ data class ExternalCatalogTrack(
 data class HomeCatalogSnapshot(
     val yandexChart: List<ExternalCatalogTrack> = emptyList(),
     val yandexNewReleases: List<ExternalCatalogTrack> = emptyList(),
-    val yandexFeedTracks: List<ExternalCatalogTrack> = emptyList(),
+    val yandexDailyTitle: String = "Плейлист дня",
+    val yandexDailyTracks: List<ExternalCatalogTrack> = emptyList(),
+    val yandexPremiereTitle: String = "Премьера",
+    val yandexPremiereTracks: List<ExternalCatalogTrack> = emptyList(),
     val vkChart: List<ExternalCatalogTrack> = emptyList(),
-    val vkRecommendations: List<ExternalCatalogTrack> = emptyList(),
-    val vkMyAudio: List<ExternalCatalogTrack> = emptyList(),
+    val vkPopular: List<ExternalCatalogTrack> = emptyList(),
+    val vkMyMusic: List<ExternalCatalogTrack> = emptyList(),
     val deezerChart: List<ExternalCatalogTrack> = emptyList(),
     val releaseRadar: List<ExternalCatalogTrack> = emptyList(),
     val updatedAtMs: Long = 0L,
@@ -86,10 +89,11 @@ data class HomeCatalogSnapshot(
         get() =
             yandexChart.isNotEmpty() ||
                 yandexNewReleases.isNotEmpty() ||
-                yandexFeedTracks.isNotEmpty() ||
+                yandexDailyTracks.isNotEmpty() ||
+                yandexPremiereTracks.isNotEmpty() ||
                 vkChart.isNotEmpty() ||
-                vkRecommendations.isNotEmpty() ||
-                vkMyAudio.isNotEmpty() ||
+                vkPopular.isNotEmpty() ||
+                vkMyMusic.isNotEmpty() ||
                 deezerChart.isNotEmpty() ||
                 releaseRadar.isNotEmpty()
 }
@@ -118,24 +122,31 @@ class CustomCatalogProvider(
         coroutineScope {
             val yandexChartTask = async { fetchYandexChart(24) }
             val yandexNewTask = async { fetchYandexNewReleases(24) }
-            val yandexFeedTask = async { fetchYandexFeedTracks(24) }
-            val vkChartTask = async { fetchVkPopular(24) }
-            val vkRecsTask = async { fetchVkRecommendations(24) }
-            val vkMyTask = async { fetchVkMyAudio(24) }
+            val yandexPersonalTask = async { fetchYandexPersonalMixes() }
+            val vkBundleTask = async { fetchVkHomeBundle() }
             val deezerChartTask = async { deezerClient().fetchChart(24) }
 
             val yandexNew = yandexNewTask.await().distinctBy { it.externalId }
-            val radar = fetchReleaseRadar(18, prefetchedYandexNew = yandexNew)
+            val radarTask = async { fetchReleaseRadar(limit = 20, preloadedYandexNew = yandexNew) }
+
+            val (dailyPair, premierePair) = yandexPersonalTask.await()
+            val (vkRecs, vkPop, vkMine) = vkBundleTask.await()
 
             HomeCatalogSnapshot(
                 yandexChart = yandexChartTask.await().distinctBy { it.externalId },
                 yandexNewReleases = yandexNew,
-                yandexFeedTracks = yandexFeedTask.await().distinctBy { it.externalId },
-                vkChart = vkChartTask.await().distinctBy { it.externalId },
-                vkRecommendations = vkRecsTask.await().distinctBy { it.externalId },
-                vkMyAudio = vkMyTask.await().distinctBy { it.externalId },
+                yandexDailyTitle = dailyPair.first,
+                yandexDailyTracks = dailyPair.second.distinctBy { it.externalId },
+                yandexPremiereTitle = premierePair.first,
+                yandexPremiereTracks = premierePair.second.distinctBy { it.externalId },
+                vkChart = vkRecs.distinctBy { it.externalId },
+                vkPopular = vkPop.distinctBy { it.externalId },
+                vkMyMusic = vkMine.distinctBy { it.externalId },
                 deezerChart = deezerChartTask.await().distinctBy { it.externalId },
-                releaseRadar = radar.distinctBy { CustomConfigStore.buildTrackKey(it.artist, it.title).ifBlank { it.externalId } },
+                releaseRadar =
+                    radarTask
+                        .await()
+                        .distinctBy { CustomConfigStore.buildTrackKey(it.artist, it.title).ifBlank { it.externalId } },
                 updatedAtMs = System.currentTimeMillis(),
             )
         }
@@ -156,17 +167,12 @@ class CustomCatalogProvider(
      * чтобы видеть свежие релизы любимых артистов — включая вырезанные цензурой в РФ.
      */
     suspend fun fetchReleaseRadar(
-        limit: Int = 18,
-        prefetchedYandexNew: List<ExternalCatalogTrack>? = null,
+        limit: Int = 20,
+        preloadedYandexNew: List<ExternalCatalogTrack>? = null,
     ): List<ExternalCatalogTrack> =
         coroutineScope {
             val topArtists = configStore.getLocalTopArtists(limit = 16)
-            val yandexNewTask =
-                if (prefetchedYandexNew == null) {
-                    async { fetchYandexNewReleases(28) }
-                } else {
-                    null
-                }
+            val yandexNewTask = async { preloadedYandexNew ?: fetchYandexNewReleases(28) }
 
             val deezerRadar = mutableListOf<ExternalCatalogTrack>()
             val deezer = deezerClient()
@@ -186,7 +192,7 @@ class CustomCatalogProvider(
                 deezerRadar.addAll(found)
             }
 
-            val yandexNew = prefetchedYandexNew ?: yandexNewTask?.await().orEmpty()
+            val yandexNew = yandexNewTask.await()
             val normTopArtists = topArtists.mapTo(HashSet()) { CustomConfigStore.buildArtistKey(it) }
             val matchedYandex =
                 yandexNew.filter { track ->
@@ -218,11 +224,15 @@ class CustomCatalogProvider(
             combined
         }
 
-    /** Персональная лента Яндекса (/feed -> Плейлист дня, Дежавю, Премьера). */
-    suspend fun fetchYandexFeedTracks(limit: Int = 24): List<ExternalCatalogTrack> =
+    /**
+     * Загружает персональные подборки Яндекс.Музыки («Плейлист дня», «Премьера», «Дежавю»).
+     */
+    private suspend fun fetchYandexPersonalMixes(): Pair<Pair<String, List<ExternalCatalogTrack>>, Pair<String, List<ExternalCatalogTrack>>> =
         withContext(Dispatchers.IO) {
+            val emptyResult = ("Плейлист дня" to emptyList<ExternalCatalogTrack>()) to ("Премьера" to emptyList<ExternalCatalogTrack>())
             val token = sanitizeYandexToken(configStore.current.yandexToken)
-            if (token.isBlank()) return@withContext emptyList()
+            if (token.isBlank()) return@withContext emptyResult
+
             val headers =
                 mapOf(
                     "Authorization" to "OAuth $token",
@@ -230,35 +240,160 @@ class CustomCatalogProvider(
                     "Accept-Language" to "ru",
                 )
             try {
-                val resp = CustomHttp.get("${yandexApiBase()}/feed", headers = headers, timeoutMs = 10_000)
-                if (!resp.isSuccess) return@withContext emptyList()
-                val generated =
-                    JSONObject(resp.body)
-                        .optJSONObject("result")
-                        ?.optJSONArray("generatedPlaylists")
-                        ?: return@withContext emptyList()
+                val resp =
+                    CustomHttp.get(
+                        url = "${yandexApiBase()}/landing3?blocks=personalplaylists",
+                        headers = headers,
+                        timeoutMs = 10_000,
+                    )
+                if (!resp.isSuccess) return@withContext emptyResult
+                val blocks = JSONObject(resp.body).optJSONObject("result")?.optJSONArray("blocks") ?: return@withContext emptyResult
 
-                val collected = mutableListOf<ExternalCatalogTrack>()
-                val seenIds = HashSet<String>()
-                for (i in 0 until generated.length()) {
-                    if (collected.size >= limit) break
-                    val pl = generated.optJSONObject(i) ?: continue
-                    val tracksArr = pl.optJSONObject("data")?.optJSONArray("tracks") ?: continue
-                    for (j in 0 until tracksArr.length()) {
-                        if (collected.size >= limit) break
-                        val trackObj = tracksArr.optJSONObject(j)?.optJSONObject("track") ?: continue
-                        val parsed = parseYandexTrack(trackObj) ?: continue
-                        if (seenIds.add(parsed.externalId)) {
-                            collected.add(parsed)
+                data class PlaylistRef(
+                    val uid: String,
+                    val kind: String,
+                    val title: String,
+                    val genType: String,
+                )
+
+                val refs = mutableListOf<PlaylistRef>()
+                for (b in 0 until blocks.length()) {
+                    val block = blocks.optJSONObject(b) ?: continue
+                    val entities = block.optJSONArray("entities") ?: continue
+                    for (e in 0 until entities.length()) {
+                        val ent = entities.optJSONObject(e) ?: continue
+                        val data = ent.optJSONObject("data")?.optJSONObject("data") ?: ent.optJSONObject("data") ?: continue
+                        val uid = data.optString("uid").trim()
+                        val kind = data.optString("kind").trim()
+                        val title = data.optString("title").trim()
+                        val genType = data.optString("generatedPlaylistType").trim().lowercase()
+                        if (uid.isNotBlank() && kind.isNotBlank() && title.isNotBlank()) {
+                            refs.add(PlaylistRef(uid, kind, title, genType))
                         }
                     }
                 }
-                collected
+                if (refs.isEmpty()) return@withContext emptyResult
+
+                val dailyRef =
+                    refs.firstOrNull { it.genType.contains("day") || it.title.contains("дня", ignoreCase = true) }
+                        ?: refs.first()
+                val premiereRef =
+                    refs.firstOrNull {
+                        it != dailyRef &&
+                            (
+                                it.genType.contains("recent") ||
+                                    it.genType.contains("premiere") ||
+                                    it.genType.contains("new") ||
+                                    it.title.contains("премьер", ignoreCase = true) ||
+                                    it.title.contains("новин", ignoreCase = true)
+                            )
+                    } ?: refs.firstOrNull { it != dailyRef }
+
+                suspend fun loadPlaylistTracks(ref: PlaylistRef?): Pair<String, List<ExternalCatalogTrack>> {
+                    if (ref == null) return "" to emptyList()
+                    val plResp =
+                        CustomHttp.get(
+                            url = "${yandexApiBase()}/users/${ref.uid}/playlists/${ref.kind}",
+                            headers = headers,
+                            timeoutMs = 10_000,
+                        )
+                    if (!plResp.isSuccess) return ref.title to emptyList()
+                    val tracksArr =
+                        JSONObject(plResp.body)
+                            .optJSONObject("result")
+                            ?.optJSONArray("tracks")
+                            ?: return ref.title to emptyList()
+                    val parsed =
+                        buildList {
+                            for (i in 0 until minOf(tracksArr.length(), 24)) {
+                                val trackObj = tracksArr.optJSONObject(i)?.optJSONObject("track") ?: continue
+                                parseYandexTrack(trackObj)?.let(::add)
+                            }
+                        }
+                    return ref.title to parsed
+                }
+
+                coroutineScope {
+                    val dailyTask = async { loadPlaylistTracks(dailyRef) }
+                    val premTask = async { loadPlaylistTracks(premiereRef) }
+                    val d = dailyTask.await()
+                    val p = premTask.await()
+                    (d.first.ifBlank { "Плейлист дня" } to d.second) to
+                        (p.first.ifBlank { "Премьера" } to p.second)
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                emptyList()
+                emptyResult
             }
+        }
+
+    /**
+     * Загружает 3 отдельные полки для вкладки VK с паузой 400 мс (без риска VK #6).
+     */
+    private suspend fun fetchVkHomeBundle(): Triple<List<ExternalCatalogTrack>, List<ExternalCatalogTrack>, List<ExternalCatalogTrack>> =
+        withContext(Dispatchers.IO) {
+            val token = sanitizeVkToken(configStore.current.vkToken)
+            if (token.isBlank()) return@withContext Triple(emptyList(), emptyList(), emptyList())
+            val encodedToken = CustomHttp.urlEncode(token)
+
+            suspend fun callVk(urls: List<Pair<String, String>>): List<ExternalCatalogTrack> {
+                for ((url, ua) in urls) {
+                    val found =
+                        try {
+                            val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to ua), timeoutMs = 10_000)
+                            if (!resp.isSuccess) {
+                                emptyList()
+                            } else {
+                                val root = JSONObject(resp.body)
+                                if (root.has("error")) {
+                                    emptyList()
+                                } else {
+                                    val respObj = root.optJSONObject("response")
+                                    val arr =
+                                        respObj?.optJSONArray("items")
+                                            ?: respObj?.optJSONArray("audios")
+                                            ?: root.optJSONArray("response")
+                                    parseVkAudioArray(arr, rejectUnavailableUrl = true).take(24)
+                                }
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
+                    if (found.isNotEmpty()) return found
+                }
+                return emptyList()
+            }
+
+            val recs =
+                callVk(
+                    listOf(
+                        "${vkApiBase()}/audio.getRecommendations?count=24&shuffle=1&access_token=$encodedToken&v=5.95" to KATE_CLASSIC_UA,
+                        "${vkApiBase()}/audio.getRecommendations?count=24&shuffle=1&access_token=$encodedToken&v=5.131" to KATE_CLASSIC_UA,
+                        "${vkApiBase()}/audio.getRecommendations?count=24&shuffle=1&access_token=$encodedToken&v=5.95" to KATE_MODERN_UA,
+                    ),
+                )
+            delay(400L)
+            val popular =
+                callVk(
+                    listOf(
+                        "${vkApiBase()}/audio.getPopular?count=24&access_token=$encodedToken&v=5.95" to KATE_CLASSIC_UA,
+                        "${vkApiBase()}/audio.getPopular?count=24&access_token=$encodedToken&v=5.131" to KATE_CLASSIC_UA,
+                        "${vkApiBase()}/audio.getPopular?count=24&access_token=$encodedToken&v=5.95" to KATE_MODERN_UA,
+                    ),
+                )
+            delay(400L)
+            val myMusic =
+                callVk(
+                    listOf(
+                        "${vkApiBase()}/audio.get?count=24&offset=0&access_token=$encodedToken&v=5.95" to KATE_CLASSIC_UA,
+                        "${vkApiBase()}/audio.get?count=24&offset=0&access_token=$encodedToken&v=5.131" to KATE_CLASSIC_UA,
+                        "${vkApiBase()}/audio.get?count=24&offset=0&access_token=$encodedToken&v=5.95" to KATE_MODERN_UA,
+                    ),
+                )
+            Triple(recs, popular, myMusic)
         }
 
     suspend fun searchYandexTracks(
@@ -314,11 +449,9 @@ class CustomCatalogProvider(
             val encodedToken = CustomHttp.urlEncode(token)
             val attempts =
                 listOf(
+                    "${vkApiBase()}/audio.search?q=$encodedQuery&count=$limit&sort=2&auto_complete=1&lang=ru&access_token=$encodedToken&v=5.95" to KATE_CLASSIC_UA,
+                    "${vkApiBase()}/audio.search?q=$encodedQuery&count=$limit&sort=2&auto_complete=1&lang=ru&access_token=$encodedToken&v=5.131" to KATE_CLASSIC_UA,
                     "${vkApiBase()}/catalog.getAudioSearch?query=$encodedQuery&need_blocks=1&lang=ru&access_token=$encodedToken&v=5.131" to VK_ANDROID_UA,
-                    "${vkApiBase()}/audio.search?q=$encodedQuery&count=$limit&sort=2&auto_complete=1&lang=ru&access_token=$encodedToken&v=5.131" to VK_ANDROID_UA,
-                    "${vkApiBase()}/audio.search?q=$encodedQuery&count=$limit&sort=2&auto_complete=1&lang=ru&access_token=$encodedToken&v=5.95" to VK_ANDROID_UA,
-                    "${vkApiBase()}/catalog.getAudioSearch?query=$encodedQuery&need_blocks=1&lang=ru&access_token=$encodedToken&v=5.131" to KATE_UA,
-                    "${vkApiBase()}/audio.search?q=$encodedQuery&count=$limit&sort=2&auto_complete=1&lang=ru&access_token=$encodedToken&v=5.95" to KATE_UA,
                 )
 
             for ((url, ua) in attempts) {
@@ -342,7 +475,7 @@ class CustomCatalogProvider(
                                 if (respObj == null) {
                                     emptyList()
                                 } else {
-                                    val arr = respObj.optJSONArray("audios") ?: respObj.optJSONArray("items")
+                                    val arr = respObj.optJSONArray("items") ?: respObj.optJSONArray("audios")
                                     parseVkAudioArray(arr, rejectUnavailableUrl = true)
                                         .take(limit)
                                         .map { it.toSongItem() }
@@ -612,84 +745,9 @@ class CustomCatalogProvider(
             }
         }
 
-    suspend fun fetchVkPopular(limit: Int = 24): List<ExternalCatalogTrack> =
-        withContext(Dispatchers.IO) {
-            val token = sanitizeVkToken(configStore.current.vkToken)
-            if (token.isBlank()) return@withContext emptyList()
-            val encodedToken = CustomHttp.urlEncode(token)
-            val safeLimit = limit.coerceIn(1, 50)
-            val attempts =
-                listOf(
-                    "${vkApiBase()}/audio.getPopular?count=$safeLimit&access_token=$encodedToken&v=5.131" to VK_ANDROID_UA,
-                    "${vkApiBase()}/catalog.getAudio?need_blocks=1&access_token=$encodedToken&v=5.131" to VK_ANDROID_UA,
-                    "${vkApiBase()}/audio.getPopular?count=$safeLimit&access_token=$encodedToken&v=5.95" to VK_ANDROID_UA,
-                    "${vkApiBase()}/audio.getPopular?count=$safeLimit&access_token=$encodedToken&v=5.95" to KATE_UA,
-                    "${vkApiBase()}/catalog.getAudio?need_blocks=1&access_token=$encodedToken&v=5.131" to KATE_UA,
-                )
-            fetchFirstVkAudioList(attempts, safeLimit)
-        }
-
-    suspend fun fetchVkRecommendations(limit: Int = 24): List<ExternalCatalogTrack> =
-        withContext(Dispatchers.IO) {
-            val token = sanitizeVkToken(configStore.current.vkToken)
-            if (token.isBlank()) return@withContext emptyList()
-            val encodedToken = CustomHttp.urlEncode(token)
-            val safeLimit = limit.coerceIn(1, 50)
-            val attempts =
-                listOf(
-                    "${vkApiBase()}/audio.getRecommendations?count=$safeLimit&shuffle=1&access_token=$encodedToken&v=5.131" to VK_ANDROID_UA,
-                    "${vkApiBase()}/audio.getRecommendations?count=$safeLimit&shuffle=1&access_token=$encodedToken&v=5.95" to VK_ANDROID_UA,
-                    "${vkApiBase()}/audio.getRecommendations?count=$safeLimit&shuffle=1&access_token=$encodedToken&v=5.131" to KATE_UA,
-                )
-            fetchFirstVkAudioList(attempts, safeLimit)
-        }
-
-    suspend fun fetchVkMyAudio(limit: Int = 24): List<ExternalCatalogTrack> =
-        withContext(Dispatchers.IO) {
-            val token = sanitizeVkToken(configStore.current.vkToken)
-            if (token.isBlank()) return@withContext emptyList()
-            val encodedToken = CustomHttp.urlEncode(token)
-            val safeLimit = limit.coerceIn(1, 50)
-            val attempts =
-                listOf(
-                    "${vkApiBase()}/audio.get?count=$safeLimit&offset=0&access_token=$encodedToken&v=5.131" to VK_ANDROID_UA,
-                    "${vkApiBase()}/audio.get?count=$safeLimit&offset=0&access_token=$encodedToken&v=5.95" to VK_ANDROID_UA,
-                    "${vkApiBase()}/audio.get?count=$safeLimit&offset=0&access_token=$encodedToken&v=5.131" to KATE_UA,
-                )
-            fetchFirstVkAudioList(attempts, safeLimit)
-        }
-
-    private suspend fun fetchFirstVkAudioList(
-        attempts: List<Pair<String, String>>,
-        safeLimit: Int,
-    ): List<ExternalCatalogTrack> {
-        for ((url, ua) in attempts) {
-            val found =
-                try {
-                    val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to ua), timeoutMs = 10_000)
-                    if (!resp.isSuccess) {
-                        emptyList()
-                    } else {
-                        val root = JSONObject(resp.body)
-                        if (root.has("error")) {
-                            emptyList()
-                        } else {
-                            val respObj = root.optJSONObject("response")
-                            val arr =
-                                respObj?.optJSONArray("items")
-                                    ?: respObj?.optJSONArray("audios")
-                                    ?: root.optJSONArray("response")
-                            parseVkAudioArray(arr, rejectUnavailableUrl = true).take(safeLimit)
-                        }
-                    }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    emptyList()
-                }
-            if (found.isNotEmpty()) return found
-        }
-        return emptyList()
+    suspend fun fetchVkPopular(limit: Int = 25): List<ExternalCatalogTrack> {
+        val (recs, pop, mine) = fetchVkHomeBundle()
+        return (recs.ifEmpty { pop }.ifEmpty { mine }).take(limit)
     }
 
     private suspend fun syncFetchedTracks(
@@ -916,31 +974,25 @@ class CustomCatalogProvider(
     ): List<ExternalCatalogTrack> =
         withContext(Dispatchers.IO) {
             val allTracks = mutableListOf<ExternalCatalogTrack>()
-            val configsToTry =
-                listOf(
-                    "5.131" to VK_ANDROID_UA,
-                    "5.95" to VK_ANDROID_UA,
-                    "5.131" to KATE_UA,
-                    "5.95" to KATE_UA,
-                )
-            var workingConfig: Pair<String, String>? = null
+            val versionsToTry = listOf("5.95", "5.131")
+            var workingVersion: String? = null
             var totalCount = -1
             var offset = 0
             val pageSize = minOf(200, maxTracksCap)
 
             while (offset < maxTracksCap) {
-                val configs = workingConfig?.let { listOf(it) } ?: configsToTry
+                val versions = workingVersion?.let { listOf(it) } ?: versionsToTry
                 var pageItems: List<ExternalCatalogTrack>? = null
                 var lastErr: String? = null
 
-                for ((ver, ua) in configs) {
+                for (ver in versions) {
                     val url =
                         "${vkApiBase()}/audio.get" +
                             "?count=$pageSize" +
                             "&offset=$offset" +
                             "&access_token=${CustomHttp.urlEncode(token)}" +
                             "&v=$ver"
-                    val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to ua), timeoutMs = 12_000)
+                    val resp = CustomHttp.get(url, headers = mapOf("User-Agent" to KATE_CLASSIC_UA), timeoutMs = 12_000)
                     if (!resp.isSuccess) {
                         lastErr = "VK HTTP ${resp.code}"
                         continue
@@ -961,7 +1013,7 @@ class CustomCatalogProvider(
                         continue
                     }
 
-                    workingConfig = ver to ua
+                    workingVersion = ver
                     val respObj = root.optJSONObject("response")
                     if (respObj != null) {
                         if (totalCount < 0) totalCount = respObj.optInt("count", -1)
@@ -1116,13 +1168,15 @@ class CustomCatalogProvider(
     companion object {
         private const val TAG = "CustomCatalog"
         private const val YANDEX_UA = "Yandex-Music-API"
-        private const val VK_ANDROID_UA =
-            "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)"
-        private const val KATE_UA =
+        private const val KATE_CLASSIC_UA =
+            "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)"
+        private const val KATE_MODERN_UA =
             "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
+        private const val VK_ANDROID_UA =
+            "VKAndroidApp/5.52-4543 (Android 5.1.1; SDK 22; x86_64; unknown Android SDK built for x86_64; en; 320x240)"
         private const val HOME_SHELVES_TTL_MS = 3L * 60 * 60 * 1_000L
         private const val BACKGROUND_SCAN_CAP = 200
-        private const val HOME_CACHE_FILE_NAME = "custom_home_snapshot_v2.json"
+        private const val HOME_CACHE_FILE_NAME = "custom_home_snapshot_v1.json"
 
         private val homeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val fallbackDeezerClient by lazy { DeezerReferenceClient() }
@@ -1288,9 +1342,7 @@ class CustomCatalogProvider(
         private fun buildHomeShelvesFromSnapshot(snapshot: HomeCatalogSnapshot): List<HomeShelf> {
             val radarSongs = snapshot.releaseRadar.map { it.toSongItem() }.distinctBy { it.id }
             val chartSongs = snapshot.yandexChart.map { it.toSongItem() }.distinctBy { it.id }
-            val ymNewSongs = snapshot.yandexNewReleases.map { it.toSongItem() }.distinctBy { it.id }
-            val ymFeedSongs = snapshot.yandexFeedTracks.map { it.toSongItem() }.distinctBy { it.id }
-            val vkSongs = (snapshot.vkChart + snapshot.vkRecommendations).map { it.toSongItem() }.distinctBy { it.id }
+            val vkSongs = snapshot.vkChart.map { it.toSongItem() }.distinctBy { it.id }
             val deezerSongs = snapshot.deezerChart.map { it.toSongItem() }.distinctBy { it.id }
 
             return buildList {
@@ -1300,28 +1352,6 @@ class CustomCatalogProvider(
                             key = "custom_release_radar",
                             title = "Радар новинок",
                             items = radarSongs,
-                            style = HomeShelfStyle.CAROUSEL,
-                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
-                        ),
-                    )
-                }
-                if (ymFeedSongs.isNotEmpty()) {
-                    add(
-                        HomeShelf(
-                            key = "custom_ym_feed",
-                            title = "Для тебя • Я.Музыка",
-                            items = ymFeedSongs,
-                            style = HomeShelfStyle.CAROUSEL,
-                            headerAction = HomeShelfHeaderAction.PLAY_ALL,
-                        ),
-                    )
-                }
-                if (ymNewSongs.isNotEmpty()) {
-                    add(
-                        HomeShelf(
-                            key = "custom_ym_new",
-                            title = "Новые релизы • Я.Музыка",
-                            items = ymNewSongs,
                             style = HomeShelfStyle.CAROUSEL,
                             headerAction = HomeShelfHeaderAction.PLAY_ALL,
                         ),
@@ -1377,10 +1407,13 @@ class CustomCatalogProvider(
                         .put("updatedAtMs", snapshot.updatedAtMs)
                         .put("yandexChart", serializeTrackList(snapshot.yandexChart))
                         .put("yandexNewReleases", serializeTrackList(snapshot.yandexNewReleases))
-                        .put("yandexFeedTracks", serializeTrackList(snapshot.yandexFeedTracks))
+                        .put("yandexDailyTitle", snapshot.yandexDailyTitle)
+                        .put("yandexDailyTracks", serializeTrackList(snapshot.yandexDailyTracks))
+                        .put("yandexPremiereTitle", snapshot.yandexPremiereTitle)
+                        .put("yandexPremiereTracks", serializeTrackList(snapshot.yandexPremiereTracks))
                         .put("vkChart", serializeTrackList(snapshot.vkChart))
-                        .put("vkRecommendations", serializeTrackList(snapshot.vkRecommendations))
-                        .put("vkMyAudio", serializeTrackList(snapshot.vkMyAudio))
+                        .put("vkPopular", serializeTrackList(snapshot.vkPopular))
+                        .put("vkMyMusic", serializeTrackList(snapshot.vkMyMusic))
                         .put("deezerChart", serializeTrackList(snapshot.deezerChart))
                         .put("releaseRadar", serializeTrackList(snapshot.releaseRadar))
                 val tmp = File(file.parentFile, "$HOME_CACHE_FILE_NAME.tmp")
@@ -1401,10 +1434,13 @@ class CustomCatalogProvider(
                 HomeCatalogSnapshot(
                     yandexChart = parseTrackList(root.optJSONArray("yandexChart")),
                     yandexNewReleases = parseTrackList(root.optJSONArray("yandexNewReleases")),
-                    yandexFeedTracks = parseTrackList(root.optJSONArray("yandexFeedTracks")),
+                    yandexDailyTitle = root.optString("yandexDailyTitle", "Плейлист дня").ifBlank { "Плейлист дня" },
+                    yandexDailyTracks = parseTrackList(root.optJSONArray("yandexDailyTracks")),
+                    yandexPremiereTitle = root.optString("yandexPremiereTitle", "Премьера").ifBlank { "Премьера" },
+                    yandexPremiereTracks = parseTrackList(root.optJSONArray("yandexPremiereTracks")),
                     vkChart = parseTrackList(root.optJSONArray("vkChart")),
-                    vkRecommendations = parseTrackList(root.optJSONArray("vkRecommendations")),
-                    vkMyAudio = parseTrackList(root.optJSONArray("vkMyAudio")),
+                    vkPopular = parseTrackList(root.optJSONArray("vkPopular")),
+                    vkMyMusic = parseTrackList(root.optJSONArray("vkMyMusic")),
                     deezerChart = parseTrackList(root.optJSONArray("deezerChart")),
                     releaseRadar = parseTrackList(root.optJSONArray("releaseRadar")),
                     updatedAtMs = root.optLong("updatedAtMs", 0L),
