@@ -29,6 +29,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Rating
+import androidx.media3.common.ThumbRating
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
@@ -262,6 +263,8 @@ class MusicService :
         private const val MUSIC_VIDEO_TAG = "MusicVideo"
         const val ACTION_OPEN_PLAYER = "action_open_player"
         const val ACTION_REFRESH_AUTOMOTIVE_LIBRARY = "action_refresh_automotive_library"
+        private const val ACTION_DISLIKE_WAVE = "com.metrolist.android.ACTION_DISLIKE_WAVE"
+        private val CommandDislikeWave = SessionCommand(ACTION_DISLIKE_WAVE, Bundle.EMPTY)
         private const val HEALTHY_PLAYBACK_THRESHOLD_MS = 30_000L
         private const val MAX_HEALTHY_REQUEST_HISTORY = 64
         private const val MAX_CONSECUTIVE_FAILURE_SKIPS = 3
@@ -306,25 +309,31 @@ class MusicService :
     private val automotiveRootBrowsableOnly = ConcurrentHashMap<MediaSession.ControllerInfo, Boolean>()
     private val automotivePlaybackRequestGate =
         AutomotivePlaybackRequestGate { songs, startIndex, queueTitle, shuffleModeEnabled, playlistPage, replacement ->
+            val isWaveQueue = queueTitle?.startsWith("Моя волна") == true
+            val finiteQueue = !isWaveQueue
             val shuffleEnabled =
-                newQueueShuffleEnabled(
-                    requestedShuffle = shuffleModeEnabled,
-                    currentShuffle = if (player.songQueue.value.isEmpty()) _shuffleModeEnabled.value else player.isShuffleEnabled,
-                    persistentShuffle = Settings.shared.persistentShuffleAcrossQueues,
-                )
+                if (isWaveQueue) {
+                    false
+                } else {
+                    newQueueShuffleEnabled(
+                        requestedShuffle = shuffleModeEnabled,
+                        currentShuffle = if (player.songQueue.value.isEmpty()) _shuffleModeEnabled.value else player.isShuffleEnabled,
+                        persistentShuffle = Settings.shared.persistentShuffleAcrossQueues,
+                    )
+                }
             if (!AndroidDeviceConnect.intercept(
                     DcPlaybackCommand(
                         DcPlaybackAction.REPLACE_QUEUE,
                         songs = songs,
                         index = startIndex,
                         title = queueTitle,
-                        finite = true,
+                        finite = finiteQueue,
                         enabled = shuffleEnabled,
                         preserveHistory = shuffleModeEnabled != true,
                     ),
                 )
             ) {
-                queueCoordinator.replaceQueueSession(songs, startIndex, queueTitle, finite = true, playlistPage = playlistPage) {
+                queueCoordinator.replaceQueueSession(songs, startIndex, queueTitle, finite = finiteQueue, playlistPage = playlistPage) {
                     replacement()
                     if (shuffleEnabled) player.toggleShuffle(preserveHistory = shuffleModeEnabled != true)
                     _shuffleModeEnabled.value = player.isShuffleEnabled
@@ -933,7 +942,12 @@ class MusicService :
                     ),
                 ).setSessionActivity(sessionActivityPendingIntent)
                 .setMediaButtonPreferences(
-                    ImmutableList.of(createLikeButton(), createRepeatButton(), createShuffleButton()),
+                    ImmutableList.of(
+                        createLikeButton(),
+                        createDislikeButton(prioritizeInWave = false),
+                        createRepeatButton(),
+                        createShuffleButton(),
+                    ),
                 ).build()
                 .also(::addSession)
 
@@ -946,20 +960,43 @@ class MusicService :
         serviceScope.launch {
             (application as App).startup.await()
             val startRadioLabel = getString(SharedRes.string.sharedStartRadio)
-            combine(player.currentSong, SongLikeState.likedSongsFlow, _repeatMode, _shuffleModeEnabled) { song, _, repeatMode, shuffle ->
-                listOf(song?.id, song?.id?.let(SongLikeState::isLiked), repeatMode, shuffle)
+            combine(
+                player.currentSong,
+                SongLikeState.likedSongsFlow,
+                _repeatMode,
+                _shuffleModeEnabled,
+                queueTitle,
+            ) { song, _, repeatMode, shuffle, title ->
+                listOf(
+                    song?.id,
+                    song?.id?.let(SongLikeState::isLiked),
+                    repeatMode,
+                    shuffle,
+                    title?.startsWith("Моя волна") == true,
+                )
             }.distinctUntilChanged().collect {
-                mediaSession?.setMediaButtonPreferences(
-                    ImmutableList.copyOf(
+                val inWave = queueCoordinator.isMyWaveQueue()
+                val buttons =
+                    if (inWave) {
                         listOf(
                             createLikeButton(),
+                            createDislikeButton(prioritizeInWave = true),
                             createRepeatButton(),
                             createShuffleButton(),
                             createRadioButton(startRadioLabel),
                             createAddToPlaylistButton(),
-                        ),
-                    ),
-                )
+                        )
+                    } else {
+                        listOf(
+                            createLikeButton(),
+                            createRepeatButton(),
+                            createDislikeButton(prioritizeInWave = false),
+                            createShuffleButton(),
+                            createRadioButton(startRadioLabel),
+                            createAddToPlaylistButton(),
+                        )
+                    }
+                mediaSession?.setMediaButtonPreferences(ImmutableList.copyOf(buttons))
             }
         }
     }
@@ -2250,6 +2287,20 @@ class MusicService :
             .build()
     }
 
+    private fun createDislikeButton(prioritizeInWave: Boolean): CommandButton =
+        CommandButton
+            .Builder(CommandButton.ICON_THUMB_DOWN_UNFILLED)
+            .setDisplayName("Не нравится")
+            .setSessionCommand(CommandDislikeWave)
+            .apply {
+                if (prioritizeInWave) {
+                    setSlots(CommandButton.SLOT_FORWARD_SECONDARY, CommandButton.SLOT_OVERFLOW)
+                } else {
+                    setSlots(CommandButton.SLOT_OVERFLOW)
+                }
+            }.setEnabled(player.currentSong.value != null)
+            .build()
+
     private fun createShuffleButton(): CommandButton =
         CommandButton
             .Builder(if (_shuffleModeEnabled.value) CommandButton.ICON_SHUFFLE_ON else CommandButton.ICON_SHUFFLE_OFF)
@@ -2414,6 +2465,17 @@ class MusicService :
         } else {
             CustomMediaCacheManager.removeLikedDownload(song.id)
         }
+        updateWidgetsNow()
+    }
+
+    private fun dislikeCurrentSong() {
+        val song = player.currentSong.value ?: return
+        AiWaveEngine.sharedInstance?.recordDislike(song)
+        if (SongLikeState.isLiked(song.id)) {
+            SongLikeState.toggleLike(song)
+            CustomMediaCacheManager.removeLikedDownload(song.id)
+        }
+        player.skipToNext(resumePlayback = true)
         updateWidgetsNow()
     }
 
@@ -3025,13 +3087,24 @@ class MusicService :
                 PlaybackNetworkStateStore.current.connected,
                 offlineAvailability(),
             )?.songs.orEmpty()
+        val loweredVoice = request.matchQuery.trim().lowercase()
+        val resolvedQueueTitle =
+            if (loweredVoice.isBlank() ||
+                loweredVoice.contains("моя волна") ||
+                loweredVoice.contains("мою волну") ||
+                loweredVoice.contains("my wave")
+            ) {
+                "Моя волна"
+            } else {
+                request.matchQuery.takeIf(String::isNotBlank)
+            }
         return automotivePlaybackRequestGate
             .resolve(
                 generation,
                 songs.map(automotiveLibrary::playableItem),
                 0,
                 C.TIME_UNSET,
-                queueTitle = request.matchQuery.takeIf(String::isNotBlank),
+                queueTitle = resolvedQueueTitle,
                 playlistPage = voiceQueue.playlistPage,
                 shuffleModeEnabled = false,
                 canApply = !AndroidListenTogetherManager.isGuestPlaybackLocked,
@@ -3180,6 +3253,7 @@ class MusicService :
                 if (authorized) {
                     commands.add(SessionCommand.COMMAND_CODE_SESSION_SET_RATING)
                     commands.add(MediaSessionConstants.CommandToggleLike)
+                    commands.add(CommandDislikeWave)
                     commands.add(MediaSessionConstants.CommandToggleShuffle)
                     commands.add(MediaSessionConstants.CommandToggleRepeat)
                     commands.add(MediaSessionConstants.CommandToggleStartRadio)
@@ -3201,6 +3275,7 @@ class MusicService :
                 MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
                     .buildUpon()
                     .add(MediaSessionConstants.CommandToggleLike)
+                    .add(CommandDislikeWave)
                     .add(MediaSessionConstants.CommandToggleRepeat)
                     .add(MediaSessionConstants.CommandToggleShuffle)
                     .add(MediaSessionConstants.CommandToggleStartRadio)
@@ -3275,6 +3350,21 @@ class MusicService :
             song: SongItem?,
             rating: Rating,
         ): ListenableFuture<SessionResult> {
+            if (song != null && rating is ThumbRating && rating.isRated && !rating.isThumbsUp) {
+                if (AndroidListenTogetherManager.isGuestPlaybackLocked) {
+                    return Futures.immediateFuture(SessionResult(SessionError.ERROR_PERMISSION_DENIED))
+                }
+                AiWaveEngine.sharedInstance?.recordDislike(song)
+                if (SongLikeState.isLiked(song.id)) {
+                    SongLikeState.toggleLike(song)
+                    CustomMediaCacheManager.removeLikedDownload(song.id)
+                }
+                if (song.id == player.currentSong.value?.id) {
+                    player.skipToNext(resumePlayback = true)
+                }
+                updateWidgetsNow()
+                return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            }
             val result = setMediaSessionRating(song, rating)
             if (result == SessionResult.RESULT_SUCCESS) updateWidgetsNow()
             return Futures.immediateFuture(SessionResult(result))
@@ -3321,6 +3411,13 @@ class MusicService :
 
                 MediaSessionConstants.ACTION_TOGGLE_LIKE -> {
                     toggleFavorite()
+                }
+
+                ACTION_DISLIKE_WAVE -> {
+                    if (AndroidListenTogetherManager.isGuestPlaybackLocked) {
+                        return Futures.immediateFuture(SessionResult(SessionError.ERROR_PERMISSION_DENIED))
+                    }
+                    dislikeCurrentSong()
                 }
 
                 MediaSessionConstants.ACTION_TOGGLE_REPEAT -> {
