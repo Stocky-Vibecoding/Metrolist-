@@ -22,6 +22,10 @@ import androidx.core.content.edit
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import com.metrolist.android.backup.BackupRestoreManager
+import com.metrolist.android.custom.CustomAuthWebViewHelper
+import com.metrolist.android.custom.CustomCatalogProvider
+import com.metrolist.android.custom.CustomMediaCacheManager
+import com.metrolist.android.custom.ExternalCatalogTrack
 import com.metrolist.android.deviceconnect.AndroidDeviceConnect
 import com.metrolist.android.di.appModule
 import com.metrolist.android.locale.AppLocale
@@ -50,6 +54,7 @@ import com.metrolist.android.widget.RecognizerWidgets
 import com.metrolist.android.widget.TurntableWidgetReceiver
 import com.metrolist.shared.api.lastfm.LastFM
 import com.metrolist.shared.api.lastfm.LastFmGalleryBrowser
+import com.metrolist.shared.api.playlistSongs
 import com.metrolist.shared.auth.AuthManager
 import com.metrolist.shared.db.MusicDatabase
 import com.metrolist.shared.db.checkAndroidDatabaseVersion
@@ -61,6 +66,7 @@ import com.metrolist.shared.listentogether.network.isAllowedListenTogetherServer
 import com.metrolist.shared.settings.BlockedContent
 import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.state.GlobalYouTube
+import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.state.SongMetadataState
 import com.metrolist.shared.state.coreModule
@@ -248,6 +254,56 @@ class App :
             modules(coreModule, sharedModule, appModule)
         }
         Timber.tag(TAG).d("Koin init complete elapsed=%dms", SystemClock.elapsedRealtime() - koinStart)
+
+        // Ранняя инициализация нашего 4 ГБ кэша, дискового кэша Главной и хуков WebView/YouTube/Last.fm
+        CustomMediaCacheManager.init(applicationContext)
+        CustomCatalogProvider.initDiskCache(applicationContext)
+        CustomAuthWebViewHelper.registerContext(applicationContext)
+        CustomCatalogProvider.externalYouTubeLikesFetcher = {
+            val songs =
+                GlobalYouTubeRepository.instance
+                    .getPlaylist(
+                        playlistId = "LM",
+                        applyContentFilters = false,
+                        allowOfflineFallback = false,
+                    ).playlistSongs()
+            songs.map { song ->
+                ExternalCatalogTrack(
+                    source = "youtube",
+                    externalId = song.id,
+                    artist = song.artists.joinToString(", ") { it.name }.trim(),
+                    title = song.title,
+                    durationSec = song.duration,
+                    coverUrl = song.thumbnail,
+                    isExplicit = song.isExplicit,
+                )
+            }
+        }
+        MusicService.offlineScrobbleSender = { pending ->
+            val sessionKey =
+                Settings.shared.lastFmSession
+                    .takeIf {
+                        it.isNotBlank() &&
+                            Settings.shared.lastFmEnabled &&
+                            Settings.shared.lastFmActivityEnabled &&
+                            !Settings.shared.lastFmSessionExpired
+                    }
+            if (sessionKey == null) {
+                false
+            } else {
+                LastFM
+                    .scrobble(
+                        GlobalYouTube.client,
+                        pending.artist,
+                        pending.title,
+                        pending.timestampSec,
+                        pending.album,
+                        pending.artist,
+                        pending.durationSec,
+                        sessionKey,
+                    ).isSuccess
+            }
+        }
 
         get<CoroutineScope>().launch(Dispatchers.Main.immediate) {
             observeDiscordInitialization {
