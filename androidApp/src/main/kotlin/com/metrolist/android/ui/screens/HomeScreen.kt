@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -117,10 +116,12 @@ import com.metrolist.shared.ui.screens.homeContentText
 import com.metrolist.shared.ui.tv.RequestTvFocus
 import com.metrolist.shared.ui.tv.tvFocusHighlight
 import com.metrolist.shared.youtube.playback.PlaybackNetworkStateStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 import org.jetbrains.compose.resources.stringResource
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
@@ -180,32 +181,71 @@ fun HomeScreen(
     val snapshot by CustomCatalogProvider.homeSnapshot.collectAsState()
     val isOffline = !networkState.connected
 
+    var refreshedLegacySnapshot by rememberSaveable { mutableStateOf(false) }
+
     LaunchedEffect(context) {
         CustomCatalogProvider.initDiskCache(context.applicationContext)
         CustomHomeShelvesBridge.requestLoad(force = false)
     }
 
+    // Если на диске лежал старый снимок без новых полок — разово подгружаем свежий
+    LaunchedEffect(snapshot.updatedAtMs, isOffline) {
+        if (!isOffline && !refreshedLegacySnapshot && snapshot.updatedAtMs > 0L && snapshot.yandexNewReleases.isEmpty()) {
+            refreshedLegacySnapshot = true
+            CustomHomeShelvesBridge.requestLoad(force = true)
+        }
+    }
+
     var selectedSource by rememberSaveable { mutableStateOf(HomeSourceTab.YANDEX) }
+    var offlineCachedSongs by remember { mutableStateOf<List<SongItem>>(emptyList()) }
+
+    LaunchedEffect(isOffline, customCacheStats.waveCacheCount, customCacheStats.likedDownloadsCount) {
+        offlineCachedSongs =
+            if (isOffline) {
+                withContext(Dispatchers.IO) {
+                    CustomMediaCacheManager.getOfflineCachedSongs(limit = 24)
+                }
+            } else {
+                emptyList()
+            }
+    }
+
+    val offlineCachedSongIds = remember(offlineCachedSongs) { offlineCachedSongs.mapTo(HashSet()) { it.id } }
 
     val isHomeItemEnabled: (YTItem) -> Boolean = { item ->
         !isOffline ||
             item.isAvailableOffline(cachedSongIds) ||
-            (item is SongItem && CustomMediaCacheManager.hasLocalFile(item.id))
+            (item is SongItem && (item.id in offlineCachedSongIds || CustomMediaCacheManager.hasLocalFile(item.id)))
     }
 
-    val offlineCachedSongs =
-        remember(isOffline, customCacheStats.waveCacheCount, customCacheStats.likedDownloadsCount) {
-            if (isOffline) CustomMediaCacheManager.getOfflineCachedSongs(limit = 24) else emptyList()
-        }
+    val yandexChartSongs = remember(snapshot.yandexChart) { snapshot.yandexChart.map { it.toSongItem() }.distinctBy { it.id } }
+    val yandexNewSongs = remember(snapshot.yandexNewReleases) { snapshot.yandexNewReleases.map { it.toSongItem() }.distinctBy { it.id } }
+    val yandexDailySongs = remember(snapshot.yandexDailyTracks) { snapshot.yandexDailyTracks.map { it.toSongItem() }.distinctBy { it.id } }
+    val yandexPremiereSongs = remember(snapshot.yandexPremiereTracks) { snapshot.yandexPremiereTracks.map { it.toSongItem() }.distinctBy { it.id } }
 
-    val yandexSongs = remember(snapshot.yandexChart) { snapshot.yandexChart.map { it.toSongItem() }.distinctBy { it.id } }
-    val vkSongs = remember(snapshot.vkChart) { snapshot.vkChart.map { it.toSongItem() }.distinctBy { it.id } }
+    val vkRecSongs = remember(snapshot.vkChart) { snapshot.vkChart.map { it.toSongItem() }.distinctBy { it.id } }
+    val vkPopSongs = remember(snapshot.vkPopular) { snapshot.vkPopular.map { it.toSongItem() }.distinctBy { it.id } }
+    val vkMySongs = remember(snapshot.vkMyMusic) { snapshot.vkMyMusic.map { it.toSongItem() }.distinctBy { it.id } }
+
     val deezerSongs = remember(snapshot.deezerChart) { snapshot.deezerChart.map { it.toSongItem() }.distinctBy { it.id } }
     val radarSongs = remember(snapshot.releaseRadar) { snapshot.releaseRadar.map { it.toSongItem() }.distinctBy { it.id } }
 
-    // Для Яндекс / VK / Deezer собираем стоковые полки HomeShelf (карусели + 4-строчные сетки)
     val customSourceShelves: List<HomeShelf>? =
-        remember(selectedSource, yandexSongs, vkSongs, deezerSongs, radarSongs, offlineCachedSongs) {
+        remember(
+            selectedSource,
+            yandexChartSongs,
+            yandexNewSongs,
+            yandexDailySongs,
+            yandexPremiereSongs,
+            snapshot.yandexDailyTitle,
+            snapshot.yandexPremiereTitle,
+            vkRecSongs,
+            vkPopSongs,
+            vkMySongs,
+            deezerSongs,
+            radarSongs,
+            offlineCachedSongs,
+        ) {
             when (selectedSource) {
                 HomeSourceTab.YOUTUBE -> null
 
@@ -222,12 +262,49 @@ fun HomeScreen(
                                 ),
                             )
                         }
-                        if (yandexSongs.isNotEmpty()) {
+                        if (yandexChartSongs.isNotEmpty()) {
                             add(
                                 HomeShelf(
                                     key = "ym_chart_grid",
                                     title = "Чарт Я.Музыки",
-                                    items = yandexSongs,
+                                    items = yandexChartSongs,
+                                    style = HomeShelfStyle.SONG_GRID,
+                                    headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                                    rows = 4,
+                                    compactRows = true,
+                                ),
+                            )
+                        }
+                        if (yandexDailySongs.isNotEmpty()) {
+                            add(
+                                HomeShelf(
+                                    key = "ym_daily_grid",
+                                    title = snapshot.yandexDailyTitle,
+                                    items = yandexDailySongs,
+                                    style = HomeShelfStyle.SONG_GRID,
+                                    headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                                    rows = 4,
+                                    compactRows = true,
+                                ),
+                            )
+                        }
+                        if (yandexNewSongs.isNotEmpty()) {
+                            add(
+                                HomeShelf(
+                                    key = "ym_new_releases_carousel",
+                                    title = "Новые релизы Я.Музыки",
+                                    items = yandexNewSongs,
+                                    style = HomeShelfStyle.CAROUSEL,
+                                    headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                                ),
+                            )
+                        }
+                        if (yandexPremiereSongs.isNotEmpty()) {
+                            add(
+                                HomeShelf(
+                                    key = "ym_premiere_grid",
+                                    title = snapshot.yandexPremiereTitle,
+                                    items = yandexPremiereSongs,
                                     style = HomeShelfStyle.SONG_GRID,
                                     headerAction = HomeShelfHeaderAction.PLAY_ALL,
                                     rows = 4,
@@ -261,16 +338,40 @@ fun HomeScreen(
                                 ),
                             )
                         }
-                        if (vkSongs.isNotEmpty()) {
+                        if (vkRecSongs.isNotEmpty()) {
                             add(
                                 HomeShelf(
-                                    key = "vk_chart_grid",
-                                    title = "Чарт и рекомендации VK",
-                                    items = vkSongs,
+                                    key = "vk_recs_grid",
+                                    title = "Рекомендации VK",
+                                    items = vkRecSongs,
                                     style = HomeShelfStyle.SONG_GRID,
                                     headerAction = HomeShelfHeaderAction.PLAY_ALL,
                                     rows = 4,
                                     compactRows = true,
+                                ),
+                            )
+                        }
+                        if (vkPopSongs.isNotEmpty()) {
+                            add(
+                                HomeShelf(
+                                    key = "vk_popular_grid",
+                                    title = "Популярное VK",
+                                    items = vkPopSongs,
+                                    style = HomeShelfStyle.SONG_GRID,
+                                    headerAction = HomeShelfHeaderAction.PLAY_ALL,
+                                    rows = 4,
+                                    compactRows = true,
+                                ),
+                            )
+                        }
+                        if (vkMySongs.isNotEmpty()) {
+                            add(
+                                HomeShelf(
+                                    key = "vk_my_music_carousel",
+                                    title = "Моя музыка VK",
+                                    items = vkMySongs,
+                                    style = HomeShelfStyle.CAROUSEL,
+                                    headerAction = HomeShelfHeaderAction.PLAY_ALL,
                                 ),
                             )
                         }
@@ -484,7 +585,6 @@ fun HomeScreen(
                     }
                 }
 
-                // Вкладки источников: Яндекс / VK / Deezer / YouTube
                 item(key = "home_source_tabs") {
                     LazyRow(
                         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
@@ -554,7 +654,8 @@ fun HomeScreen(
                                         text =
                                             when {
                                                 isOffline -> "Нет сети — чарт обновится при подключении"
-                                                selectedSource == HomeSourceTab.VK -> "Войди в ВК в настройках волны, чтобы видеть чарт VK"
+                                                selectedSource == HomeSourceTab.VK ->
+                                                    "Войди в ВК в Настройках → Источники и ИИ-движок, чтобы видеть рекомендации и чарт VK"
                                                 else -> "Чарт пока не загружен"
                                             },
                                         style = MaterialTheme.typography.bodyMedium,
