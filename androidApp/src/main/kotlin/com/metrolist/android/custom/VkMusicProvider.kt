@@ -65,8 +65,9 @@ class VkMusicProvider(
         }
 
         val notes = mutableListOf<String>()
+        var allUnknownMethod = true
         for ((index, profile) in CLIENT_PROFILES.withIndex()) {
-            if (index > 0) delay(700L)
+            if (index > 0) delay(450L)
             val attempt = testSearchProfile(cleanToken, profile)
             if (attempt.isSuccess) {
                 activeProfile = profile
@@ -75,6 +76,7 @@ class VkMusicProvider(
                 return Result.success("ВК аудио работает (${profile.label}/${profile.endpoint.label}, треков: $count)")
             }
             val errMsg = attempt.exceptionOrNull()?.message.orEmpty()
+            if (!errMsg.contains("#3")) allUnknownMethod = false
             if (errMsg.contains("#9")) {
                 floodCooldownUntilMs = System.currentTimeMillis() + FLOOD_COOLDOWN_MS
                 return Result.failure(
@@ -82,9 +84,17 @@ class VkMusicProvider(
                 )
             }
             if (errMsg.contains("#5")) {
-                return Result.failure(IllegalStateException("Токен ВК истёк или невалиден (#5) — нажми «Войти в ВК»"))
+                return Result.failure(IllegalStateException("Токен ВК истёк или невалиден (#5) — нажми «Обновить ВК»"))
             }
             notes.add("${profile.label}/${profile.endpoint.label}: $errMsg")
+        }
+
+        if (allUnknownMethod && notes.isNotEmpty()) {
+            return Result.failure(
+                IllegalStateException(
+                    "Токен без прав аудио (#3 — VK отключил Kate). Нажми «Обновить ВК» и выбери VK Admin или VK Android",
+                ),
+            )
         }
 
         return Result.failure(IllegalStateException("ВК аудио недоступно (${notes.joinToString("; ")})"))
@@ -510,12 +520,10 @@ class VkMusicProvider(
                         (reference.isExplicit && isRuTrack)
                 )
 
-        // Эталонная длительность из Deezer/YTM либо медианная по чистым кандидатам
         val effectiveDurationSec =
             reference.durationSec?.takeIf { it > 30L }
                 ?: inferConsensusDuration(candidates, reference, targetLower)
 
-        // Жёсткий допуск 3 сек при наличии эталона — отсекает ускоренные/замедленные обходы АП с питчем
         val tolerance =
             when {
                 relaxed -> 8L
@@ -529,21 +537,16 @@ class VkMusicProvider(
             .mapNotNull { candidate ->
                 val fullCandLower = "${candidate.artist} ${candidate.title}".lowercase()
 
-                // 1. Жёстко отсекаем цензурные / clean / radio версии
                 if (hasCensoredMarker(fullCandLower, targetLower)) return@mapNotNull null
-
-                // 2. Отсекаем slowed, sped up, pitch, ремиксы, каверы, лайвы, обходы АП
                 if (hasUnwantedVersionTag(fullCandLower, targetLower)) return@mapNotNull null
                 if (!relaxed && hasAntiApPitchMarker(fullCandLower, targetLower)) return@mapNotNull null
 
-                // Убираем позитивные пометки "(без цензуры)" перед сравнением названий
                 val isMarkedUncensored = hasUncensoredMarker(fullCandLower)
                 val cleanTitleForMatch = stripUncensoredMarkers(candidate.title)
                 if (TrackMatcher.hasForbiddenStopWord(reference.title, cleanTitleForMatch)) {
                     return@mapNotNull null
                 }
 
-                // 3. Проверка длительности (отсекает скрытый +5%/-5% питч со сдвигом скорости)
                 if (candidate.durationSec in 1L..35L && (effectiveDurationSec == null || effectiveDurationSec > 50L)) {
                     return@mapNotNull null
                 }
@@ -567,7 +570,6 @@ class VkMusicProvider(
 
                 var bonus = 0
 
-                // Бонус/штраф за точное совпадение длительности (главная защита от питча)
                 if (effectiveDurationSec != null && candidate.durationSec > 0L) {
                     val diff = abs(effectiveDurationSec - candidate.durationSec)
                     bonus +=
@@ -580,20 +582,16 @@ class VkMusicProvider(
                         }
                 }
 
-                // Штраф за обфускацию названия пробелами/символами (типичный признак пиратского питч-обхода АП)
                 if (!targetHasSpacedLetters && SPACED_OBFUSCATION_REGEX.containsMatchIn(fullCandLower)) {
                     bonus -= 24
                 }
                 if (hasAntiApPitchMarker(fullCandLower, targetLower)) {
                     bonus -= 30
                 }
-
-                // Штраф за непонятные приписки в скобках
                 if (hasUnexpectedBracketJunk(candidate.title, reference.title)) {
                     bonus -= 16
                 }
 
-                // Логика выбора: антицензура РФ vs обычный трек
                 if (preferUncensoredUpload) {
                     if (isMarkedUncensored) bonus += 35
                     if (!candidate.isOfficial) {
@@ -609,7 +607,6 @@ class VkMusicProvider(
                     if (reference.isExplicit && candidate.isExplicit) bonus += 10
                 }
 
-                // Небольшой бонус за прямой MP3 вместо HLS
                 if (!candidate.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)) {
                     bonus += 3
                 }
@@ -762,14 +759,13 @@ class VkMusicProvider(
         private const val FLOOD_COOLDOWN_MS = 3 * 60 * 1_000L
         private const val AUTO_REFRESH_COOLDOWN_MS = 30_000L
 
-        /** Вешается встроенным WebView-менеджером для тихого перевыпуска токена при #5. */
         @Volatile
         var onTokenExpiredRefreshHook: (suspend () -> String?)? = null
 
-        private const val KATE_UA =
-            "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
         private const val VK_ANDROID_UA =
             "VKAndroidApp/8.99-23423 (Android 13; SDK 33; arm64-v8a; samsung SM-S918B; ru; 2340x1080)"
+        private const val KATE_UA =
+            "KateMobileAndroid/103.1 lite-545 (Android 13; SDK 33; arm64-v8a; samsung SM-F956B; ru)"
 
         private val MULTI_SPACE_REGEX = Regex("\\s+")
         private val EMPTY_BRACKETS_REGEX = Regex("[(\\[{]\\s*[)\\]}]")
@@ -941,6 +937,24 @@ class VkMusicProvider(
         private val CLIENT_PROFILES =
             listOf(
                 VkClientProfile(
+                    label = "VKApp",
+                    userAgent = VK_ANDROID_UA,
+                    apiVersion = "5.131",
+                    endpoint = VkSearchEndpoint.CATALOG,
+                ),
+                VkClientProfile(
+                    label = "VKApp",
+                    userAgent = VK_ANDROID_UA,
+                    apiVersion = "5.131",
+                    endpoint = VkSearchEndpoint.LEGACY,
+                ),
+                VkClientProfile(
+                    label = "VKApp",
+                    userAgent = VK_ANDROID_UA,
+                    apiVersion = "5.95",
+                    endpoint = VkSearchEndpoint.LEGACY,
+                ),
+                VkClientProfile(
                     label = "Kate",
                     userAgent = KATE_UA,
                     apiVersion = "5.131",
@@ -951,12 +965,6 @@ class VkMusicProvider(
                     userAgent = KATE_UA,
                     apiVersion = "5.95",
                     endpoint = VkSearchEndpoint.LEGACY,
-                ),
-                VkClientProfile(
-                    label = "VKApp",
-                    userAgent = VK_ANDROID_UA,
-                    apiVersion = "5.131",
-                    endpoint = VkSearchEndpoint.CATALOG,
                 ),
             )
     }
