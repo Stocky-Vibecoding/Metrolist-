@@ -317,7 +317,7 @@ android {
         }
         debug {
             applicationIdSuffix = ".debug"
-            manifestPlaceholders["appLabel"] = "Metrolist++ Debug"
+            manifestPlaceholders["appLabel"] = "Metrolist++"
         }
     }
 
