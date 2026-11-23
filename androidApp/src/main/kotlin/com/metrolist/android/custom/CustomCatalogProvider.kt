@@ -25,6 +25,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -32,6 +34,8 @@ import java.io.File
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 data class ExternalCatalogTrack(
     val source: String,
@@ -41,6 +45,8 @@ data class ExternalCatalogTrack(
     val durationSec: Long? = null,
     val coverUrl: String? = null,
     val isExplicit: Boolean = false,
+    val releaseYear: Int? = null,
+    val releaseDateMs: Long? = null,
 ) {
     fun toSongItem(): SongItem {
         val parsedArtists =
@@ -165,6 +171,7 @@ class CustomCatalogProvider(
     suspend fun fetchReleaseRadar(
         limit: Int = 20,
         preloadedYandexNew: List<ExternalCatalogTrack>? = null,
+        maxAgeDays: Int = 90,
     ): List<ExternalCatalogTrack> =
         coroutineScope {
             val topArtists = configStore.getLocalTopArtists(limit = 16)
@@ -179,7 +186,7 @@ class CustomCatalogProvider(
                             async(Dispatchers.IO) {
                                 deezer.fetchArtistRecentReleases(
                                     artistName = artistName,
-                                    maxAgeDays = 60,
+                                    maxAgeDays = maxAgeDays,
                                     limit = 2,
                                 )
                             }
@@ -774,6 +781,11 @@ class CustomCatalogProvider(
                         val artist = parseYandexArtists(obj.optJSONArray("artists"))
                         val cover = formatYandexCover(obj.optString("coverUri"))
                         val explicit = obj.optString("contentWarning").equals("explicit", ignoreCase = true)
+                        val rawDate = obj.optString("releaseDate").trim()
+                        val relYear =
+                            obj.optInt("year", 0).takeIf { it in 1900..2100 }
+                                ?: rawDate.takeIf { it.length >= 4 }?.take(4)?.toIntOrNull()?.takeIf { it in 1900..2100 }
+                        val relDateMs = parseIsoDateMs(rawDate)
                         add(
                             ExternalCatalogTrack(
                                 source = "yandex",
@@ -782,6 +794,8 @@ class CustomCatalogProvider(
                                 title = title,
                                 coverUrl = cover,
                                 isExplicit = explicit,
+                                releaseYear = relYear,
+                                releaseDateMs = relDateMs,
                             ),
                         )
                     }
@@ -1118,6 +1132,7 @@ class CustomCatalogProvider(
         val durationSec = obj.optLong("durationMs", 0L).takeIf { it > 0L }?.div(1000L)
         val cover = formatYandexCover(obj.optString("coverUri"))
         val explicit = obj.optString("contentWarning").equals("explicit", ignoreCase = true)
+        val (relYear, relDateMs) = parseYandexAlbumRelease(obj.optJSONArray("albums"))
         return ExternalCatalogTrack(
             source = "yandex",
             externalId = "ym_$id",
@@ -1126,7 +1141,25 @@ class CustomCatalogProvider(
             durationSec = durationSec,
             coverUrl = cover,
             isExplicit = explicit,
+            releaseYear = relYear,
+            releaseDateMs = relDateMs,
         )
+    }
+
+    private fun parseYandexAlbumRelease(albums: JSONArray?): Pair<Int?, Long?> {
+        val firstAlb = albums?.optJSONObject(0) ?: return null to null
+        val rawDate = firstAlb.optString("releaseDate").trim()
+        val yearFromField = firstAlb.optInt("year", 0).takeIf { it in 1900..2100 }
+        val yearFromDate = rawDate.takeIf { it.length >= 4 }?.take(4)?.toIntOrNull()?.takeIf { it in 1900..2100 }
+        return (yearFromField ?: yearFromDate) to parseIsoDateMs(rawDate)
+    }
+
+    private fun parseIsoDateMs(rawDate: String?): Long? {
+        val clean = rawDate?.trim().orEmpty()
+        if (clean.length < 10) return null
+        return runCatching {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(clean.take(10))?.time
+        }.getOrNull()
     }
 
     private fun parseYandexArtists(arr: JSONArray?): String {
@@ -1225,14 +1258,22 @@ class CustomCatalogProvider(
         private const val WEB_API_RU_HOST = "web.api.vk.ru"
         private const val API_VK_COM_HOST = "api.vk.com"
         private const val HOME_SHELVES_TTL_MS = 3L * 60 * 60 * 1_000L
+        private const val FRESH_POOL_TTL_MS = 2L * 60 * 60 * 1_000L
         private const val BACKGROUND_SCAN_CAP = 200
         private const val HOME_CACHE_FILE_NAME = "custom_home_snapshot_v1.json"
 
         private val homeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val fallbackDeezerClient by lazy { DeezerReferenceClient() }
+        private val freshPoolMutex = Mutex()
 
         private val _homeSnapshot = MutableStateFlow(HomeCatalogSnapshot())
         val homeSnapshot: StateFlow<HomeCatalogSnapshot> = _homeSnapshot.asStateFlow()
+
+        @Volatile
+        private var cachedFreshArtistReleases: List<ExternalCatalogTrack> = emptyList()
+
+        @Volatile
+        private var cachedFreshArtistAtMs: Long = 0L
 
         @Volatile
         var externalYouTubeLikesFetcher: (suspend () -> List<ExternalCatalogTrack>)? = null
@@ -1257,6 +1298,55 @@ class CustomCatalogProvider(
 
         @Volatile
         private var lastSearchedQuery: String = ""
+
+        /**
+         * Возвращает кэшированный пул реальных релизов любимых артистов пользователя за последний год (<= 365 дней)
+         * для подмешивания в свежую квоту волны (25% РУ + 25% зарубежка) и в фильтр «Свежее».
+         */
+        suspend fun getCachedFreshArtistReleases(
+            configStore: CustomConfigStore,
+            maxAgeDays: Int = 365,
+            limit: Int = 24,
+        ): List<ExternalCatalogTrack> {
+            val now = System.currentTimeMillis()
+            if (cachedFreshArtistReleases.isNotEmpty() && now - cachedFreshArtistAtMs < FRESH_POOL_TTL_MS) {
+                return cachedFreshArtistReleases.take(limit)
+            }
+            return freshPoolMutex.withLock {
+                val recheckNow = System.currentTimeMillis()
+                if (cachedFreshArtistReleases.isNotEmpty() && recheckNow - cachedFreshArtistAtMs < FRESH_POOL_TTL_MS) {
+                    return@withLock cachedFreshArtistReleases.take(limit)
+                }
+                val topArtists = configStore.getLocalTopArtists(limit = 16)
+                if (topArtists.isEmpty()) return@withLock emptyList()
+                val deezer = HybridStreamResolver.getDeezerClient() ?: fallbackDeezerClient
+                val fetched =
+                    coroutineScope {
+                        topArtists
+                            .take(12)
+                            .chunked(4)
+                            .flatMap { chunk ->
+                                chunk
+                                    .map { artistName ->
+                                        async(Dispatchers.IO) {
+                                            deezer.fetchArtistRecentReleases(
+                                                artistName = artistName,
+                                                maxAgeDays = maxAgeDays,
+                                                limit = 3,
+                                            )
+                                        }
+                                    }.awaitAll()
+                                    .flatten()
+                            }
+                    }.distinctBy { CustomConfigStore.buildTrackKey(it.artist, it.title).ifBlank { it.externalId } }
+
+                if (fetched.isNotEmpty()) {
+                    cachedFreshArtistReleases = fetched
+                    cachedFreshArtistAtMs = System.currentTimeMillis()
+                }
+                fetched.take(limit)
+            }
+        }
 
         fun initDiskCache(appContext: Context) {
             if (homeCacheFile != null) return
@@ -1511,6 +1601,8 @@ class CustomCatalogProvider(
                                 if (t.durationSec != null && t.durationSec > 0L) put("d", t.durationSec)
                                 if (!t.coverUrl.isNullOrBlank()) put("c", t.coverUrl)
                                 if (t.isExplicit) put("e", true)
+                                if (t.releaseYear != null && t.releaseYear > 0) put("y", t.releaseYear)
+                                if (t.releaseDateMs != null && t.releaseDateMs > 0L) put("rd", t.releaseDateMs)
                             },
                     )
                 }
@@ -1532,6 +1624,8 @@ class CustomCatalogProvider(
                             durationSec = o.optLong("d", -1L).takeIf { it > 0L },
                             coverUrl = o.optString("c").takeIf { it.isNotBlank() },
                             isExplicit = o.optBoolean("e", false),
+                            releaseYear = o.optInt("y", -1).takeIf { it in 1900..2100 },
+                            releaseDateMs = o.optLong("rd", -1L).takeIf { it > 0L },
                         ),
                     )
                 }
