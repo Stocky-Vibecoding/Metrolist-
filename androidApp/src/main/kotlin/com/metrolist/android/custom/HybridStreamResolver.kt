@@ -20,7 +20,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,6 +35,7 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 data class ResolverLogEntry(
     val timestampMs: Long,
@@ -83,9 +87,13 @@ object TrackBindingCache {
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val byVideoId = ConcurrentHashMap<String, TrackBinding>()
     private val byTrackKey = ConcurrentHashMap<String, TrackBinding>()
+    private val diskLock = Any()
 
     @Volatile
     private var storageFile: File? = null
+
+    @Volatile
+    private var diskLoaded: Boolean = false
 
     @Volatile
     private var saveJob: Job? = null
@@ -160,56 +168,64 @@ object TrackBindingCache {
         saveJob =
             ioScope.launch {
                 delay(1_500L)
-                saveToDisk(file)
+                if (diskLoaded) {
+                    saveToDisk(file)
+                }
             }
     }
 
     private fun loadFromDisk(file: File) {
-        if (!file.exists()) return
-        runCatching {
-            val root = JSONObject(file.readText(Charsets.UTF_8))
-            root.optJSONObject("byId")?.let { obj ->
-                val keys = obj.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    obj.optJSONObject(k)?.let { parseBinding(it) }?.let { byVideoId[k] = it }
+        synchronized(diskLock) {
+            if (file.exists()) {
+                runCatching {
+                    val root = JSONObject(file.readText(Charsets.UTF_8))
+                    root.optJSONObject("byId")?.let { obj ->
+                        val keys = obj.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            obj.optJSONObject(k)?.let { parseBinding(it) }?.let { byVideoId.putIfAbsent(k, it) }
+                        }
+                    }
+                    root.optJSONObject("byKey")?.let { obj ->
+                        val keys = obj.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            obj.optJSONObject(k)?.let { parseBinding(it) }?.let { byTrackKey.putIfAbsent(k, it) }
+                        }
+                    }
+                }.onFailure { err ->
+                    Log.w(TAG, "Failed to load track bindings: ${err.message}")
                 }
             }
-            root.optJSONObject("byKey")?.let { obj ->
-                val keys = obj.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    obj.optJSONObject(k)?.let { parseBinding(it) }?.let { byTrackKey[k] = it }
-                }
-            }
-        }.onFailure { err ->
-            Log.w(TAG, "Failed to load track bindings: ${err.message}")
+            diskLoaded = true
         }
     }
 
     private fun saveToDisk(file: File) {
-        runCatching {
-            val root = JSONObject()
-            val idObj = JSONObject()
-            byVideoId.entries
-                .sortedByDescending { it.value.updatedAtMs }
-                .take(MAX_ENTRIES)
-                .forEach { (k, v) -> idObj.put(k, serializeBinding(v)) }
-            val keyObj = JSONObject()
-            byTrackKey.entries
-                .sortedByDescending { it.value.updatedAtMs }
-                .take(MAX_ENTRIES)
-                .forEach { (k, v) -> keyObj.put(k, serializeBinding(v)) }
-            root.put("byId", idObj)
-            root.put("byKey", keyObj)
-            val tmp = File(file.parentFile, "$FILE_NAME.tmp")
-            tmp.writeText(root.toString(), Charsets.UTF_8)
-            if (!tmp.renameTo(file)) {
-                tmp.copyTo(file, overwrite = true)
-                tmp.delete()
+        synchronized(diskLock) {
+            runCatching {
+                val root = JSONObject()
+                val idObj = JSONObject()
+                byVideoId.entries
+                    .sortedByDescending { it.value.updatedAtMs }
+                    .take(MAX_ENTRIES)
+                    .forEach { (k, v) -> idObj.put(k, serializeBinding(v)) }
+                val keyObj = JSONObject()
+                byTrackKey.entries
+                    .sortedByDescending { it.value.updatedAtMs }
+                    .take(MAX_ENTRIES)
+                    .forEach { (k, v) -> keyObj.put(k, serializeBinding(v)) }
+                root.put("byId", idObj)
+                root.put("byKey", keyObj)
+                val tmp = File(file.parentFile, "$FILE_NAME.tmp")
+                tmp.writeText(root.toString(), Charsets.UTF_8)
+                if (!tmp.renameTo(file)) {
+                    tmp.copyTo(file, overwrite = true)
+                    tmp.delete()
+                }
+            }.onFailure { err ->
+                Log.w(TAG, "Failed to persist track bindings: ${err.message}")
             }
-        }.onFailure { err ->
-            Log.w(TAG, "Failed to persist track bindings: ${err.message}")
         }
     }
 
@@ -247,6 +263,7 @@ object LastFmOfflineBuffer {
     private const val MAX_ITEMS = 250
 
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val persistChannel = Channel<Unit>(Channel.CONFLATED)
     private val lock = Any()
     private val queue = ArrayList<PendingScrobble>()
 
@@ -259,6 +276,9 @@ object LastFmOfflineBuffer {
         storageFile = file
         ioScope.launch {
             loadFromDisk(file)
+            for (signal in persistChannel) {
+                writeSnapshotToDisk(file)
+            }
         }
     }
 
@@ -271,7 +291,7 @@ object LastFmOfflineBuffer {
                 queue.any {
                     it.artist.equals(scrobble.artist, ignoreCase = true) &&
                         it.title.equals(scrobble.title, ignoreCase = true) &&
-                        kotlin.math.abs(it.timestampSec - scrobble.timestampSec) < 30L
+                        abs(it.timestampSec - scrobble.timestampSec) < 30L
                 }
             if (duplicate) return
             queue.add(scrobble)
@@ -279,7 +299,7 @@ object LastFmOfflineBuffer {
                 queue.removeAt(0)
             }
         }
-        persistAsync()
+        persistChannel.trySend(Unit)
     }
 
     suspend fun flushPending(sender: suspend (PendingScrobble) -> Boolean): Int {
@@ -287,7 +307,14 @@ object LastFmOfflineBuffer {
         if (snapshot.isEmpty()) return 0
         val sent = mutableListOf<PendingScrobble>()
         for (item in snapshot) {
-            val ok = runCatching { sender(item) }.getOrDefault(false)
+            val ok =
+                try {
+                    sender(item)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    false
+                }
             if (ok) {
                 sent.add(item)
             } else {
@@ -298,32 +325,34 @@ object LastFmOfflineBuffer {
             synchronized(lock) {
                 queue.removeAll(sent.toSet())
             }
-            persistAsync()
+            persistChannel.trySend(Unit)
         }
         return sent.size
     }
 
-    private fun persistAsync() {
-        val file = storageFile ?: return
-        ioScope.launch {
-            val snapshot = synchronized(lock) { queue.toList() }
-            runCatching {
-                val arr = JSONArray()
-                snapshot.forEach { s ->
-                    arr.put(
-                        JSONObject()
-                            .put("a", s.artist)
-                            .put("t", s.title)
-                            .apply {
-                                if (!s.album.isNullOrBlank()) put("alb", s.album)
-                                if (s.durationSec != null && s.durationSec > 0L) put("d", s.durationSec)
-                            }.put("ts", s.timestampSec),
-                    )
-                }
-                file.writeText(arr.toString(), Charsets.UTF_8)
-            }.onFailure { err ->
-                Log.w(TAG, "Failed to save offline scrobble queue: ${err.message}")
+    private fun writeSnapshotToDisk(file: File) {
+        val snapshot = synchronized(lock) { queue.toList() }
+        runCatching {
+            val arr = JSONArray()
+            snapshot.forEach { s ->
+                arr.put(
+                    JSONObject()
+                        .put("a", s.artist)
+                        .put("t", s.title)
+                        .apply {
+                            if (!s.album.isNullOrBlank()) put("alb", s.album)
+                            if (s.durationSec != null && s.durationSec > 0L) put("d", s.durationSec)
+                        }.put("ts", s.timestampSec),
+                )
             }
+            val tmp = File(file.parentFile, "$FILE_NAME.tmp")
+            tmp.writeText(arr.toString(), Charsets.UTF_8)
+            if (!tmp.renameTo(file)) {
+                tmp.copyTo(file, overwrite = true)
+                tmp.delete()
+            }
+        }.onFailure { err ->
+            Log.w(TAG, "Failed to save offline scrobble queue: ${err.message}")
         }
     }
 
@@ -332,22 +361,29 @@ object LastFmOfflineBuffer {
         runCatching {
             val arr = JSONArray(file.readText(Charsets.UTF_8))
             synchronized(lock) {
-                queue.clear()
                 for (i in 0 until minOf(arr.length(), MAX_ITEMS)) {
                     val o = arr.optJSONObject(i) ?: continue
                     val artist = o.optString("a").trim()
                     val title = o.optString("t").trim()
                     val ts = o.optLong("ts", 0L)
                     if (artist.isNotBlank() && title.isNotBlank() && ts > 0L) {
-                        queue.add(
-                            PendingScrobble(
-                                artist = artist,
-                                title = title,
-                                album = o.optString("alb").takeIf { it.isNotBlank() },
-                                timestampSec = ts,
-                                durationSec = o.optLong("d", -1L).takeIf { it > 0L },
-                            ),
-                        )
+                        val duplicate =
+                            queue.any {
+                                it.artist.equals(artist, ignoreCase = true) &&
+                                    it.title.equals(title, ignoreCase = true) &&
+                                    abs(it.timestampSec - ts) < 30L
+                            }
+                        if (!duplicate) {
+                            queue.add(
+                                PendingScrobble(
+                                    artist = artist,
+                                    title = title,
+                                    album = o.optString("alb").takeIf { it.isNotBlank() },
+                                    timestampSec = ts,
+                                    durationSec = o.optLong("d", -1L).takeIf { it > 0L },
+                                ),
+                            )
+                        }
                     }
                 }
             }
@@ -370,6 +406,9 @@ object CustomMediaCacheManager {
     private val protectedSafeKeys = ConcurrentHashMap.newKeySet<String>()
     private val networkErrorTimestamps = ArrayDeque<Long>()
     private val networkLock = Any()
+
+    @Volatile
+    private var activePlayingSafeKey: String? = null
 
     @Volatile
     private var preloadQueueJob: Job? = null
@@ -437,10 +476,10 @@ object CustomMediaCacheManager {
     }
 
     fun setProtectedTrackIds(videoIds: Collection<String>) {
+        val next = videoIds.mapNotNull { id -> id.takeIf { it.isNotBlank() }?.let(::safeKey) }.toSet()
         protectedSafeKeys.clear()
-        videoIds.forEach { id ->
-            if (id.isNotBlank()) protectedSafeKeys.add(safeKey(id))
-        }
+        protectedSafeKeys.addAll(next)
+        activePlayingSafeKey?.let { protectedSafeKeys.add(it) }
     }
 
     fun hasLocalFile(videoId: String): Boolean {
@@ -458,6 +497,8 @@ object CustomMediaCacheManager {
     ): Pair<PlaybackResource, String>? {
         if (videoId.isBlank()) return null
         val safe = safeKey(videoId)
+        activePlayingSafeKey = safe
+        protectedSafeKeys.add(safe)
 
         likedDownloadsDir?.let { dir ->
             readEntry(dir, safe, videoId, song)?.let { res ->
@@ -480,6 +521,7 @@ object CustomMediaCacheManager {
         val dir = waveCacheDir ?: return
         if (song.id.isBlank() || song.isLocal || song.isLive || song.isPodcast) return
         val safe = safeKey(song.id)
+        activePlayingSafeKey = safe
         protectedSafeKeys.add(safe)
         if (File(dir, "$safe.audio").exists()) return
         if (likedDownloadsDir?.let { File(it, "$safe.audio").exists() } == true) return
@@ -527,6 +569,7 @@ object CustomMediaCacheManager {
         preloadQueueJob =
             ioScope.launch {
                 for (song in targets) {
+                    currentCoroutineContext().ensureActive()
                     val safe = safeKey(song.id)
                     if (hasLocalFile(song.id)) continue
                     if (!activeDownloads.add("wave::$safe")) continue
@@ -556,11 +599,7 @@ object CustomMediaCacheManager {
         resource: PlaybackResource? = null,
     ) {
         if (song.id.isBlank() || song.isLocal || song.isLive || song.isPodcast) return
-
-        // Сначала дублируем в защищённую приватную папку, чтобы 4 ГБ FIFO никогда не тронул лайк
         cacheLikedTrackDirectly(song, resource)
-
-        // И при наличии системного хука поддерживаем совместимость со скрытым разделом «Скачанные»
         systemDownloadLikeHook?.invoke(song)
     }
 
@@ -584,7 +623,12 @@ object CustomMediaCacheManager {
                     val cachedMeta = File(waveDir, "$safe.json")
                     if (cachedAudio.exists() && cachedAudio.length() > 16_384L) {
                         runCatching {
-                            cachedAudio.copyTo(dstAudio, overwrite = true)
+                            val tmpDst = File(dir, "$safe.tmp")
+                            cachedAudio.copyTo(tmpDst, overwrite = true)
+                            if (!tmpDst.renameTo(dstAudio)) {
+                                tmpDst.copyTo(dstAudio, overwrite = true)
+                                tmpDst.delete()
+                            }
                             if (cachedMeta.exists()) cachedMeta.copyTo(File(dir, "$safe.json"), overwrite = true)
                         }.onSuccess {
                             refreshStats()
@@ -647,12 +691,15 @@ object CustomMediaCacheManager {
                 val explicit = meta.optBoolean("isExplicit", false)
 
                 val parsedArtists =
-                    artistStr
-                        .split(",", "&")
-                        .map { it.trim() }
-                        .filter { it.isNotBlank() }
+                    CustomConfigStore
+                        .splitArtistNames(artistStr)
                         .map { ArtistTiny(id = null, name = it) }
-                        .ifEmpty { listOf(ArtistTiny(id = null, name = "Неизвестный")) }
+                        .ifEmpty {
+                            artistStr
+                                .takeIf { it.isNotBlank() }
+                                ?.let { listOf(ArtistTiny(id = null, name = it)) }
+                                ?: listOf(ArtistTiny(id = null, name = "Неизвестный"))
+                        }
 
                 val song =
                     SongItem(
@@ -752,7 +799,7 @@ object CustomMediaCacheManager {
     ): PlaybackResource? {
         val audioFile = File(dir, "$safe.audio")
         if (!audioFile.exists() || audioFile.length() <= 16_384L) return null
-        // НЕ обновляем lastModified при чтении — сохраняем строгий FIFO (самые первые удаляются первыми)
+        // НЕ обновляем lastModified при чтении — сохраняем строгий FIFO
 
         val metaObj =
             runCatching {
@@ -781,7 +828,7 @@ object CustomMediaCacheManager {
         )
     }
 
-    private fun downloadToDir(
+    private suspend fun downloadToDir(
         dir: File,
         safe: String,
         song: SongItem,
@@ -790,8 +837,9 @@ object CustomMediaCacheManager {
     ): Boolean {
         val tmpFile = File(dir, "$safe.tmp")
         val finalFile = File(dir, "$safe.audio")
+        val metaTmpFile = File(dir, "$safe.json.tmp")
         val metaFile = File(dir, "$safe.json")
-        return runCatching {
+        return try {
             val conn = (URL(resource.url).openConnection() as HttpURLConnection)
             try {
                 conn.requestMethod = "GET"
@@ -801,13 +849,20 @@ object CustomMediaCacheManager {
                 resource.headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
                 if (conn.responseCode !in 200..299) {
                     recordNetworkFailure()
-                    return@runCatching false
+                    return false
                 }
+                val contentType = conn.contentType?.lowercase().orEmpty()
+                if (contentType.startsWith("text/") || contentType.contains("json") || contentType.contains("xml")) {
+                    Log.w(TAG, "Refusing to cache non-audio response ($contentType) for ${song.title}")
+                    return false
+                }
+                val ctx = currentCoroutineContext()
                 conn.inputStream.use { input ->
                     FileOutputStream(tmpFile).use { output ->
                         val buf = ByteArray(16_384)
                         var read = input.read(buf)
                         while (read >= 0) {
+                            ctx.ensureActive()
                             output.write(buf, 0, read)
                             read = input.read(buf)
                         }
@@ -820,7 +875,7 @@ object CustomMediaCacheManager {
 
             if (!tmpFile.exists() || tmpFile.length() <= 16_384L) {
                 tmpFile.delete()
-                return@runCatching false
+                return false
             }
 
             if (finalFile.exists()) finalFile.delete()
@@ -848,15 +903,25 @@ object CustomMediaCacheManager {
                         if (!coverUrl.isNullOrBlank()) put("coverUrl", coverUrl)
                         if (!vibeTag.isNullOrBlank()) put("vibeTag", vibeTag)
                     }
-            metaFile.writeText(meta.toString(), Charsets.UTF_8)
+            metaTmpFile.writeText(meta.toString(), Charsets.UTF_8)
+            if (!metaTmpFile.renameTo(metaFile)) {
+                metaTmpFile.copyTo(metaFile, overwrite = true)
+                metaTmpFile.delete()
+            }
             recordNetworkSuccess()
             Log.d(TAG, "Saved audio to ${dir.name}: ${song.title} (${finalFile.length() / 1024} KB)")
             true
-        }.onFailure { err ->
+        } catch (cancelled: CancellationException) {
             tmpFile.delete()
+            metaTmpFile.delete()
+            throw cancelled
+        } catch (err: Exception) {
+            tmpFile.delete()
+            metaTmpFile.delete()
             recordNetworkFailure()
             Log.w(TAG, "Cache download failed for ${song.title}: ${err.message}")
-        }.getOrDefault(false)
+            false
+        }
     }
 
     /**
@@ -887,18 +952,18 @@ object CustomMediaCacheManager {
         // Первый проход: удаляем только незащищённые старые файлы
         for ((file, safe, _) in sortedOldestFirst) {
             if (total <= maxBytes) break
-            if (safe in protectedSafeKeys) continue
+            if (safe in protectedSafeKeys || safe == activePlayingSafeKey) continue
             val size = file.length()
             file.delete()
             File(dir, "$safe.json").delete()
             total -= size
         }
 
-        // Страховочный проход: если всё равно выше лимита — чистим самые старые
+        // Страховочный проход: если всё равно выше лимита — чистим старые, кроме текущего играющего
         if (total > maxBytes) {
             for ((file, safe, _) in sortedOldestFirst) {
                 if (total <= maxBytes) break
-                if (!file.exists()) continue
+                if (safe == activePlayingSafeKey || !file.exists()) continue
                 val size = file.length()
                 file.delete()
                 File(dir, "$safe.json").delete()
@@ -948,7 +1013,9 @@ object LocalCensorshipAdvisor {
             "кизару",
             "big baby tape",
             "friendly thug",
+            "friendly thug 52 ngg",
             "alblak",
+            "alblak 52",
             "платина",
             "og buda",
             "163onmyneck",
@@ -1007,25 +1074,47 @@ object LocalCensorshipAdvisor {
             "mag luzi",
             "цинк уродов",
             "a v g",
+            "avg",
         )
 
     fun hasCyrillic(text: String): Boolean =
         text.any { ch -> ch in 'а'..'я' || ch in 'А'..'Я' || ch == 'ё' || ch == 'Ё' }
+
+    private fun matchesArtistSet(
+        rawArtist: String,
+        set: Set<String>,
+    ): Boolean {
+        val parts = CustomConfigStore.splitArtistNames(rawArtist)
+        val candidates = if (parts.isNotEmpty()) parts else listOf(rawArtist)
+        for (part in candidates) {
+            val norm = TrackMatcher.normalize(part)
+            if (norm.isBlank()) continue
+            if (norm in set) return true
+            // Подстроку проверяем только для длинных имён (>= 6 символов) по границе слова,
+            // чтобы "atl" не матчил The Beatles, а "face" — Babyface/Scarface
+            if (norm.length >= 6) {
+                for (known in set) {
+                    if (known.length >= 6 && (norm == known || norm.startsWith("$known ") || norm.endsWith(" $known"))) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
 
     fun isRussianTrack(
         artist: String,
         title: String,
     ): Boolean {
         if (hasCyrillic(artist) || hasCyrillic(title)) return true
-        val normArtist = TrackMatcher.normalize(artist)
-        if (normArtist.isBlank()) return false
-        return knownRuCensoredArtists.any { normArtist.contains(it) } ||
-            learnedArtists.any { normArtist.contains(it) }
+        if (artist.isBlank()) return false
+        return matchesArtistSet(artist, knownRuCensoredArtists) ||
+            matchesArtistSet(artist, learnedArtists)
     }
 
     fun rememberCensoredArtist(artist: String) {
-        val parts = artist.split(",", "&", "feat.", "ft.")
-        parts.forEach { raw ->
+        CustomConfigStore.splitArtistNames(artist).forEach { raw ->
             val norm = TrackMatcher.normalize(raw)
             if (norm.length >= 2) learnedArtists.add(norm)
         }
@@ -1035,10 +1124,10 @@ object LocalCensorshipAdvisor {
         artist: String,
         title: String,
     ): Boolean {
-        val normArtist = TrackMatcher.normalize(artist)
-        if (normArtist.isBlank()) return false
-        if (learnedArtists.any { normArtist.contains(it) }) return true
-        if (knownRuCensoredArtists.any { normArtist.contains(it) }) return true
+        if (artist.isNotBlank()) {
+            if (matchesArtistSet(artist, learnedArtists)) return true
+            if (matchesArtistSet(artist, knownRuCensoredArtists)) return true
+        }
         val normTitle = TrackMatcher.normalize(title)
         return normTitle.contains("uncensored") || normTitle.contains("без цензуры")
     }
@@ -1140,7 +1229,8 @@ class HybridStreamResolver(
     private val yandexProvider: YandexMusicProvider,
     private val vkProvider: VkMusicProvider,
 ) : StreamResolver {
-    private val failedProvidersByVideo = ConcurrentHashMap<String, MutableSet<String>>()
+    /** `videoId -> (provider -> failedAtMs)` с автоматическим истечением через 5 минут. */
+    private val failedProvidersByVideo = ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>()
     private val preResolvedCache = ConcurrentHashMap<String, PreResolvedEntry>()
     private val preResolvingIds = ConcurrentHashMap.newKeySet<String>()
     private val vkVariantIndexByVideo = ConcurrentHashMap<String, Int>()
@@ -1157,6 +1247,23 @@ class HybridStreamResolver(
 
     init {
         activeInstance = this
+    }
+
+    private fun activeFailedProviders(videoId: String): Set<String> {
+        val map = failedProvidersByVideo[videoId] ?: return emptySet()
+        val now = System.currentTimeMillis()
+        val expired = map.filterValues { now - it > FAILED_PROVIDER_TTL_MS }.keys
+        expired.forEach { map.remove(it) }
+        return map.keys
+    }
+
+    private fun markProviderFailed(
+        videoId: String,
+        provider: String,
+    ) {
+        if (failedProvidersByVideo.size > 300) failedProvidersByVideo.clear()
+        failedProvidersByVideo
+            .getOrPut(videoId) { ConcurrentHashMap() }[provider] = System.currentTimeMillis()
     }
 
     override suspend fun resolve(
@@ -1287,14 +1394,18 @@ class HybridStreamResolver(
         // Зарубежный каскад: Deezer (обложка/эталон) → YTM → VK → Яндекс
         if (isForeignAuto && song != null && !song.isLocal && !song.isUploaded && !song.isPodcast && !song.isLive) {
             val deezerRef =
-                runCatching {
+                try {
                     deezerClient.lookup(
                         artist = artist,
                         title = title,
                         fallbackDurationSec = song.duration,
                         fallbackExplicit = song.isExplicit || song.explicitness == true,
                     )
-                }.getOrNull()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
 
             if (deezerRef != null && (!deezerRef.coverXlUrl.isNullOrBlank() || !deezerRef.deezerId.isNullOrBlank())) {
                 TrackBindingCache.put(videoId, artist, title) { prev ->
@@ -1307,7 +1418,7 @@ class HybridStreamResolver(
                 }
             }
 
-            val ytmFailed = "ytm" in failedProvidersByVideo[videoId].orEmpty()
+            val ytmFailed = "ytm" in activeFailedProviders(videoId)
             var ytmError: Throwable? = null
             if (!ytmFailed) {
                 try {
@@ -1409,7 +1520,7 @@ class HybridStreamResolver(
         if (query.isBlank()) return null
 
         val foundId =
-            runCatching {
+            try {
                 val page =
                     GlobalYouTubeRepository.instance.searchFiltered(
                         query = query,
@@ -1436,7 +1547,11 @@ class HybridStreamResolver(
                         if (score >= 52) cand.id to score else null
                     }.maxByOrNull { it.second }
                     ?.first
-            }.getOrNull()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
 
         if (!foundId.isNullOrBlank()) {
             if (externalToYouTubeId.size > 400) externalToYouTubeId.clear()
@@ -1494,13 +1609,16 @@ class HybridStreamResolver(
                     !LocalCensorshipAdvisor.isRussianTrack(artist, title) &&
                     !configStore.isArtistLearnedCensored(artist)
             if (isForeignAuto) {
-                runCatching {
+                try {
                     deezerClient.lookup(
                         artist = artist,
                         title = title,
                         fallbackDurationSec = song.duration,
                         fallbackExplicit = song.isExplicit || song.explicitness == true,
                     )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
                 }
                 if (videoId.startsWith("dz_")) {
                     resolveYouTubeFallbackId(videoId, song)
@@ -1583,7 +1701,7 @@ class HybridStreamResolver(
         if (!cfg.hybridResolverEnabled && !isExternalCatalogId(videoId)) return null
         if (cfg.yandexToken.isBlank() && cfg.vkToken.isBlank()) return null
 
-        val failed = failedProvidersByVideo[videoId].orEmpty()
+        val failed = activeFailedProviders(videoId)
         val manualPref = configStore.getTrackSourceOverride(videoId = videoId, artist = artist, title = title)
         if (manualPref == TrackSourcePreference.YTM && forcedOrder == null) {
             if (!isPreResolve && !forSystemDownload) {
@@ -1666,9 +1784,8 @@ class HybridStreamResolver(
                         val directYmId =
                             videoId.takeIf { it.startsWith("ym_") && !it.startsWith("ym_alb_") }?.removePrefix("ym_")
                                 ?: diskBinding?.yandexId
-                        val allowCensored = isManualCustom || yandexCensorshipDetected || cfg.vkToken.isBlank()
+                        val allowCensored = isManualCustom || yandexCensorshipDetected || cfg.vkToken.isBlank() || !cfg.preferVkForExplicit
                         if (directYmId != null && !localCensored && !isManualCustom && !yandexCensorshipDetected && !cachedCensored) {
-                            // Быстрый прямой путь через дисковый кэш привязок (0 поисковых запросов)
                             resolved =
                                 yandexProvider.resolveDirectById(
                                     trackId = directYmId,
@@ -1684,7 +1801,6 @@ class HybridStreamResolver(
                                     allowSuspectedCensored = allowCensored,
                                 )
                             if (outcome.censorshipDetected && !allowCensored && cfg.vkToken.isNotBlank()) {
-                                // Уровни 1 и 2 детектора поймали цензуру в Яндексе — запоминаем и перекидываем на VK!
                                 yandexCensorshipDetected = true
                                 deferredYandexTrackId = outcome.trackId
                                 configStore.putCachedCensorship(artist, title, true)
@@ -1692,7 +1808,6 @@ class HybridStreamResolver(
                                 if ("vk" !in orderQueue.subList(idx, orderQueue.size)) {
                                     orderQueue.add(idx, "vk")
                                 }
-                                // Если VK не найдёт — последним шансом разрешаем вернуться к Яндексу
                                 if ("yandex" !in orderQueue.subList(idx, orderQueue.size)) {
                                     orderQueue.add("yandex")
                                 }
@@ -1723,7 +1838,6 @@ class HybridStreamResolver(
                 if (resolved != null) break
             }
 
-            // Страховочный фолбэк к Яндексу если цензура была обнаружена, но VK не нашёл трек
             if (resolved == null && provider == "yandex" && deferredYandexTrackId != null && yandexCensorshipDetected) {
                 resolved =
                     yandexProvider.resolveDirectById(
@@ -1735,24 +1849,20 @@ class HybridStreamResolver(
 
             if (resolved == null) continue
 
-            // Системный загрузчик скачивает прямые аудиофайлы, HLS .m3u8 пропускаем дальше по каскаду
             if (forSystemDownload && (resolved.isHls || resolved.url.substringBefore('?').endsWith(".m3u8", ignoreCase = true))) {
                 continue
             }
 
-            // Запоминаем активный VK audioKey для чёрного списка при ручном переключении кривого питча
             if (resolved.clientName == "vk" && !resolved.sourceTrackId.isNullOrBlank()) {
                 lastResolvedVkAudioKeyByVideo[videoId] = resolved.sourceTrackId
             }
 
-            // Приоритет HD-обложек: Deezer > Яндекс > VK
             val bestCover =
                 reference.coverXlUrl
                     ?: resolved.coverUrl?.takeIf { resolved.clientName == "yandex" }
                     ?: diskBinding?.hdCoverUrl
                     ?: resolved.coverUrl
 
-            // Сохраняем привязку на диск для мгновенных повторных запусков
             TrackBindingCache.put(videoId, artist, title) { prev ->
                 prev.copy(
                     source = resolved.clientName,
@@ -1815,17 +1925,20 @@ class HybridStreamResolver(
         val title = (song.canonicalTitle ?: song.title).trim()
         val isForeign = !LocalCensorshipAdvisor.isRussianTrack(artist, title) && !configStore.isArtistLearnedCensored(artist)
 
-        // Для зарубежных треков пробуем сначала прямой поток YTM (если не SABR), затем VK → Яндекс
         if (isForeign) {
             val hints = lastHints
             val quality = lastAudioQuality
             if (hints != null && quality != null) {
                 val ytmRes =
-                    runCatching {
+                    try {
                         resolveViaDelegate(song.id, song) { ytId, ytSong ->
                             delegate.resolve(ytId, hints, quality, ytSong)
                         }
-                    }.getOrNull()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
                 if (ytmRes != null && !ytmRes.isSabr && ytmRes.url.startsWith("http")) {
                     return ytmRes
                 }
@@ -1843,7 +1956,6 @@ class HybridStreamResolver(
             )
         }
 
-        // Для русских треков идём по основному каскаду (Яндекс → VK или VK → Яндекс при цензуре)
         tryResolveCustom(
             videoId = song.id,
             sourceSong = song,
@@ -1858,11 +1970,15 @@ class HybridStreamResolver(
         val quality = lastAudioQuality
         if (hints != null && quality != null) {
             val ytmRes =
-                runCatching {
+                try {
                     resolveViaDelegate(song.id, song) { ytId, ytSong ->
                         delegate.resolve(ytId, hints, quality, ytSong)
                     }
-                }.getOrNull()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
             if (ytmRes != null && !ytmRes.isSabr && ytmRes.url.startsWith("http")) {
                 return ytmRes
             }
@@ -1922,8 +2038,8 @@ class HybridStreamResolver(
 
     private fun invalidateVkSessionStreamsInternal() {
         preResolvedCache.clear()
-        // Сбрасываем временные ошибки провайдеров при смене Wi-Fi <-> 4G / VPN
         failedProvidersByVideo.clear()
+        vkProvider.resetFloodCooldown()
     }
 
     override suspend fun resetExtractionBackoff() {
@@ -1963,10 +2079,10 @@ class HybridStreamResolver(
         if (clientName == "yandex" || clientName == "vk") {
             Log.w(TAG, "Custom stream failed ($clientName, code=$responseCode) for $videoId, falling back")
             preResolvedCache.remove(videoId)
-            failedProvidersByVideo.getOrPut(videoId) { ConcurrentHashMap.newKeySet() }.add(clientName)
+            markProviderFailed(videoId, clientName)
             return
         }
-        failedProvidersByVideo.getOrPut(videoId) { ConcurrentHashMap.newKeySet() }.add("ytm")
+        markProviderFailed(videoId, "ytm")
         val delegateId = externalToYouTubeId[videoId] ?: videoId
         if (!isExternalCatalogId(delegateId)) {
             delegate.reportPlaybackFailure(delegateId, clientName, responseCode, profileId, hints, category)
@@ -1985,6 +2101,7 @@ class HybridStreamResolver(
     companion object {
         private const val TAG = "HybridResolver"
         private const val PRE_RESOLVE_TTL_MS = 12 * 60 * 1_000L
+        private const val FAILED_PROVIDER_TTL_MS = 5 * 60 * 1_000L
 
         @Volatile
         private var activeInstance: HybridStreamResolver? = null
@@ -2035,7 +2152,6 @@ class HybridStreamResolver(
                     (currentOverride == TrackSourcePreference.VK || activeClientName == "vk")
 
             if (alreadyOnVk) {
-                // Текущий кривой/питчеванный VK-файл навсегда улетает в чёрный список
                 val badAudioKey =
                     inst.lastResolvedVkAudioKeyByVideo.remove(song.id)
                         ?: TrackBindingCache.get(song.id, artist, title)?.vkAudioKey
@@ -2050,7 +2166,6 @@ class HybridStreamResolver(
             }
 
             if (pref == TrackSourcePreference.VK && activeClientName == "yandex") {
-                // Уровень 3 детектора цензуры: запоминаем трек и повышаем индекс цензуры артиста
                 inst.configStore.putCachedCensorship(artist, title, true)
                 inst.configStore.recordManualCensorshipSwitch(artist)
             }
