@@ -12,6 +12,8 @@ import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.view.TextureView
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -94,6 +96,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -137,6 +140,7 @@ import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.components.images.AsyncImage
 import com.metrolist.shared.ui.icons.MetrolistIcons
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -223,6 +227,8 @@ private fun cleanChromeUserAgent(context: Context): String =
  * через сохранённые куки встроенного WebView.
  */
 object CustomAuthWebViewHelper {
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     @Volatile
     private var appContext: Context? = null
 
@@ -281,12 +287,19 @@ object CustomAuthWebViewHelper {
                             return@suspendCancellableCoroutine
                         }
                     var finished = false
-                    fun finishWith(token: String?) {
-                        if (finished) return
-                        finished = true
+                    fun destroyOnMain() {
                         runCatching {
                             webView.stopLoading()
                             webView.destroy()
+                        }
+                    }
+                    fun finishWith(token: String?) {
+                        if (finished) return
+                        finished = true
+                        if (Looper.myLooper() == Looper.getMainLooper()) {
+                            destroyOnMain()
+                        } else {
+                            mainHandler.post { destroyOnMain() }
                         }
                         if (cont.isActive) cont.resume(token)
                     }
@@ -350,7 +363,6 @@ private fun ServiceOAuthWebViewDialog(
         } else {
             provider.authUrl
         }
-    var currentUrl by remember { mutableStateOf(targetUrl) }
     var loadProgress by remember { mutableIntStateOf(10) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var delivered by remember { mutableStateOf(false) }
@@ -358,7 +370,7 @@ private fun ServiceOAuthWebViewDialog(
 
     LaunchedEffect(targetUrl) {
         errorMessage = null
-        currentUrl = targetUrl
+        loadProgress = 10
         webViewRef?.loadUrl(targetUrl)
     }
 
@@ -501,12 +513,15 @@ private fun ServiceOAuthWebViewDialog(
                                 }
                             webViewClient =
                                 object : WebViewClient() {
-                                    private fun checkUrl(url: String?): Boolean {
+                                    private fun checkUrl(
+                                        view: WebView?,
+                                        url: String?,
+                                    ): Boolean {
                                         if (url.isNullOrBlank()) return false
-                                        currentUrl = url
                                         val token = CustomAuthWebViewHelper.extractAccessToken(url)
                                         if (token != null && !delivered) {
                                             delivered = true
+                                            view?.stopLoading()
                                             CookieManager.getInstance().flush()
                                             onTokenCaptured(token)
                                             return true
@@ -523,9 +538,8 @@ private fun ServiceOAuthWebViewDialog(
                                         request: WebResourceRequest?,
                                     ): Boolean {
                                         val u = request?.url?.toString() ?: return false
-                                        if (checkUrl(u)) return true
+                                        if (checkUrl(view, u)) return true
                                         val scheme = request.url?.scheme?.lowercase().orEmpty()
-                                        // Не даём ВК перекинуть авторизацию в стороннее приложение через vk:// или intent://
                                         if (scheme != "http" && scheme != "https") {
                                             return true
                                         }
@@ -537,7 +551,7 @@ private fun ServiceOAuthWebViewDialog(
                                         url: String?,
                                     ) {
                                         loadProgress = 100
-                                        checkUrl(url)
+                                        checkUrl(view, url)
                                     }
 
                                     override fun onReceivedError(
@@ -553,6 +567,15 @@ private fun ServiceOAuthWebViewDialog(
                                 }
                             webViewRef = this
                             loadUrl(targetUrl)
+                        }
+                    },
+                    onRelease = { webView ->
+                        if (webViewRef === webView) webViewRef = null
+                        runCatching {
+                            webView.stopLoading()
+                            webView.loadUrl("about:blank")
+                            webView.removeAllViews()
+                            webView.destroy()
                         }
                     },
                     modifier = Modifier.fillMaxWidth().weight(1f),
@@ -672,7 +695,6 @@ fun WaveHomeScreen(
     var showWaveSettingsSheet by remember { mutableStateOf(false) }
     var showSourcePickerSheet by remember { mutableStateOf(false) }
 
-    // Паузим видео-маскот, когда экран скрыт (другая вкладка, открытый плеер или шторки)
     val isMascotVideoActive =
         isScreenActive && !showWaveSettingsSheet && !showSourcePickerSheet
 
@@ -694,41 +716,52 @@ fun WaveHomeScreen(
 
         val artist = song.artists.joinToString(", ") { it.name }.trim()
         val bankPhrase =
-            runCatching {
+            try {
                 phraseBank.nextPhraseForTrack(
                     artist = artist,
                     title = song.title,
                     moodKey = cfg.waveMood.name,
                     moodLabel = cfg.waveMood.label,
                     hasGeminiKey = cfg.geminiApiKey.isNotBlank(),
-                )
-            }.getOrNull()?.trim()?.takeIf { it.isNotBlank() }
+                )?.trim()?.takeIf { it.isNotBlank() }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
 
         if (currentSong?.id == song.id) {
             mascotPhrase = bankPhrase ?: pickFallbackMascotPhrase(cfg.waveMood, previousPhrase)
         }
     }
 
-    fun launchFreshWave() {
+    fun launchFreshWave(useInstantStarter: Boolean) {
         val conn = playerConnection ?: return
-        val starter = aiWaveEngine.buildInstantStarterSongs(excludeIds = setOfNotNull(currentSong?.id))
+        val excludeCurrent = setOfNotNull(currentSong?.id)
         val startedInstant =
-            if (starter.isNotEmpty()) {
-                conn.playQueue(
-                    songs = starter,
-                    queueTitle = "Моя волна",
-                    finite = false,
-                    forceStartPlaying = true,
-                )
-                true
+            if (useInstantStarter) {
+                val starter = aiWaveEngine.buildInstantStarterSongs(excludeIds = excludeCurrent)
+                if (starter.isNotEmpty()) {
+                    conn.playQueue(
+                        songs = starter,
+                        queueTitle = "Моя волна",
+                        finite = false,
+                        forceStartPlaying = true,
+                    )
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
 
         scope.launch {
             aiWaveEngine
-                .generateWaveSongs(backgroundLabel = startedInstant)
-                .onSuccess { fresh ->
+                .generateWaveSongs(
+                    backgroundLabel = startedInstant,
+                    excludeIds = if (startedInstant) emptySet() else excludeCurrent,
+                ).onSuccess { fresh ->
                     if (startedInstant && conn.queueTitle.value?.startsWith("Моя волна") == true) {
                         conn.replaceUpcomingWaveQueue(fresh)
                     } else {
@@ -752,7 +785,7 @@ fun WaveHomeScreen(
             playerConnection.togglePlayPause()
             return
         }
-        launchFreshWave()
+        launchFreshWave(useInstantStarter = true)
     }
 
     val activeBubbleText =
@@ -818,7 +851,7 @@ fun WaveHomeScreen(
                     ActiveExternalContextPill(
                         label = activeContextLabel,
                         onOpenContext = onExpandPlayer,
-                        onResetToWave = ::launchFreshWave,
+                        onResetToWave = { launchFreshWave(useInstantStarter = false) },
                     )
                 }
             }
@@ -834,7 +867,7 @@ fun WaveHomeScreen(
                     if (isOutsideWave) {
                         ReturnToWavePillButton(
                             enabled = !isGenerating,
-                            onClick = ::launchFreshWave,
+                            onClick = { launchFreshWave(useInstantStarter = false) },
                         )
                     }
                     WaveFilterPillButton(
@@ -877,7 +910,6 @@ fun WaveHomeScreen(
                         playerConnection?.skipToPrevious()
                     },
                     onNextClick = {
-                        // Быстрый скип (<28с) и авторазворот волны централизованно считаются в MusicService
                         playerConnection?.skipToNext()
                     },
                     onOpenFullPlayer = onExpandPlayer,
@@ -962,7 +994,7 @@ fun WaveHomeScreen(
                 onUpdate = { transform -> configStore.update(transform) },
                 onApplyOrRefresh = {
                     showWaveSettingsSheet = false
-                    launchFreshWave()
+                    launchFreshWave(useInstantStarter = false)
                 },
             )
         }
@@ -1186,11 +1218,12 @@ private fun ReturnToWavePillButton(
 private fun LiveMascotVideoLayer(
     isPlaying: Boolean,
     isStageVisible: Boolean,
-    bassEnergy: Float,
+    bassEnergyProvider: () -> Float,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val currentBassProvider by rememberUpdatedState(bassEnergyProvider)
 
     val sleepRes = CustomMascotAssets.sleepVideoResId
     val wakeRes = CustomMascotAssets.wakeVideoResId
@@ -1217,8 +1250,6 @@ private fun LiveMascotVideoLayer(
     var videoWidth by remember { mutableIntStateOf(16) }
     var videoHeight by remember { mutableIntStateOf(9) }
     var textureViewRef by remember { mutableStateOf<TextureView?>(null) }
-    var lastAppliedSpeed by remember { mutableFloatStateOf(1f) }
-    var lastSpeedUpdateMs by remember { mutableLongStateOf(0L) }
     var lastShaderSize by remember { mutableStateOf(0 to 0) }
     var lastTransformKey by remember { mutableStateOf("") }
 
@@ -1339,7 +1370,6 @@ private fun LiveMascotVideoLayer(
             val sleepTarget = sleepRes.takeIf { it != 0 } ?: awakeRes
             isInWakeTransition = false
             exoPlayer.setPlaybackSpeed(1f)
-            lastAppliedSpeed = 1f
             if (sleepTarget != 0) {
                 exoPlayer.repeatMode = Player.REPEAT_MODE_ONE
                 exoPlayer.setMediaItem(MediaItem.fromUri(rawUri(sleepTarget)))
@@ -1349,21 +1379,20 @@ private fun LiveMascotVideoLayer(
         }
     }
 
-    LaunchedEffect(shouldRenderVideo, isPlaying, isInWakeTransition, bassEnergy) {
+    LaunchedEffect(shouldRenderVideo, isPlaying, isInWakeTransition) {
         if (!shouldRenderVideo || !isPlaying || isInWakeTransition) {
-            if (abs(lastAppliedSpeed - 1f) > 0.02f) {
-                exoPlayer.setPlaybackSpeed(1f)
-                lastAppliedSpeed = 1f
-            }
+            exoPlayer.setPlaybackSpeed(1f)
             return@LaunchedEffect
         }
-        val now = System.currentTimeMillis()
-        if (now - lastSpeedUpdateMs < 220L) return@LaunchedEffect
-        val targetSpeed = (0.90f + bassEnergy.coerceIn(0f, 1f) * 0.30f).coerceIn(0.88f, 1.22f)
-        if (abs(targetSpeed - lastAppliedSpeed) >= 0.04f) {
-            exoPlayer.setPlaybackSpeed(targetSpeed)
-            lastAppliedSpeed = targetSpeed
-            lastSpeedUpdateMs = now
+        var lastAppliedSpeed = 1f
+        while (isActive) {
+            val energy = currentBassProvider().coerceIn(0f, 1f)
+            val targetSpeed = (0.90f + energy * 0.30f).coerceIn(0.88f, 1.22f)
+            if (abs(targetSpeed - lastAppliedSpeed) >= 0.04f) {
+                exoPlayer.setPlaybackSpeed(targetSpeed)
+                lastAppliedSpeed = targetSpeed
+            }
+            delay(220L)
         }
     }
 
@@ -1645,7 +1674,7 @@ private fun AnimatedWaveMascotStage(
                     LiveMascotVideoLayer(
                         isPlaying = isPlaying,
                         isStageVisible = isStageVisible,
-                        bassEnergy = bassEnergy.floatValue,
+                        bassEnergyProvider = { bassEnergy.floatValue },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -2132,7 +2161,7 @@ fun CustomEngineSettingsContent(
     var importSyncLimit by remember { mutableIntStateOf(100) }
     var importProgressText by remember { mutableStateOf<String?>(null) }
     var importJob by remember { mutableStateOf<Job?>(null) }
-    val isImporting = importJob?.isActive == true
+    val isImporting = importJob != null
 
     fun persistInputs() {
         val cleanYandex = CustomAuthWebViewHelper.extractOrCleanToken(yandexInput) ?: yandexInput.trim()
@@ -2151,22 +2180,54 @@ fun CustomEngineSettingsContent(
         }
     }
 
+    fun launchLibraryImport(
+        startLabel: String,
+        action: suspend (Int, (LibraryImportProgress) -> Unit) -> Result<LibraryImportSummary>,
+    ) {
+        persistInputs()
+        importProgressText = startLabel
+        importJob?.cancel()
+        importJob =
+            scope.launch {
+                try {
+                    action(importSyncLimit) { prog ->
+                        importProgressText = prog.message
+                    }.onSuccess { res ->
+                        importProgressText =
+                            "Готово (${res.sourceLabel}): загружено ${res.totalFetched}, в памяти ${res.savedForWave}, добавлено в Библиотеку ${res.addedToLibrary}"
+                    }.onFailure { err ->
+                        importProgressText = "Ошибка импорта: ${err.message}"
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } finally {
+                    importJob = null
+                }
+            }
+    }
+
     val exportFileLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
             if (uri == null) return@rememberLauncherForActivityResult
             persistInputs()
-            val payload = configStore.exportToJson(extraLikedIds = SongLikeState.likedSongIds)
-            val saved =
-                runCatching {
-                    context.contentResolver.openOutputStream(uri)?.use { out ->
-                        out.write(payload.toByteArray(Charsets.UTF_8))
-                    } ?: error("Не удалось открыть файл для записи")
-                }
-            statusMessage =
-                saved.fold(
-                    onSuccess = { "Бэкап сохранён в файл (лайков: ${maxOf(cfg.likedTracksBackup.size, likedIds.size)})" },
-                    onFailure = { err -> "Ошибка сохранения файла: ${err.message}" },
-                )
+            val likedSnapshot = SongLikeState.likedSongIds
+            statusMessage = "Сохраняю бэкап…"
+            scope.launch {
+                val saved =
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            val payload = configStore.exportToJson(extraLikedIds = likedSnapshot)
+                            context.contentResolver.openOutputStream(uri)?.use { out ->
+                                out.write(payload.toByteArray(Charsets.UTF_8))
+                            } ?: error("Не удалось открыть файл для записи")
+                        }
+                    }
+                statusMessage =
+                    saved.fold(
+                        onSuccess = { "Бэкап сохранён в файл (лайков: ${maxOf(cfg.likedTracksBackup.size, likedSnapshot.size)})" },
+                        onFailure = { err -> "Ошибка сохранения файла: ${err.message}" },
+                    )
+            }
         }
 
     val importFileLauncher =
@@ -2208,7 +2269,7 @@ fun CustomEngineSettingsContent(
                                     var ok = 0
                                     for (entry in toRestore) {
                                         val found =
-                                            runCatching {
+                                            try {
                                                 val q = listOf(entry.artist, entry.title).filter { it.isNotBlank() }.joinToString(" ")
                                                 val page =
                                                     GlobalYouTubeRepository.instance.searchFiltered(
@@ -2216,9 +2277,28 @@ fun CustomEngineSettingsContent(
                                                         filter = SearchFilter.SONG,
                                                         allowOfflineFallback = false,
                                                     )
-                                                val songs = page.items.filterIsInstance<SongItem>()
-                                                songs.firstOrNull { entry.id.isNotBlank() && it.id == entry.id } ?: songs.firstOrNull()
-                                            }.getOrNull()
+                                                val songs = page.items.filterIsInstance<SongItem>().filter { !it.isUnavailable }
+                                                songs.firstOrNull { entry.id.isNotBlank() && it.id == entry.id }
+                                                    ?: songs
+                                                        .mapNotNull { cand ->
+                                                            val candArt = cand.artists.joinToString(", ") { it.name }.trim()
+                                                            val score =
+                                                                TrackMatcher.matchScore(
+                                                                    targetArtist = entry.artist,
+                                                                    targetTitle = entry.title,
+                                                                    targetDurationSec = null,
+                                                                    candidateArtist = candArt,
+                                                                    candidateTitle = cand.title,
+                                                                    candidateDurationSec = cand.duration,
+                                                                )
+                                                            if (score >= 55) cand to score else null
+                                                        }.maxByOrNull { it.second }
+                                                        ?.first
+                                            } catch (e: CancellationException) {
+                                                throw e
+                                            } catch (_: Exception) {
+                                                null
+                                            }
                                         if (found != null && found.id !in SongLikeState.likedSongIds) {
                                             withContext(Dispatchers.Main) {
                                                 if (found.id !in SongLikeState.likedSongIds) {
@@ -2454,51 +2534,54 @@ fun CustomEngineSettingsContent(
                     isCheckingApis = true
                     statusMessage = "Проверяю Яндекс, VK и Gemini…"
                     scope.launch {
-                        val report =
-                            coroutineScope {
-                                val yandexTask =
-                                    async {
-                                        val token = yandexInput.trim()
-                                        if (token.isBlank()) {
-                                            "Я.Музыка: не указан"
-                                        } else {
-                                            when (yandexProvider.checkPlusStatus(token)) {
-                                                YandexPlusStatus.ACTIVE -> "Я.Музыка: OK (Плюс активен)"
-                                                YandexPlusStatus.NO_PLUS -> "Я.Музыка: нет Плюса (идёт на VK/YTM)"
-                                                YandexPlusStatus.INVALID_TOKEN -> "Я.Музыка: невалидный токен"
-                                                YandexPlusStatus.NO_TOKEN -> "Я.Музыка: не указан"
-                                                YandexPlusStatus.UNKNOWN -> "Я.Музыка: ошибка сети"
+                        try {
+                            val report =
+                                coroutineScope {
+                                    val yandexTask =
+                                        async {
+                                            val token = yandexInput.trim()
+                                            if (token.isBlank()) {
+                                                "Я.Музыка: не указан"
+                                            } else {
+                                                when (yandexProvider.checkPlusStatus(token)) {
+                                                    YandexPlusStatus.ACTIVE -> "Я.Музыка: OK (Плюс активен)"
+                                                    YandexPlusStatus.NO_PLUS -> "Я.Музыка: нет Плюса (идёт на VK/YTM)"
+                                                    YandexPlusStatus.INVALID_TOKEN -> "Я.Музыка: невалидный токен"
+                                                    YandexPlusStatus.NO_TOKEN -> "Я.Музыка: не указан"
+                                                    YandexPlusStatus.UNKNOWN -> "Я.Музыка: ошибка сети"
+                                                }
                                             }
                                         }
-                                    }
-                                val vkTask =
-                                    async {
-                                        val token = vkInput.trim()
-                                        if (token.isBlank()) {
-                                            "VK: не указан"
-                                        } else {
-                                            vkProvider.checkTokenDetailed(token).fold(
-                                                onSuccess = { "VK: $it" },
-                                                onFailure = { "VK: ${it.message ?: "ошибка"}" },
-                                            )
+                                    val vkTask =
+                                        async {
+                                            val token = vkInput.trim()
+                                            if (token.isBlank()) {
+                                                "VK: не указан"
+                                            } else {
+                                                vkProvider.checkTokenDetailed(token).fold(
+                                                    onSuccess = { "VK: $it" },
+                                                    onFailure = { "VK: ${it.message ?: "ошибка"}" },
+                                                )
+                                            }
                                         }
-                                    }
-                                val geminiTask =
-                                    async {
-                                        val key = geminiKeyInput.trim()
-                                        if (key.isBlank()) {
-                                            "Gemini: не указан"
-                                        } else {
-                                            geminiClient.testConnection(key).fold(
-                                                onSuccess = { "Gemini: OK ($it)" },
-                                                onFailure = { "Gemini: ${it.message ?: "ошибка"}" },
-                                            )
+                                    val geminiTask =
+                                        async {
+                                            val key = geminiKeyInput.trim()
+                                            if (key.isBlank()) {
+                                                "Gemini: не указан"
+                                            } else {
+                                                geminiClient.testConnection(key).fold(
+                                                    onSuccess = { "Gemini: OK ($it)" },
+                                                    onFailure = { "Gemini: ${it.message ?: "ошибка"}" },
+                                                )
+                                            }
                                         }
-                                    }
-                                listOf(yandexTask.await(), vkTask.await(), geminiTask.await()).joinToString("\n")
-                            }
-                        statusMessage = report
-                        isCheckingApis = false
+                                    listOf(yandexTask.await(), vkTask.await(), geminiTask.await()).joinToString("\n")
+                                }
+                            statusMessage = report
+                        } finally {
+                            isCheckingApis = false
+                        }
                     }
                 },
                 modifier = Modifier.weight(1f),
@@ -2554,20 +2637,9 @@ fun CustomEngineSettingsContent(
             OutlinedButton(
                 enabled = !isImporting,
                 onClick = {
-                    persistInputs()
-                    importProgressText = "Запускаю импорт из Я.Музыки…"
-                    importJob =
-                        scope.launch {
-                            catalogProvider
-                                .importYandexLikes(importSyncLimit) { prog ->
-                                    importProgressText = prog.message
-                                }.onSuccess { res ->
-                                    importProgressText =
-                                        "Готово (${res.sourceLabel}): загружено ${res.totalFetched}, в памяти ${res.savedForWave}, добавлено в Библиотеку ${res.addedToLibrary}"
-                                }.onFailure { err ->
-                                    importProgressText = "Ошибка импорта: ${err.message}"
-                                }
-                        }
+                    launchLibraryImport("Запускаю импорт из Я.Музыки…") { limit, progress ->
+                        catalogProvider.importYandexLikes(limit, progress)
+                    }
                 },
             ) {
                 Text("Я.Музыка")
@@ -2575,20 +2647,9 @@ fun CustomEngineSettingsContent(
             OutlinedButton(
                 enabled = !isImporting,
                 onClick = {
-                    persistInputs()
-                    importProgressText = "Запускаю импорт из VK…"
-                    importJob =
-                        scope.launch {
-                            catalogProvider
-                                .importVkAudios(importSyncLimit) { prog ->
-                                    importProgressText = prog.message
-                                }.onSuccess { res ->
-                                    importProgressText =
-                                        "Готово (${res.sourceLabel}): загружено ${res.totalFetched}, в памяти ${res.savedForWave}, добавлено в Библиотеку ${res.addedToLibrary}"
-                                }.onFailure { err ->
-                                    importProgressText = "Ошибка импорта: ${err.message}"
-                                }
-                        }
+                    launchLibraryImport("Запускаю импорт из VK…") { limit, progress ->
+                        catalogProvider.importVkAudios(limit, progress)
+                    }
                 },
             ) {
                 Text("VK")
@@ -2596,20 +2657,9 @@ fun CustomEngineSettingsContent(
             OutlinedButton(
                 enabled = !isImporting,
                 onClick = {
-                    persistInputs()
-                    importProgressText = "Запускаю импорт из YouTube…"
-                    importJob =
-                        scope.launch {
-                            catalogProvider
-                                .importYouTubeLikes(importSyncLimit) { prog ->
-                                    importProgressText = prog.message
-                                }.onSuccess { res ->
-                                    importProgressText =
-                                        "Готово (${res.sourceLabel}): загружено ${res.totalFetched}, в памяти ${res.savedForWave}, добавлено в Библиотеку ${res.addedToLibrary}"
-                                }.onFailure { err ->
-                                    importProgressText = "Ошибка импорта: ${err.message}"
-                                }
-                        }
+                    launchLibraryImport("Запускаю импорт из YouTube…") { limit, progress ->
+                        catalogProvider.importYouTubeLikes(limit, progress)
+                    }
                 },
             ) {
                 Text("YouTube")
@@ -2784,10 +2834,13 @@ fun CustomEngineSettingsContent(
             OutlinedButton(
                 onClick = {
                     persistInputs()
-                    val exported = configStore.exportToJson(extraLikedIds = SongLikeState.likedSongIds)
-                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("metrolist_custom_json", exported))
-                    statusMessage = "JSON скопирован в буфер"
+                    val likedSnapshot = SongLikeState.likedSongIds
+                    scope.launch {
+                        val exported = withContext(Dispatchers.Default) { configStore.exportToJson(extraLikedIds = likedSnapshot) }
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("metrolist_custom_json", exported))
+                        statusMessage = "JSON скопирован в буфер"
+                    }
                 },
             ) {
                 Icon(MetrolistIcons.Outlined.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
