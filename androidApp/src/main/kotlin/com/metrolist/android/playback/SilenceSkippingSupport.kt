@@ -101,7 +101,6 @@ internal class SilenceSkippingSupport(
         }.setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
 
     fun attach(player: ExoPlayer) {
-        // Штатный пропуск тишины по всему треку не включаем принудительно — середину песни не режем
         player.skipSilenceEnabled = false
         edgeTrimmer.enabled = true
         detector.enabled = Settings.shared.skipSilence && Settings.shared.skipSilenceInstant
@@ -119,7 +118,7 @@ internal class SilenceSkippingSupport(
                     reason: Int,
                 ) {
                     detector.resetTracking()
-                    edgeTrimmer.resetForNewPosition(player.currentPosition)
+                    edgeTrimmer.onTrackChanged(player.currentPosition)
                 }
 
                 override fun onPositionDiscontinuity(
@@ -128,7 +127,11 @@ internal class SilenceSkippingSupport(
                     reason: Int,
                 ) {
                     detector.resetTracking()
-                    edgeTrimmer.resetForNewPosition(newPosition.positionMs)
+                    if (reason == Player.DISCONTINUITY_REASON_AUTO_TRANSITION) {
+                        edgeTrimmer.onTrackChanged(newPosition.positionMs)
+                    } else if (reason == Player.DISCONTINUITY_REASON_SEEK || reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT) {
+                        edgeTrimmer.resetForSeek(newPosition.positionMs)
+                    }
                 }
 
                 override fun onTimelineChanged(
@@ -141,7 +144,6 @@ internal class SilenceSkippingSupport(
             }
         player.addListener(listener)
 
-        // Обновляем позицию и длительность для edgeTrimmer (строго начало и конец трека)
         scope.launch {
             playing.collectLatest { isPlaying ->
                 edgeTrimmer.updateTimeline(player.currentPosition, player.duration)
@@ -157,7 +159,6 @@ internal class SilenceSkippingSupport(
                 snapshotFlow { Settings.shared.skipSilence to Settings.shared.skipSilenceInstant }
                     .combine(playing) { settings, isPlaying -> Triple(settings.first, settings.second, isPlaying) }
                     .collectLatest { (enabled, instant, isPlaying) ->
-                        // Никогда не включаем вырезку тишины в середине трека
                         player.skipSilenceEnabled = false
                         edgeTrimmer.enabled = true
                         detector.enabled = enabled && instant
@@ -170,7 +171,6 @@ internal class SilenceSkippingSupport(
                                 seekTo = { position ->
                                     val curPos = player.currentPosition
                                     val dur = player.duration
-                                    // Instant-пропуск разрешён строго в начале или конце трека
                                     val inEdgeWindow =
                                         curPos < EDGE_LEADING_WINDOW_MS ||
                                             (dur > EDGE_MIN_TRACK_DURATION_MS && dur - curPos <= EDGE_TRAILING_WINDOW_MS)
@@ -241,7 +241,7 @@ internal fun musicAudioProcessorChain(vararg processors: AudioProcessor): Defaul
 
 /**
  * Обрезка мёртвой тишины (< −55 дБ) СТРОГО в начале и самом конце трека.
- * Вся середина песни проходит 100% без изменений (pass-through), сохраняя художественные паузы и ямы.
+ * Вся середина песни проходит 100% без изменений (pass-through).
  */
 internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
     @Volatile
@@ -256,6 +256,9 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
     @Volatile
     private var heardAudioInTrack: Boolean = false
 
+    @Volatile
+    private var pendingTrackStart: Boolean = true
+
     private var trailingSilentFrames: Long = 0L
 
     fun updateTimeline(
@@ -266,10 +269,18 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
         if (totalDurationMs > 0L) durationMs = totalDurationMs
     }
 
-    fun resetForNewPosition(newPosMs: Long) {
+    fun onTrackChanged(startPosMs: Long) {
+        positionMs = startPosMs.coerceAtLeast(0L)
+        durationMs = C.TIME_UNSET
+        pendingTrackStart = positionMs <= 1_500L
+        heardAudioInTrack = !pendingTrackStart
+        trailingSilentFrames = 0L
+    }
+
+    fun resetForSeek(newPosMs: Long) {
         positionMs = newPosMs.coerceAtLeast(0L)
-        // Если перемотали в середину трека — сразу считаем, что начало пройдено
-        heardAudioInTrack = positionMs > 1_500L
+        pendingTrackStart = positionMs <= 1_500L
+        heardAudioInTrack = !pendingTrackStart
         trailingSilentFrames = 0L
     }
 
@@ -290,12 +301,15 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
             return
         }
 
+        // Media3 отдаёт 16-bit PCM в little-endian — выставляем порядок байтов явно
+        inputBuffer.order(ByteOrder.LITTLE_ENDIAN)
+
         val pos = positionMs
         val dur = durationMs
 
-        // 1. НАЧАЛО ТРЕКА: режем мёртвую тишину строго до первого реального звука (в пределах первых 10 сек)
+        // 1. НАЧАЛО ТРЕКА: режем мёртвую тишину строго до первого звука (в пределах первых 10 сек)
         if (!heardAudioInTrack) {
-            if (pos > EDGE_LEADING_WINDOW_MS) {
+            if (!pendingTrackStart && pos > EDGE_LEADING_WINDOW_MS) {
                 heardAudioInTrack = true
                 passThrough(inputBuffer)
                 return
@@ -320,13 +334,12 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
             }
 
             if (firstAudibleFrame < 0) {
-                // Весь буфер — мёртвая тишина в самом начале: просто пропускаем его
                 inputBuffer.position(limit)
                 return
             }
 
             heardAudioInTrack = true
-            // Оставляем 20 мс запаса перед первым звуком, чтобы не откусить атаку первого удара
+            pendingTrackStart = false
             val prerollFrames = (sampleRate / 50).coerceAtLeast(1)
             val keepFromFrame = (firstAudibleFrame - prerollFrames).coerceAtLeast(0)
             inputBuffer.position(startPos + keepFromFrame * bytesPerFrame)
@@ -334,7 +347,7 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
             return
         }
 
-        // 2. СЕРЕДИНА ТРЕКА: 100% pass-through, вообще не сканируем и не трогаем
+        // 2. СЕРЕДИНА ТРЕКА: 100% pass-through
         val inTrailingWindow = dur > EDGE_MIN_TRACK_DURATION_MS && pos >= (dur - EDGE_TRAILING_WINDOW_MS)
         if (!inTrailingWindow) {
             trailingSilentFrames = 0L
@@ -342,7 +355,7 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
             return
         }
 
-        // 3. КОНЕЦ ТРЕКА: если пошла сплошная мёртвая тишина > 600 мс — отбрасываем пустой хвост
+        // 3. КОНЕЦ ТРЕКА: отбрасываем пустой хвост мёртвой тишины > 600 мс
         val startPos = inputBuffer.position()
         val limit = inputBuffer.limit()
         val frameCount = (limit - startPos) / bytesPerFrame
@@ -368,7 +381,6 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
         trailingSilentFrames += frameCount.toLong()
         val confirmFrames = (sampleRate.toLong() * EDGE_TRAILING_CONFIRM_MS) / 1_000L
         if (trailingSilentFrames > confirmFrames) {
-            // Хвост мёртвой тишины в конце трека — отбрасываем для бесшовного перехода
             inputBuffer.position(limit)
         } else {
             passThrough(inputBuffer)
@@ -384,19 +396,19 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
     }
 
     override fun onFlush(streamMetadata: AudioProcessor.StreamMetadata) {
-        heardAudioInTrack = positionMs > 1_500L
+        heardAudioInTrack = !pendingTrackStart && positionMs > 1_500L
         trailingSilentFrames = 0L
     }
 
     override fun onReset() {
         heardAudioInTrack = false
+        pendingTrackStart = true
         trailingSilentFrames = 0L
         positionMs = 0L
         durationMs = C.TIME_UNSET
     }
 
     companion object {
-        // −55 dBFS в 16-битном PCM (~58 из 32767) — строго мёртвая цифровая тишина
         private val DEAD_SILENCE_PEAK: Int =
             (Short.MAX_VALUE * 10.0.pow(MUSIC_SILENCE_THRESHOLD_DB / 20.0)).toInt().coerceAtLeast(16)
     }
