@@ -12,8 +12,6 @@ import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
 import android.net.Uri
 import android.os.Build
-import android.os.Handler
-import android.os.Looper
 import android.view.TextureView
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -151,26 +149,18 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
-import kotlin.coroutines.resume
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
-private const val VK_OAUTH_URL =
-    "https://oauth.vk.com/authorize?client_id=2685278&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=mobile&v=5.95&response_type=token&revoke=1"
-private const val VK_ALT_OAUTH_URL =
-    "https://oauth.vk.com/authorize?client_id=2685278&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.131&response_type=token&revoke=1"
-private const val VK_SILENT_OAUTH_URL =
-    "https://oauth.vk.com/authorize?client_id=2685278&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=mobile&v=5.95&response_type=token"
+private const val VK_WEB_LOGIN_URL = "https://m.vk.ru/audio"
 private const val YANDEX_OAUTH_URL =
     "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d"
 private const val GEMINI_AI_STUDIO_URL = "https://aistudio.google.com/apikey"
@@ -218,7 +208,7 @@ private enum class OAuthProvider(
     val title: String,
     val authUrl: String,
 ) {
-    VK("Вход в ВКонтакте", VK_OAUTH_URL),
+    VK("Вход в ВКонтакте (веб-сессия)", VK_WEB_LOGIN_URL),
     YANDEX("Вход в Яндекс.Музыку", YANDEX_OAUTH_URL),
 }
 
@@ -498,8 +488,6 @@ fun LastFmLoginDialog(
 }
 
 object CustomAuthWebViewHelper {
-    private val mainHandler = Handler(Looper.getMainLooper())
-
     @Volatile
     private var appContext: Context? = null
 
@@ -522,6 +510,9 @@ object CustomAuthWebViewHelper {
     fun extractOrCleanToken(raw: String?): String? {
         val trimmed = raw?.trim().orEmpty()
         if (trimmed.isBlank()) return null
+        if (VkWebSession.isCookieSession(trimmed)) {
+            return trimmed.takeIf { VkWebSession.hasSessionCookie(VkWebSession.extractCookieHeader(it)) }
+        }
         extractAccessToken(trimmed)?.let { return it }
         if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
             return null
@@ -546,76 +537,12 @@ object CustomAuthWebViewHelper {
         return listOfNotNull(code, desc).joinToString(": ").takeIf { it.isNotBlank() }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
     suspend fun silentRefreshVkToken(): String? {
-        val ctx = appContext ?: return null
-        return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(12_000L) {
-                suspendCancellableCoroutine<String?> { cont ->
-                    val webView =
-                        runCatching { WebView(ctx) }.getOrNull() ?: run {
-                            if (cont.isActive) cont.resume(null)
-                            return@suspendCancellableCoroutine
-                        }
-                    var finished = false
-                    fun destroyOnMain() {
-                        runCatching {
-                            webView.stopLoading()
-                            webView.destroy()
-                        }
-                    }
-                    fun finishWith(token: String?) {
-                        if (finished) return
-                        finished = true
-                        if (Looper.myLooper() == Looper.getMainLooper()) {
-                            destroyOnMain()
-                        } else {
-                            mainHandler.post { destroyOnMain() }
-                        }
-                        if (cont.isActive) cont.resume(token)
-                    }
-
-                    cont.invokeOnCancellation { finishWith(null) }
-
-                    CookieManager.getInstance().setAcceptCookie(true)
-                    CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-                    webView.settings.apply {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        userAgentString = cleanChromeUserAgent(ctx)
-                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    }
-                    webView.webChromeClient = WebChromeClient()
-                    webView.webViewClient =
-                        object : WebViewClient() {
-                            override fun shouldOverrideUrlLoading(
-                                view: WebView?,
-                                request: WebResourceRequest?,
-                            ): Boolean {
-                                val u = request?.url?.toString()
-                                val tok = extractAccessToken(u)
-                                if (tok != null) {
-                                    finishWith(tok)
-                                    return true
-                                }
-                                val scheme = request?.url?.scheme?.lowercase().orEmpty()
-                                return scheme != "http" && scheme != "https"
-                            }
-
-                            override fun onPageFinished(
-                                view: WebView?,
-                                url: String?,
-                            ) {
-                                val tok = extractAccessToken(url)
-                                if (tok != null) {
-                                    finishWith(tok)
-                                }
-                            }
-                        }
-                    webView.loadUrl(VK_SILENT_OAUTH_URL)
-                }
-            }
-        }
+        val liveCookies = VkWebSession.collectCookiesFromWebView()
+        if (!VkWebSession.hasSessionCookie(liveCookies)) return null
+        val tokenData = VkWebSession.exchangeCookieForWebToken(liveCookies) ?: return null
+        if (tokenData.accessToken.isBlank()) return null
+        return VkWebSession.COOKIE_PREFIX + liveCookies
     }
 }
 
@@ -627,22 +554,46 @@ private fun ServiceOAuthWebViewDialog(
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
-    var useAltVkFlow by remember { mutableStateOf(false) }
-    val targetUrl =
-        if (provider == OAuthProvider.VK && useAltVkFlow) {
-            VK_ALT_OAUTH_URL
-        } else {
-            provider.authUrl
-        }
+    val scope = rememberCoroutineScope()
+    val targetUrl = provider.authUrl
     var loadProgress by remember { mutableIntStateOf(10) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var statusHint by remember { mutableStateOf<String?>(null) }
+    var isVerifyingVk by remember { mutableStateOf(false) }
     var delivered by remember { mutableStateOf(false) }
+    var lastCheckedCookieHash by remember { mutableIntStateOf(0) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
 
-    LaunchedEffect(targetUrl) {
+    fun tryCaptureVkCookies(manual: Boolean) {
+        if (delivered || isVerifyingVk) return
+        runCatching { CookieManager.getInstance().flush() }
+        val cookies = VkWebSession.collectCookiesFromWebView()
+        if (!VkWebSession.hasSessionCookie(cookies)) {
+            if (manual) {
+                errorMessage = "Сначала войди в аккаунт ВК на странице ниже"
+            }
+            return
+        }
+        val hash = cookies.hashCode()
+        if (!manual && hash == lastCheckedCookieHash) return
+        lastCheckedCookieHash = hash
+        isVerifyingVk = true
         errorMessage = null
-        loadProgress = 10
-        webViewRef?.loadUrl(targetUrl)
+        statusHint = "Получаю веб-токен ВК…"
+        scope.launch {
+            val tokenData = VkWebSession.exchangeCookieForWebToken(cookies)
+            isVerifyingVk = false
+            if (tokenData != null && !delivered) {
+                delivered = true
+                webViewRef?.stopLoading()
+                onTokenCaptured(VkWebSession.COOKIE_PREFIX + cookies)
+            } else {
+                statusHint = null
+                if (manual) {
+                    errorMessage = "Не удалось получить web_token — убедись, что страница аудио открылась (и без VPN)"
+                }
+            }
+        }
     }
 
     Dialog(
@@ -667,7 +618,14 @@ private fun ServiceOAuthWebViewDialog(
                             fontWeight = FontWeight.SemiBold,
                         )
                         Text(
-                            text = errorMessage ?: "Войди в аккаунт — токен подхватится автоматически",
+                            text =
+                                errorMessage
+                                    ?: statusHint
+                                    ?: if (provider == OAuthProvider.VK) {
+                                        "Войди в ВК — веб-сессия подхватится автоматически"
+                                    } else {
+                                        "Войди в аккаунт — токен подхватится автоматически"
+                                    },
                             style = MaterialTheme.typography.bodySmall,
                             color =
                                 if (errorMessage != null) {
@@ -690,62 +648,73 @@ private fun ServiceOAuthWebViewDialog(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     if (provider == OAuthProvider.VK) {
-                        FilterChip(
-                            selected = !useAltVkFlow,
-                            onClick = { useAltVkFlow = false },
-                            label = { Text("Kate Mobile", maxLines = 1) },
-                        )
-                        FilterChip(
-                            selected = useAltVkFlow,
-                            onClick = { useAltVkFlow = true },
-                            label = { Text("Kate (web)", maxLines = 1) },
-                        )
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            runCatching {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl))
-                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                                )
-                                Toast.makeText(
-                                    context,
-                                    "После входа скопируй ссылку blank.html и нажми «Вставить токен»",
-                                    Toast.LENGTH_LONG,
-                                ).show()
-                            }.onFailure {
-                                Toast.makeText(context, "Не удалось открыть браузер", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                    ) {
-                        Text("В браузере")
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            val clip = cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
-                            val extracted = CustomAuthWebViewHelper.extractOrCleanToken(clip)
-                            if (extracted != null && !delivered) {
-                                delivered = true
-                                onTokenCaptured(extracted)
-                            } else {
-                                Toast.makeText(
-                                    context,
-                                    "В буфере нет токена (скопируй URL с access_token=)",
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            }
-                        },
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                    ) {
-                        Text("Вставить токен")
+                        Button(
+                            enabled = !isVerifyingVk,
+                            onClick = { tryCaptureVkCookies(manual = true) },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        ) {
+                            Text(if (isVerifyingVk) "Проверяю…" else "Завершить вход")
+                        }
+                        OutlinedButton(
+                            enabled = !isVerifyingVk,
+                            onClick = {
+                                errorMessage = null
+                                statusHint = "Очистил куки — войди заново"
+                                lastCheckedCookieHash = 0
+                                VkWebSession.clearWebViewVkCookies()
+                                webViewRef?.loadUrl(VK_WEB_LOGIN_URL)
+                            },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        ) {
+                            Text("Сменить аккаунт")
+                        }
+                    } else {
+                        OutlinedButton(
+                            onClick = {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl))
+                                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                    )
+                                    Toast.makeText(
+                                        context,
+                                        "После входа скопируй ссылку и нажми «Вставить токен»",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                }.onFailure {
+                                    Toast.makeText(context, "Не удалось открыть браузер", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        ) {
+                            Text("В браузере")
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                val clip = cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                                val extracted = CustomAuthWebViewHelper.extractOrCleanToken(clip)
+                                if (extracted != null && !delivered) {
+                                    delivered = true
+                                    onTokenCaptured(extracted)
+                                } else {
+                                    Toast.makeText(
+                                        context,
+                                        "В буфере нет токена (скопируй URL с access_token=)",
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        ) {
+                            Text("Вставить токен")
+                        }
                     }
                 }
 
-                if (loadProgress in 1..99) {
+                if (loadProgress in 1..99 || isVerifyingVk) {
                     LinearProgressIndicator(
-                        progress = { loadProgress / 100f },
+                        progress = { if (isVerifyingVk) 0.85f else loadProgress / 100f },
                         modifier = Modifier.fillMaxWidth(),
                     )
                 } else {
@@ -771,7 +740,12 @@ private fun ServiceOAuthWebViewDialog(
                                 loadWithOverviewMode = true
                                 useWideViewPort = true
                                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                                userAgentString = cleanChromeUserAgent(ctx)
+                                userAgentString =
+                                    if (provider == OAuthProvider.VK) {
+                                        VkWebSession.WEB_CHROME_UA
+                                    } else {
+                                        cleanChromeUserAgent(ctx)
+                                    }
                             }
                             webChromeClient =
                                 object : WebChromeClient() {
@@ -784,7 +758,7 @@ private fun ServiceOAuthWebViewDialog(
                                 }
                             webViewClient =
                                 object : WebViewClient() {
-                                    private fun checkUrl(
+                                    private fun checkYandexUrl(
                                         view: WebView?,
                                         url: String?,
                                     ): Boolean {
@@ -809,7 +783,7 @@ private fun ServiceOAuthWebViewDialog(
                                         request: WebResourceRequest?,
                                     ): Boolean {
                                         val u = request?.url?.toString() ?: return false
-                                        if (checkUrl(view, u)) return true
+                                        if (provider == OAuthProvider.YANDEX && checkYandexUrl(view, u)) return true
                                         val scheme = request.url?.scheme?.lowercase().orEmpty()
                                         if (scheme != "http" && scheme != "https") {
                                             return true
@@ -822,7 +796,14 @@ private fun ServiceOAuthWebViewDialog(
                                         url: String?,
                                     ) {
                                         loadProgress = 100
-                                        checkUrl(view, url)
+                                        if (provider == OAuthProvider.VK) {
+                                            val lower = url.orEmpty().lowercase()
+                                            if (lower.contains("vk.ru") || lower.contains("vk.com")) {
+                                                tryCaptureVkCookies(manual = false)
+                                            }
+                                        } else {
+                                            checkYandexUrl(view, url)
+                                        }
                                     }
 
                                     override fun onReceivedError(
@@ -832,7 +813,12 @@ private fun ServiceOAuthWebViewDialog(
                                     ) {
                                         if (request?.isForMainFrame == true) {
                                             loadProgress = 100
-                                            errorMessage = "Не грузится (${error?.description ?: "ошибка сети"}) — попробуй «В браузере»"
+                                            errorMessage =
+                                                if (provider == OAuthProvider.VK) {
+                                                    "Не грузится (${error?.description ?: "ошибка сети"}) — проверь сеть/VPN"
+                                                } else {
+                                                    "Не грузится (${error?.description ?: "ошибка сети"}) — попробуй «В браузере»"
+                                                }
                                         }
                                     }
                                 }
@@ -2692,9 +2678,15 @@ fun CustomEngineSettingsContent(
                 Text(if (showManualTokens) "Скрыть токены" else "Вручную")
             }
         }
+        val vkStatusLabel =
+            when {
+                vkInput.isBlank() -> "нет"
+                VkWebSession.isCookieSession(vkInput) -> "подключён (веб)"
+                else -> "старый токен (обнови)"
+            }
         Text(
             text =
-                "ВК: ${if (vkInput.isNotBlank()) "подключён" else "нет"} • " +
+                "ВК: $vkStatusLabel • " +
                     "Яндекс: ${if (yandexInput.isNotBlank()) "подключён" else "нет"} • " +
                     "YouTube: ${if (isYouTubeLoggedIn) "подключён" else "нет"} • " +
                     "Last.fm: ${if (lastFmConnected) "подключён" else "нет"}",
@@ -2713,7 +2705,7 @@ fun CustomEngineSettingsContent(
             OutlinedTextField(
                 value = vkInput,
                 onValueChange = { vkInput = it },
-                label = { Text("Токен ВК (Kate Mobile / ссылка blank.html#access_token=...)") },
+                label = { Text("Сессия / токен ВК (vkcookie::... или access_token)") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -3129,9 +3121,18 @@ fun CustomEngineSettingsContent(
                 when (provider) {
                     OAuthProvider.VK -> {
                         vkInput = capturedToken
+                        VkWebSession.invalidateCachedToken()
+                        vkProvider.resetFloodCooldown()
                         configStore.update { it.copy(vkToken = capturedToken) }
                         CustomCatalogProvider.triggerBackgroundTasteScan(configStore, force = true)
-                        statusMessage = "Вход в ВК выполнен — токен сохранён, вкус сканируется в фоне"
+                        statusMessage = "Веб-сессия ВК сохранена — проверяю аудио…"
+                        scope.launch {
+                            statusMessage =
+                                vkProvider.checkTokenDetailed(capturedToken).fold(
+                                    onSuccess = { "VK: $it" },
+                                    onFailure = { "VK: ${it.message ?: "ошибка проверки"}" },
+                                )
+                        }
                     }
                     OAuthProvider.YANDEX -> {
                         yandexInput = capturedToken
