@@ -16,40 +16,25 @@ import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.focusGroup
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -68,26 +53,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.focusRestorer
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.metrolist.android.LocalMiniPlayerBottomInset
 import com.metrolist.android.LocalPlaylistAdder
+import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.android.playback.AudioCacheManager
 import com.metrolist.android.playback.LocalPlayerConnection
 import com.metrolist.android.playback.SongDownloadManager
-import com.metrolist.android.ui.component.AdaptiveModalBottomSheet
 import com.metrolist.android.ui.component.SwipeGestureHandler
 import com.metrolist.android.ui.components.CollectionCoverEditor
-import com.metrolist.android.ui.components.SongMetadataRow
 import com.metrolist.android.ui.download.rememberDownloadPermissionGate
 import com.metrolist.android.ui.menu.CollectionExportDialog
 import com.metrolist.android.ui.menu.PlaylistMenu
@@ -107,7 +84,6 @@ import com.metrolist.shared.generated.resources.Res
 import com.metrolist.shared.generated.resources.back
 import com.metrolist.shared.generated.resources.cached_playlist
 import com.metrolist.shared.generated.resources.cancel
-import com.metrolist.shared.generated.resources.delete
 import com.metrolist.shared.generated.resources.edit_playlist_cover
 import com.metrolist.shared.generated.resources.episodes_for_later
 import com.metrolist.shared.generated.resources.error_unknown
@@ -152,13 +128,11 @@ import com.metrolist.shared.settings.HiddenLibraryItems
 import com.metrolist.shared.settings.SavedPlaylistCollectionSorting
 import com.metrolist.shared.settings.SavedPlaylistSongSorting
 import com.metrolist.shared.settings.Settings
-import com.metrolist.shared.settings.displayName
 import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.state.SongMetadataState
 import com.metrolist.shared.ui.components.AlertDialog
 import com.metrolist.shared.ui.components.CollectionFilterBar
-import com.metrolist.shared.ui.components.CollectionFilterBarText
 import com.metrolist.shared.ui.components.ContainedLoadingIndicator
 import com.metrolist.shared.ui.components.PlaylistOrderControls
 import com.metrolist.shared.ui.components.PopupContent
@@ -166,7 +140,6 @@ import com.metrolist.shared.ui.components.PopupVisibility
 import com.metrolist.shared.ui.components.RefreshIndicator
 import com.metrolist.shared.ui.components.SongSelectionControls
 import com.metrolist.shared.ui.components.TopPlaylistOrderControls
-import com.metrolist.shared.ui.components.images.AsyncImage
 import com.metrolist.shared.ui.components.libraryCover
 import com.metrolist.shared.ui.components.rememberDownloadPlaylistFilter
 import com.metrolist.shared.ui.components.topPlaylistOrderControlsText
@@ -178,9 +151,7 @@ import com.metrolist.shared.ui.screens.collectionFilterBarText
 import com.metrolist.shared.ui.screens.playlistContentText
 import com.metrolist.shared.ui.screens.playlistOrderControlsText
 import com.metrolist.shared.ui.selection.rememberSelectionState
-import com.metrolist.shared.ui.settings.StorageConfirmationDialog
 import com.metrolist.shared.ui.tv.tvFocusHighlight
-import com.valentinilk.shimmer.shimmer
 import io.ktor.utils.io.jvm.javaio.toByteReadChannel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -290,6 +261,16 @@ fun AutoPlaylistScreen(
         if (countIds.isEmpty()) flowOf(emptyMap()) else database.collectionPlayCounts(countIds)
     }.collectAsState(emptyMap())
 
+    val customCachedSongs by remember(currentType) {
+        if (currentType == "cached") {
+            CustomMediaCacheManager.stats.map {
+                BlockedContent.filterSongs(CustomMediaCacheManager.getOfflineCachedSongs(limit = 300))
+            }
+        } else {
+            flowOf(emptyList())
+        }
+    }.collectAsState(initial = emptyList())
+
     val defaultLikedSort =
         remember {
             PlaylistSongSort.entries.firstOrNull {
@@ -395,6 +376,19 @@ fun AutoPlaylistScreen(
             emptyList()
         } else if (isLikedCollection && likedReorderMode && collectionQuery.isBlank()) {
             songs
+        } else if (currentType == "cached" && customCachedSongs.isNotEmpty()) {
+            val existingIds = preparedSongs.mapTo(HashSet()) { it.id }
+            val q = collectionQuery.trim()
+            val extra =
+                customCachedSongs.filter { song ->
+                    song.id !in existingIds &&
+                        (
+                            q.isBlank() ||
+                                song.title.contains(q, ignoreCase = true) ||
+                                song.artists.any { it.name.contains(q, ignoreCase = true) }
+                        )
+                }
+            preparedSongs + extra
         } else {
             preparedSongs
         }
@@ -404,8 +398,8 @@ fun AutoPlaylistScreen(
         }
     val displayedSongIds = remember(displayedSongs) { displayedSongs.mapTo(mutableSetOf()) { it.id } }
 
-    LaunchedEffect(songs) {
-        selection.retain(songs.map { it.id })
+    LaunchedEffect(songs, customCachedSongs) {
+        selection.retain((songs + customCachedSongs).map { it.id })
     }
 
     suspend fun loadUploadedSongs() {
@@ -414,14 +408,15 @@ fun AutoPlaylistScreen(
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            Toast.makeText(context, getString(Res.string.upload_failed), Toast.LENGTH_LONG).show()
+            if (Settings.shared.innerTubeCookie.isNotBlank()) {
+                Toast.makeText(context, getString(Res.string.upload_failed), Toast.LENGTH_LONG).show()
+            }
         }
     }
 
     val uploadLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
             pendingUploads += uris.size
-            // Picked files upload one at a time; picking again while uploading adds to the queue.
             uris.forEach { uri ->
                 scope.launch {
                     try {
@@ -522,12 +517,26 @@ fun AutoPlaylistScreen(
             }
 
             "top100" -> {
-                songs =
+                val mostPlayed =
                     database
                         .dao()
                         .mostPlayedSongs(topPeriod.fromTimestamp(Clock.System.now().toEpochMilliseconds()), limit = 100)
                         .first()
                         .map { it.toSongItem() }
+                songs =
+                    mostPlayed.ifEmpty {
+                        database
+                            .dao()
+                            .events()
+                            .first()
+                            .distinctBy { it.song.id }
+                            .take(100)
+                            .map { it.song.toSongItem() }
+                            .ifEmpty {
+                                (SongLikeState.likedSongs + CustomMediaCacheManager.getOfflineCachedSongs(limit = 50))
+                                    .distinctBy { it.id }
+                            }
+                    }
             }
 
             "uploaded" -> {
@@ -611,7 +620,10 @@ fun AutoPlaylistScreen(
             onRemove =
                 when {
                     isLikedCollection -> {
-                        { SongLikeState.removeLikes(selectedSongs.map { it.id }) }
+                        {
+                            selectedSongs.forEach { CustomMediaCacheManager.removeLikedDownload(it.id) }
+                            SongLikeState.removeLikes(selectedSongs.map { it.id })
+                        }
                     }
 
                     currentType == "downloaded" || currentType == "cached" -> {
@@ -759,7 +771,7 @@ fun AutoPlaylistScreen(
                             null
                         },
                     songs = displayedSongs,
-                    artworkSongs = songs,
+                    artworkSongs = if (currentType == "cached") displayedSongs else songs,
                     downloadedSongIds = downloadedSongIds,
                     text = playlistContentText(useTrackCount = currentType in setOf("podcasts", "SE")),
                     onPlayAll = {
@@ -785,8 +797,17 @@ fun AutoPlaylistScreen(
                             val input = presentationInput().copy(query = "")
                             val title = autoPlaylistTitle(currentType)
                             scope.launch {
-                                val queue = prepareAutoPlaylistSongs(input)
-                                val target = queue.indexOfPlaylistOccurrence(song)
+                                val baseQueue = prepareAutoPlaylistSongs(input)
+                                val queue =
+                                    if (currentType == "cached" && customCachedSongs.isNotEmpty()) {
+                                        val ids = baseQueue.mapTo(HashSet()) { it.id }
+                                        baseQueue + customCachedSongs.filter { it.id !in ids }
+                                    } else {
+                                        baseQueue
+                                    }
+                                val target =
+                                    queue.indexOfPlaylistOccurrence(song).takeIf { it >= 0 }
+                                        ?: queue.indexOfFirst { it.id == song.id }
                                 if (target >= 0) playerConnection?.playQueue(queue, target, title, finite = true)
                             }
                         }
@@ -952,14 +973,21 @@ fun AutoPlaylistScreen(
             onStartRadio = { playerConnection?.startRadio(song) },
             onPlayNext = { playerConnection?.addToQueue(song, playNext = true) },
             onAddToQueue = { playerConnection?.addToQueue(song) },
-            onLike = { SongLikeState.toggleLike(song) },
+            onLike = {
+                val wasLiked = SongLikeState.isLiked(song.id)
+                SongLikeState.toggleLike(song)
+                if (wasLiked) CustomMediaCacheManager.removeLikedDownload(song.id)
+            },
             onGoToArtist = onArtistClick,
             onGoToAlbum = song.album?.id?.let { albumId -> onAlbumClick?.let { open -> { open(albumId) } } },
             onRemove =
                 if (currentType == "cached") {
                     {
                         scope.launch {
-                            if (!audioCacheManager.removeCache(song.id, playerConnection?.playbackInstanceId() ?: 0L)) {
+                            val hadCustom = CustomMediaCacheManager.hasLocalFile(song.id)
+                            CustomMediaCacheManager.invalidateTrack(song.id)
+                            val removedCore = audioCacheManager.removeCache(song.id, playerConnection?.playbackInstanceId() ?: 0L)
+                            if (!hadCustom && !removedCore) {
                                 Toast.makeText(context, getString(Res.string.error_unknown), Toast.LENGTH_LONG).show()
                             }
                         }
@@ -977,28 +1005,29 @@ fun AutoPlaylistScreen(
 
     if (showCollectionMenu) {
         val title = autoPlaylistTitle(currentType)
+        val menuSongs = if (currentType == "cached") displayedSongs else songs
         PlaylistMenu(
             playlist =
                 BuiltinPlaylist.fromId("auto:$currentType")?.playlist(title)
                     ?: PlaylistItem(id = "auto:$currentType", title = title, thumbnail = null),
             fallbackIcon = MetrolistIcons.Filled.Favorite,
             onDismiss = { showCollectionMenu = false },
-            onPlay = { playerConnection?.playQueue(songs, queueTitle = title, finite = true) },
-            onShuffle = { playerConnection?.shuffleQueue(songs, queueTitle = title, finite = true) },
-            onPlayNext = { playerConnection?.addToQueue(songs, playNext = true) },
-            onAddToQueue = { playerConnection?.addToQueue(songs) },
+            onPlay = { playerConnection?.playQueue(menuSongs, queueTitle = title, finite = true) },
+            onShuffle = { playerConnection?.shuffleQueue(menuSongs, queueTitle = title, finite = true) },
+            onPlayNext = { playerConnection?.addToQueue(menuSongs, playNext = true) },
+            onAddToQueue = { playerConnection?.addToQueue(menuSongs) },
             onHideFromLibrary = {
                 HiddenLibraryItems.hide(HiddenLibraryItem(HiddenLibraryItemType.AUTO, currentType, title))
             },
             onExport = { showExportDialog = true },
-            loadSongs = { songs },
+            loadSongs = { menuSongs },
         )
     }
     PopupVisibility(visible = showExportDialog) {
         CollectionExportDialog(
             title = autoPlaylistTitle(currentType),
             onDismiss = { showExportDialog = false },
-            loadSongs = { songs },
+            loadSongs = { if (currentType == "cached") displayedSongs else songs },
         )
     }
 
@@ -1028,7 +1057,9 @@ fun AutoPlaylistScreen(
                                 if (currentType == "downloaded") {
                                     songDownloadManager.clearDownloads()
                                 } else {
+                                    CustomMediaCacheManager.clearWaveCache()
                                     audioCacheManager.clearCache()
+                                    true
                                 }
                             if (!removed) Toast.makeText(context, getString(Res.string.error_unknown), Toast.LENGTH_LONG).show()
                             selection.exit()
@@ -1065,7 +1096,10 @@ fun AutoPlaylistScreen(
                                     if (currentType == "downloaded") {
                                         songs.firstOrNull { it.id == id }?.let { songDownloadManager.removeDownload(it) } == true
                                     } else {
-                                        audioCacheManager.removeCache(id, playerConnection?.playbackInstanceId() ?: 0L)
+                                        val hadCustom = CustomMediaCacheManager.hasLocalFile(id)
+                                        CustomMediaCacheManager.invalidateTrack(id)
+                                        val removedCore = audioCacheManager.removeCache(id, playerConnection?.playbackInstanceId() ?: 0L)
+                                        hadCustom || removedCore
                                     }
                                 }
                             if (failed.isNotEmpty()) Toast.makeText(context, getString(Res.string.error_unknown), Toast.LENGTH_LONG).show()
