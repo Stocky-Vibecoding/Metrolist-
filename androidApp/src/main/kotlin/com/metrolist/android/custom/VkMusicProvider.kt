@@ -12,7 +12,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.abs
@@ -25,7 +24,7 @@ data class VkWebTokenData(
 /**
  * Менеджер веб-сессии VK (client_id=6287487):
  * хранит долгоживущие cookies (`vkcookie::...`) и прозрачно меняет их на короткий `web_token`
- * через `POST https://login.vk.ru/?act=web_token` для работы с `web.api.vk.ru/method/*`.
+ * через `POST https://login.vk.ru/?act=web_token` для работы с `web.api.vk.ru/method/`.
  */
 object VkWebSession {
     private const val TAG = "VkWebSession"
@@ -85,7 +84,15 @@ object VkWebSession {
     fun clearWebViewVkCookies() {
         runCatching {
             val cm = CookieManager.getInstance()
-            val domains = listOf("https://vk.ru", "https://m.vk.ru", "https://login.vk.ru", "https://id.vk.ru", "https://vk.com", "https://login.vk.com")
+            val domains =
+                listOf(
+                    "https://vk.ru",
+                    "https://m.vk.ru",
+                    "https://login.vk.ru",
+                    "https://id.vk.ru",
+                    "https://vk.com",
+                    "https://login.vk.com",
+                )
             for (d in domains) {
                 val raw = cm.getCookie(d) ?: continue
                 parseCookieMap(raw).keys.forEach { key ->
@@ -263,9 +270,9 @@ object VkWebSession {
                 conn.setFixedLengthStreamingMode(payload.size)
                 conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
-                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
-                    writer.write(formBody)
-                    writer.flush()
+                conn.outputStream.use { out ->
+                    out.write(payload)
+                    out.flush()
                 }
                 val code = conn.responseCode
                 val stream = if (code in 200..299) conn.inputStream else conn.errorStream
