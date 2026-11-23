@@ -116,6 +116,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -134,8 +135,10 @@ import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import com.metrolist.android.playback.PlayerConnection
 import com.metrolist.android.playback.SmartLoudnessController
+import com.metrolist.shared.api.lastfm.LastFM
 import com.metrolist.shared.model.SearchFilter
 import com.metrolist.shared.model.SongItem
+import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.state.GlobalYouTubeRepository
 import com.metrolist.shared.state.SongLikeState
 import com.metrolist.shared.ui.components.images.AsyncImage
@@ -151,6 +154,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLDecoder
 import kotlin.coroutines.resume
 import kotlin.math.PI
@@ -158,15 +165,21 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
-private const val VK_OAUTH_URL =
-    "https://oauth.vk.com/authorize?client_id=2685278&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.131&response_type=token&revoke=1"
 private const val VK_ADMIN_OAUTH_URL =
     "https://oauth.vk.com/authorize?client_id=6121396&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.131&response_type=token&revoke=1"
+private const val VK_ANDROID_OAUTH_URL =
+    "https://oauth.vk.com/authorize?client_id=2274003&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.131&response_type=token&revoke=1"
+private const val VK_ME_OAUTH_URL =
+    "https://oauth.vk.com/authorize?client_id=6146827&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.131&response_type=token&revoke=1"
+private const val VK_KATE_OAUTH_URL =
+    "https://oauth.vk.com/authorize?client_id=2685278&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.131&response_type=token&revoke=1"
 private const val VK_SILENT_OAUTH_URL =
-    "https://oauth.vk.com/authorize?client_id=2685278&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.131&response_type=token"
+    "https://oauth.vk.com/authorize?client_id=6121396&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.131&response_type=token"
 private const val YANDEX_OAUTH_URL =
     "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d"
 private const val GEMINI_AI_STUDIO_URL = "https://aistudio.google.com/apikey"
+private const val LASTFM_API_CREATE_URL = "https://www.last.fm/api/account/create"
+private const val LASTFM_API_ENDPOINT = "https://ws.audioscrobbler.com/2.0/"
 
 private const val FALLBACK_MOBILE_CHROME_UA =
     "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
@@ -206,11 +219,21 @@ half4 main(float2 fragCoord) {
 }
 """
 
+private enum class VkOAuthClient(
+    val label: String,
+    val url: String,
+) {
+    VK_ADMIN("VK Admin", VK_ADMIN_OAUTH_URL),
+    VK_ANDROID("VK Android", VK_ANDROID_OAUTH_URL),
+    VK_ME("VK Me", VK_ME_OAUTH_URL),
+    KATE("Kate", VK_KATE_OAUTH_URL),
+}
+
 private enum class OAuthProvider(
     val title: String,
     val authUrl: String,
 ) {
-    VK("Вход в ВКонтакте", VK_OAUTH_URL),
+    VK("Вход в ВКонтакте", VK_ADMIN_OAUTH_URL),
     YANDEX("Вход в Яндекс.Музыку", YANDEX_OAUTH_URL),
 }
 
@@ -348,6 +371,279 @@ object CustomAuthWebViewHelper {
     }
 }
 
+/** Прямой вход в Last.fm (`auth.getMobileSession` или привязка профиля по никнейму) без экрана «Интеграции». */
+private suspend fun performLastFmMobileLogin(
+    username: String,
+    password: String,
+    apiKey: String,
+    secret: String,
+): Result<Pair<String, String>> =
+    withContext(Dispatchers.IO) {
+        try {
+            val sigRaw =
+                "api_key${apiKey}methodauth.getMobileSessionpassword${password}username${username}$secret"
+            val apiSig = CustomHttp.md5Hex(sigRaw)
+            val formBody =
+                "method=auth.getMobileSession" +
+                    "&username=${CustomHttp.urlEncode(username)}" +
+                    "&password=${CustomHttp.urlEncode(password)}" +
+                    "&api_key=${CustomHttp.urlEncode(apiKey)}" +
+                    "&api_sig=$apiSig" +
+                    "&format=json"
+
+            val conn = (URL(LASTFM_API_ENDPOINT).openConnection() as HttpURLConnection)
+            val responseText: String
+            try {
+                conn.requestMethod = "POST"
+                conn.connectTimeout = 10_000
+                conn.readTimeout = 15_000
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+                    writer.write(formBody)
+                    writer.flush()
+                }
+                val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+                responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            } finally {
+                conn.disconnect()
+            }
+
+            val root = JSONObject(responseText)
+            if (root.has("error")) {
+                val msg = root.optString("message").ifBlank { "Ошибка Last.fm #${root.optInt("error")}" }
+                return@withContext Result.failure(IllegalStateException(msg))
+            }
+            val sessionObj = root.optJSONObject("session")
+                ?: return@withContext Result.failure(IllegalStateException("Пустой ответ от Last.fm"))
+            val key = sessionObj.optString("key").trim()
+            val name = sessionObj.optString("name").trim().ifBlank { username }
+            if (key.isBlank()) {
+                return@withContext Result.failure(IllegalStateException("Last.fm не вернул ключ сессии"))
+            }
+            Result.success(name to key)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+@Composable
+fun LastFmLoginDialog(
+    configStore: CustomConfigStore,
+    onDismiss: () -> Unit,
+    onSuccess: (String) -> Unit = {},
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val cfg by configStore.config.collectAsState()
+
+    var usernameInput by remember {
+        mutableStateOf(
+            Settings.shared.lastFmUsername.ifBlank { cfg.lastFmUsername },
+        )
+    }
+    var passwordInput by remember { mutableStateOf("") }
+    var apiKeyInput by remember { mutableStateOf(cfg.lastFmApiKey) }
+    var secretInput by remember { mutableStateOf(cfg.lastFmSecret) }
+    var isLoading by remember { mutableStateOf(false) }
+    var errorText by remember { mutableStateOf<String?>(null) }
+
+    val isAlreadyConnected =
+        Settings.shared.lastFmSession.isNotBlank() ||
+            Settings.shared.lastFmUsername.isNotBlank() ||
+            cfg.lastFmUsername.isNotBlank()
+
+    Dialog(onDismissRequest = { if (!isLoading) onDismiss() }) {
+        Surface(
+            shape = RoundedCornerShape(26.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            modifier = Modifier.fillMaxWidth().widthIn(max = 380.dp),
+        ) {
+            Column(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    text = "Профиль Last.fm",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = "Укажи никнейм для профиля. Для скробблинга и истории получи бесплатный API Key + Secret на сайте Last.fm и введи пароль.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(LASTFM_API_CREATE_URL))
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                            )
+                        }.onFailure {
+                            Toast.makeText(context, "Не удалось открыть браузер", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Получить API ключ Last.fm")
+                }
+
+                OutlinedTextField(
+                    value = usernameInput,
+                    onValueChange = { usernameInput = it },
+                    label = { Text("Имя пользователя Last.fm") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = passwordInput,
+                    onValueChange = { passwordInput = it },
+                    label = { Text("Пароль (для скробблинга)") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = apiKeyInput,
+                    onValueChange = { apiKeyInput = it },
+                    label = { Text("API Key (с last.fm/api)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = secretInput,
+                    onValueChange = { secretInput = it },
+                    label = { Text("Shared Secret (с last.fm/api)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                if (!errorText.isNullOrBlank()) {
+                    Text(
+                        text = errorText.orEmpty(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (isAlreadyConnected) {
+                        TextButton(
+                            enabled = !isLoading,
+                            onClick = {
+                                Settings.shared.lastFmUsername = ""
+                                Settings.shared.lastFmSession = ""
+                                Settings.shared.lastFmEnabled = false
+                                Settings.shared.lastFmSessionExpired = false
+                                configStore.update {
+                                    it.copy(
+                                        lastFmUsername = "",
+                                        localAccountName = "Профиль Last.fm",
+                                    )
+                                }
+                                onSuccess("Вышли из Last.fm")
+                                onDismiss()
+                            },
+                        ) {
+                            Text("Выйти", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    Spacer(modifier = Modifier.weight(1f))
+                    TextButton(enabled = !isLoading, onClick = onDismiss) {
+                        Text("Отмена")
+                    }
+                    Button(
+                        enabled = !isLoading,
+                        onClick = {
+                            val user = usernameInput.trim()
+                            val pass = passwordInput
+                            val key = apiKeyInput.trim()
+                            val sec = secretInput.trim()
+                            if (user.isBlank()) {
+                                errorText = "Введи имя пользователя Last.fm"
+                                return@Button
+                            }
+                            errorText = null
+
+                            if (pass.isBlank()) {
+                                // Быстрая привязка профиля и вкуса без пароля
+                                if (key.isNotBlank() && sec.isNotBlank()) {
+                                    LastFM.initialize(key, sec)
+                                }
+                                Settings.shared.lastFmUsername = user
+                                configStore.update {
+                                    it.copy(
+                                        lastFmUsername = user,
+                                        lastFmApiKey = key,
+                                        lastFmSecret = sec,
+                                        localAccountName = user,
+                                    )
+                                }
+                                onSuccess("Профиль Last.fm сохранён: $user")
+                                onDismiss()
+                                return@Button
+                            }
+
+                            if (key.isBlank() || sec.isBlank()) {
+                                errorText = "Для входа с паролем укажи API Key и Shared Secret (кнопка сверху), либо оставь пароль пустым"
+                                return@Button
+                            }
+
+                            isLoading = true
+                            scope.launch {
+                                try {
+                                    performLastFmMobileLogin(
+                                        username = user,
+                                        password = pass,
+                                        apiKey = key,
+                                        secret = sec,
+                                    ).onSuccess { (resolvedName, sessionKey) ->
+                                        LastFM.initialize(key, sec)
+                                        Settings.shared.lastFmUsername = resolvedName
+                                        Settings.shared.lastFmSession = sessionKey
+                                        Settings.shared.lastFmEnabled = true
+                                        Settings.shared.lastFmActivityEnabled = true
+                                        Settings.shared.lastFmSessionExpired = false
+                                        configStore.update {
+                                            it.copy(
+                                                lastFmUsername = resolvedName,
+                                                lastFmApiKey = key,
+                                                lastFmSecret = sec,
+                                                localAccountName = resolvedName,
+                                            )
+                                        }
+                                        onSuccess("Last.fm подключён: $resolvedName")
+                                        onDismiss()
+                                    }.onFailure { err ->
+                                        errorText = err.message ?: "Не удалось войти в Last.fm"
+                                    }
+                                } finally {
+                                    isLoading = false
+                                }
+                            }
+                        },
+                    ) {
+                        Text(if (isLoading) "Вход…" else "Подключить")
+                    }
+                }
+            }
+        }
+    }
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 private fun ServiceOAuthWebViewDialog(
@@ -356,10 +652,10 @@ private fun ServiceOAuthWebViewDialog(
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
-    var useVkAdminClient by remember { mutableStateOf(false) }
+    var vkClient by remember { mutableStateOf(VkOAuthClient.VK_ADMIN) }
     val targetUrl =
-        if (provider == OAuthProvider.VK && useVkAdminClient) {
-            VK_ADMIN_OAUTH_URL
+        if (provider == OAuthProvider.VK) {
+            vkClient.url
         } else {
             provider.authUrl
         }
@@ -419,16 +715,13 @@ private fun ServiceOAuthWebViewDialog(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     if (provider == OAuthProvider.VK) {
-                        FilterChip(
-                            selected = !useVkAdminClient,
-                            onClick = { useVkAdminClient = false },
-                            label = { Text("Kate", maxLines = 1) },
-                        )
-                        FilterChip(
-                            selected = useVkAdminClient,
-                            onClick = { useVkAdminClient = true },
-                            label = { Text("VK Admin", maxLines = 1) },
-                        )
+                        VkOAuthClient.entries.forEach { client ->
+                            FilterChip(
+                                selected = vkClient == client,
+                                onClick = { vkClient = client },
+                                label = { Text(client.label, maxLines = 1) },
+                            )
+                        }
                     }
                     OutlinedButton(
                         onClick = {
@@ -528,7 +821,7 @@ private fun ServiceOAuthWebViewDialog(
                                         }
                                         val oauthErr = CustomAuthWebViewHelper.extractOAuthError(url)
                                         if (oauthErr != null) {
-                                            errorMessage = "Ошибка OAuth: $oauthErr (попробуй VK Admin или «В браузере»)"
+                                            errorMessage = "Ошибка OAuth: $oauthErr (попробуй VK Android или «В браузере»)"
                                         }
                                         return false
                                     }
@@ -735,7 +1028,6 @@ fun WaveHomeScreen(
         }
     }
 
-    // Полная пересборка волны (по кнопке «Применить» или «Обновить волну»)
     fun regenerateWave() {
         val conn = playerConnection ?: return
         val excludeCurrent = setOfNotNull(currentSong?.id)
@@ -757,7 +1049,6 @@ fun WaveHomeScreen(
         }
     }
 
-    // Мгновенное продолжение сохранённой волны (при возврате к волне / крестике / запуске с пустого плеера)
     fun resumeOrStartWave() {
         val conn = playerConnection ?: return
         val excludeCurrent = setOfNotNull(currentSong?.id)
@@ -774,8 +1065,6 @@ fun WaveHomeScreen(
             }
 
         if (unplayed.isNotEmpty()) {
-            // Продолжаем с недослушанных треков волны без лишнего запроса в Gemini —
-            // когда останется <= 3 треков, AndroidQueueCoordinator сам тихо догрузит следующую пачку
             conn.playQueue(
                 songs = unplayed,
                 queueTitle = "Моя волна",
@@ -785,7 +1074,6 @@ fun WaveHomeScreen(
             return
         }
 
-        // Все сохранённые треки уже недавно отыграли — мгновенно включаем и тихо обновляем хвост
         conn.playQueue(
             songs = savedStarter,
             queueTitle = "Моя волна",
@@ -811,8 +1099,10 @@ fun WaveHomeScreen(
         resumeOrStartWave()
     }
 
+    // Не дублируем «Подбираю волну…» в пузыре, пока под маскотом уже крутится спиннер
     val activeBubbleText =
         when {
+            isGenerating && !isPlaying -> null
             !waveStatus.isNullOrBlank() -> waveStatus
             isPlaying && !mascotPhrase.isNullOrBlank() -> mascotPhrase
             else -> null
@@ -952,6 +1242,7 @@ fun WaveHomeScreen(
                         AnimatedWaveMascotStage(
                             isPlaying = isPlaying,
                             isGenerating = isGenerating,
+                            generatingLabel = waveStatus,
                             showMascot = cfg.mascotEnabled,
                             isStageVisible = isMascotVideoActive,
                             speechBubbleText = activeBubbleText,
@@ -983,6 +1274,7 @@ fun WaveHomeScreen(
                     AnimatedWaveMascotStage(
                         isPlaying = isPlaying,
                         isGenerating = isGenerating,
+                        generatingLabel = waveStatus,
                         showMascot = cfg.mascotEnabled,
                         isStageVisible = isMascotVideoActive,
                         speechBubbleText = activeBubbleText,
@@ -1444,6 +1736,7 @@ private fun LiveMascotVideoLayer(
 private fun AnimatedWaveMascotStage(
     isPlaying: Boolean,
     isGenerating: Boolean,
+    generatingLabel: String?,
     showMascot: Boolean,
     isStageVisible: Boolean,
     speechBubbleText: String?,
@@ -1833,7 +2126,7 @@ private fun AnimatedWaveMascotStage(
                     modifier = Modifier.size(16.dp),
                 )
                 Text(
-                    text = "Подбираю волну…",
+                    text = generatingLabel?.takeIf { it.isNotBlank() } ?: "Подбираю волну…",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -2149,7 +2442,7 @@ fun CustomEngineSettingsContent(
     isYouTubeLoggedIn: Boolean = false,
     isLastFmLoggedIn: Boolean = false,
     onOpenYouTubeLogin: (() -> Unit)? = null,
-    onOpenLastFmLogin: (() -> Unit)? = null,
+    @Suppress("UNUSED_PARAMETER") onOpenLastFmLogin: (() -> Unit)? = null,
     bottomPadding: Dp = 0.dp,
     showTitleHeader: Boolean = true,
 ) {
@@ -2180,11 +2473,18 @@ fun CustomEngineSettingsContent(
     var showLogs by remember { mutableStateOf(false) }
     var showManualTokens by remember { mutableStateOf(false) }
     var activeOAuthProvider by remember { mutableStateOf<OAuthProvider?>(null) }
+    var showLastFmLoginDialog by remember { mutableStateOf(false) }
 
     var importSyncLimit by remember { mutableIntStateOf(100) }
     var importProgressText by remember { mutableStateOf<String?>(null) }
     var importJob by remember { mutableStateOf<Job?>(null) }
     val isImporting = importJob != null
+
+    val effectiveLastFmConnected =
+        isLastFmLoggedIn ||
+            Settings.shared.lastFmSession.isNotBlank() ||
+            Settings.shared.lastFmUsername.isNotBlank() ||
+            cfg.lastFmUsername.isNotBlank()
 
     fun persistInputs() {
         val cleanYandex = CustomAuthWebViewHelper.extractOrCleanToken(yandexInput) ?: yandexInput.trim()
@@ -2417,15 +2717,13 @@ fun CustomEngineSettingsContent(
                 Button(
                     onClick = onOpenYouTubeLogin,
                 ) {
-                    Text(if (isYouTubeLoggedIn) "YouTube ✓" else "Войти в YouTube")
+                    Text(if (isYouTubeLoggedIn) "Обновить YouTube" else "Войти в YouTube")
                 }
             }
-            if (onOpenLastFmLogin != null) {
-                Button(
-                    onClick = onOpenLastFmLogin,
-                ) {
-                    Text(if (isLastFmLoggedIn) "Last.fm ✓" else "Войти в Last.fm")
-                }
+            Button(
+                onClick = { showLastFmLoginDialog = true },
+            ) {
+                Text(if (effectiveLastFmConnected) "Обновить Last.fm" else "Войти в Last.fm")
             }
             OutlinedButton(
                 onClick = { showManualTokens = !showManualTokens },
@@ -2438,7 +2736,7 @@ fun CustomEngineSettingsContent(
                 "ВК: ${if (vkInput.isNotBlank()) "подключён" else "нет"} • " +
                     "Яндекс: ${if (yandexInput.isNotBlank()) "подключён" else "нет"} • " +
                     "YouTube: ${if (isYouTubeLoggedIn) "подключён" else "нет"} • " +
-                    "Last.fm: ${if (isLastFmLoggedIn) "подключён" else "нет"}",
+                    "Last.fm: ${if (effectiveLastFmConnected) "подключён" else "нет"}",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -2461,14 +2759,14 @@ fun CustomEngineSettingsContent(
             OutlinedTextField(
                 value = lfmKeyInput,
                 onValueChange = { lfmKeyInput = it },
-                label = { Text("Last.fm API Key (необязательно)") },
+                label = { Text("Last.fm API Key") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
                 value = lfmSecretInput,
                 onValueChange = { lfmSecretInput = it },
-                label = { Text("Last.fm Secret") },
+                label = { Text("Last.fm Shared Secret") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -2875,6 +3173,14 @@ fun CustomEngineSettingsContent(
         Spacer(modifier = Modifier.height(24.dp + bottomPadding))
     }
 
+    if (showLastFmLoginDialog) {
+        LastFmLoginDialog(
+            configStore = configStore,
+            onDismiss = { showLastFmLoginDialog = false },
+            onSuccess = { msg -> statusMessage = msg },
+        )
+    }
+
     activeOAuthProvider?.let { provider ->
         ServiceOAuthWebViewDialog(
             provider = provider,
@@ -2883,9 +3189,17 @@ fun CustomEngineSettingsContent(
                 when (provider) {
                     OAuthProvider.VK -> {
                         vkInput = capturedToken
+                        vkProvider.resetFloodCooldown()
                         configStore.update { it.copy(vkToken = capturedToken) }
                         CustomCatalogProvider.triggerBackgroundTasteScan(configStore, force = true)
-                        statusMessage = "Вход в ВК выполнен — токен сохранён, вкус сканируется в фоне"
+                        statusMessage = "Вход в ВК выполнен — проверяю аудио API…"
+                        scope.launch {
+                            statusMessage =
+                                vkProvider.checkTokenDetailed(capturedToken).fold(
+                                    onSuccess = { "VK: $it" },
+                                    onFailure = { "VK: ${it.message ?: "ошибка"}" },
+                                )
+                        }
                     }
                     OAuthProvider.YANDEX -> {
                         yandexInput = capturedToken
@@ -3052,35 +3366,3 @@ fun SearchAiPlaylistCard(
                                         .clickable { onPlaySongs(songs.drop(index), result!!.query) }
                                         .padding(vertical = 4.dp, horizontal = 4.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    text = "${index + 1}.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.width(26.dp),
-                                )
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = song.title,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    if (artistText.isNotBlank()) {
-                                        Text(
-                                            text = artistText,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
