@@ -6,6 +6,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Locale
 import kotlin.math.abs
 
 data class ResolvedCustomStream(
@@ -38,6 +40,8 @@ private data class YandexTrackCandidate(
     val available: Boolean,
     val coverUrl: String?,
     val hasRestrictionDisclaimer: Boolean,
+    val releaseYear: Int? = null,
+    val releaseDateMs: Long? = null,
 )
 
 class YandexMusicProvider(
@@ -219,6 +223,8 @@ class YandexMusicProvider(
             durationSec = best.durationSec,
             coverUrl = best.coverUrl,
             isExplicit = best.isExplicit,
+            releaseYear = best.releaseYear,
+            releaseDateMs = best.releaseDateMs,
         )
     }
 
@@ -246,7 +252,7 @@ class YandexMusicProvider(
                 } else {
                     mapOf("User-Agent" to CLIENT_USER_AGENT, "Accept-Language" to "ru")
                 }
-            val response = CustomHttp.get(url, headers = headers, timeoutMs = 6_000)
+            val response = CustomHttp.get(url, headers = headers, timeoutMs = 4_500)
             if (token.isNotBlank() && (response.code == 401 || response.code == 403)) {
                 configStore.setYandexPlusStatus(YandexPlusStatus.INVALID_TOKEN)
                 emptyList()
@@ -294,6 +300,7 @@ class YandexMusicProvider(
                             val hasRestriction = hasRestrictionDisclaimer(disclaimers)
                             val available = item.optBoolean("available", true)
                             val coverUrl = formatHdCover(item.optString("coverUri"))
+                            val (relYear, relDateMs) = parseAlbumRelease(item.optJSONArray("albums"))
 
                             add(
                                 YandexTrackCandidate(
@@ -306,6 +313,8 @@ class YandexMusicProvider(
                                     available = available,
                                     coverUrl = coverUrl,
                                     hasRestrictionDisclaimer = hasRestriction,
+                                    releaseYear = relYear,
+                                    releaseDateMs = relDateMs,
                                 ),
                             )
                         }
@@ -318,6 +327,22 @@ class YandexMusicProvider(
             Log.w(TAG, "Yandex search failed: ${error.message}")
             emptyList()
         }
+
+    private fun parseAlbumRelease(albums: JSONArray?): Pair<Int?, Long?> {
+        val firstAlb = albums?.optJSONObject(0) ?: return null to null
+        val rawDate = firstAlb.optString("releaseDate").trim()
+        val yearFromField = firstAlb.optInt("year", 0).takeIf { it in 1900..2100 }
+        val yearFromDate = rawDate.takeIf { it.length >= 4 }?.take(4)?.toIntOrNull()?.takeIf { it in 1900..2100 }
+        val ms =
+            if (rawDate.length >= 10) {
+                runCatching {
+                    SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(rawDate.take(10))?.time
+                }.getOrNull()
+            } else {
+                null
+            }
+        return (yearFromField ?: yearFromDate) to ms
+    }
 
     private fun pickBestMatch(
         candidates: List<YandexTrackCandidate>,
@@ -449,7 +474,7 @@ class YandexMusicProvider(
                 CustomHttp.get(
                     url = "$API_BASE/tracks/$trackId/download-info",
                     headers = authHeaders(token),
-                    timeoutMs = 6_000,
+                    timeoutMs = 5_500,
                 )
             if (infoResp.code == 401 || infoResp.code == 403) {
                 configStore.setYandexPlusStatus(YandexPlusStatus.INVALID_TOKEN)
@@ -486,7 +511,7 @@ class YandexMusicProvider(
                             CustomHttp.get(
                                 url = "$targetInfoUrl${separator}format=json",
                                 headers = authHeaders(token),
-                                timeoutMs = 6_000,
+                                timeoutMs = 5_500,
                             )
                         val meta = if (metaResp.isSuccess) parseDownloadMeta(metaResp.body) else null
                         if (meta == null) {
