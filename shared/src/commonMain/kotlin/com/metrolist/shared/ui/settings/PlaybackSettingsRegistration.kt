@@ -16,7 +16,6 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.runtime.Composable
 import com.metrolist.shared.generated.resources.*
 import com.metrolist.shared.settings.KeepScreenOnMode
-import com.metrolist.shared.settings.LoudnessLevel
 import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.ui.icons.MetrolistIcons
 import com.metrolist.shared.utils.formatPlaybackPitch
@@ -36,20 +35,6 @@ internal fun SettingsUiRegistryBuilder.registerPlaybackSettings(host: SharedSett
             SettingsChoice("AUTO", stringResource(Res.string.audio_quality_auto)),
             SettingsChoice("HIGH", stringResource(Res.string.audio_quality_high)),
         )
-    val loudnessLevelChoices =
-        LoudnessLevel.entries.map { level ->
-            SettingsChoice(
-                level.name,
-                stringResource(
-                    when (level) {
-                        LoudnessLevel.AGGRESSIVE -> Res.string.loudness_level_aggressive
-                        LoudnessLevel.LOUD -> Res.string.loudness_level_loud
-                        LoudnessLevel.BALANCED -> Res.string.loudness_level_balanced
-                        LoudnessLevel.QUIET -> Res.string.loudness_level_quiet
-                    },
-                ),
-            )
-        }
     page(
         id = SettingsPageId.PLAYER,
         title = stringResource(Res.string.player_settings_title),
@@ -80,40 +65,6 @@ internal fun SettingsUiRegistryBuilder.registerPlaybackSettings(host: SharedSett
             ) {
                 settings.audioQuality = it
                 host.onSettingChanged(SettingsChangeEffect.AUDIO, null)
-            }
-            if (host.platform != SettingsPlatform.IOS) {
-                switch(
-                    id = "sponsorBlockEnabled",
-                    title = stringResource(Res.string.sponsorblock_podcasts),
-                    description = stringResource(Res.string.sponsorblock_podcasts_description),
-                    checked = settings.sponsorBlockEnabled,
-                ) { settings.sponsorBlockEnabled = it }
-            }
-            switch(
-                id = "skipSilence",
-                title = stringResource(Res.string.skip_silence),
-                description = stringResource(Res.string.skip_silence_desc),
-                checked = settings.skipSilence,
-            ) {
-                settings.skipSilence = it
-                host.onSettingChanged(SettingsChangeEffect.AUDIO, null)
-            }
-            if (host.platform != SettingsPlatform.IOS) {
-                switch(
-                    id = "skipSilenceInstant",
-                    title = stringResource(Res.string.skip_silence_instant),
-                    description =
-                        if (settings.skipSilence) {
-                            stringResource(Res.string.skip_silence_instant_desc)
-                        } else {
-                            stringResource(Res.string.settings_requires_enabled, stringResource(Res.string.skip_silence))
-                        },
-                    checked = settings.skipSilenceInstant,
-                    enabled = settings.skipSilence,
-                ) {
-                    settings.skipSilenceInstant = it
-                    host.onSettingChanged(SettingsChangeEffect.AUDIO, null)
-                }
             }
             switch(
                 id = "keepPausedOnSongChange",
@@ -212,27 +163,6 @@ internal fun SettingsUiRegistryBuilder.registerPlaybackSettings(host: SharedSett
             }
         }
         group("sound", stringResource(Res.string.settings_sound)) {
-            switch(
-                "audioNormalization",
-                stringResource(Res.string.audio_normalization),
-                checked = settings.audioNormalization,
-                description = stringResource(Res.string.settings_normalization_summary),
-            ) {
-                settings.audioNormalization = it
-                host.onSettingChanged(SettingsChangeEffect.AUDIO, null)
-            }
-            choice(
-                id = "loudnessLevel",
-                title = stringResource(Res.string.loudness_level),
-                valueLabel = loudnessLevelChoices.first { it.id == settings.loudnessLevel.name }.label,
-                choices = loudnessLevelChoices,
-                selectedChoiceId = settings.loudnessLevel.name,
-                enabled = settings.audioNormalization,
-                description = stringResource(Res.string.settings_loudness_target_summary),
-            ) {
-                settings.loudnessLevel = LoudnessLevel.valueOf(it)
-                host.onSettingChanged(SettingsChangeEffect.AUDIO, null)
-            }
             if (SettingsPageId.EQUALIZER in host.availablePages) {
                 navigation(
                     "equalizer",
@@ -324,25 +254,6 @@ internal fun SettingsUiRegistryBuilder.registerPlaybackSettings(host: SharedSett
                 description = stringResource(Res.string.remember_shuffle_and_repeat_desc),
                 checked = settings.rememberShuffleAndRepeat,
             ) { settings.rememberShuffleAndRepeat = it }
-            switch(
-                id = "autoDownloadOnLike",
-                title = stringResource(Res.string.auto_download_on_like),
-                checked = settings.autoDownloadOnLike,
-            ) { enabled ->
-                if (host.platform == SettingsPlatform.ANDROID) {
-                    host.onSettingChanged(SettingsChangeEffect.AUTO_DOWNLOAD_ON_LIKE, enabled)
-                } else {
-                    settings.autoDownloadOnLike = enabled
-                }
-            }
-            // Only Android downloads a whole album or playlist when it is saved.
-            if (host.platform == SettingsPlatform.ANDROID) {
-                switch(
-                    id = "autoDownloadSavedCollections",
-                    title = stringResource(Res.string.auto_download_saved_collections),
-                    checked = settings.autoDownloadSavedCollections,
-                ) { enabled -> host.onSettingChanged(SettingsChangeEffect.AUTO_DOWNLOAD_SAVED_COLLECTIONS, enabled) }
-            }
         }
         if (host.platform != SettingsPlatform.DESKTOP) {
             group("device", stringResource(Res.string.appearance_misc)) {
