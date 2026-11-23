@@ -757,7 +757,6 @@ class ExoPlaybackPlayer(
                 while (isActive) {
                     val elapsed = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)
                     val t = (elapsed.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
-                    // Мягкая квадратичная кривая ease-out
                     val eased = 1f - (1f - t) * (1f - t)
                     smoothFadeGain = (startGain + (1f - startGain) * eased).coerceIn(0f, 1f)
                     applyPlaybackGains()
@@ -1091,11 +1090,19 @@ class ExoPlaybackPlayer(
                         watchedResource.videoId,
                         watchedResource.clientName,
                     )
-                    reportPlaybackFailure(
-                        PlaybackException(
-                            "Stream buffering stalled",
-                            TimeoutException("Buffering watchdog exceeded ${BUFFERING_STALL_TIMEOUT_MS}ms"),
-                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+                    emitPlaybackFailure(
+                        PlaybackFailure(
+                            stage = "buffering_watchdog",
+                            message = "Stream buffering stalled after ${BUFFERING_STALL_TIMEOUT_MS}ms",
+                            cause = TimeoutException("Buffering watchdog exceeded ${BUFFERING_STALL_TIMEOUT_MS}ms"),
+                            sourceName = "Media3",
+                            videoId = watchedResource.videoId,
+                            playbackInstanceId = watchedInstance,
+                            playbackPositionMs = getRealtimePositionMs(),
+                            resumePlayback = wantsPlayback,
+                            isMediaSourceFailure = true,
+                            shouldExcludePlaybackProfile = true,
+                            category = PlaybackFailureCategory.TIMEOUT,
                         ),
                     )
                 }
