@@ -357,7 +357,9 @@ fun LibraryContent(
                 emptyList()
             } else {
                 autoPlaylists.filterNot {
-                    (Settings.shared.hidePodcasts && it.type in setOf("podcasts", "SE")) ||
+                    it.type.equals("downloaded", ignoreCase = true) ||
+                        it.type.equals("downloads", ignoreCase = true) ||
+                        (Settings.shared.hidePodcasts && it.type in setOf("podcasts", "SE")) ||
                         HiddenLibraryItemKey(HiddenLibraryItemType.AUTO, it.type) in hiddenItemKeys
                 }
             }
