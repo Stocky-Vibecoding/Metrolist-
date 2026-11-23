@@ -123,8 +123,6 @@ import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
@@ -152,7 +150,6 @@ import androidx.navigationevent.compose.NavigationEventDispatcherOwnerHostDefaul
 import androidx.navigationevent.compose.rememberNavigationEventDispatcherOwner
 import coil3.request.ImageRequest
 import com.metrolist.android.App
-import com.metrolist.android.BuildConfig
 import com.metrolist.android.LocalListenTogetherManager
 import com.metrolist.android.LocalMiniPlayerBottomInset
 import com.metrolist.android.LocalPlayerExpanded
@@ -162,6 +159,7 @@ import com.metrolist.android.LocalStartupPresentation
 import com.metrolist.android.MainActivity
 import com.metrolist.android.custom.AiWaveEngine
 import com.metrolist.android.custom.CustomConfigStore
+import com.metrolist.android.custom.CustomMediaCacheManager
 import com.metrolist.android.custom.GeminiClient
 import com.metrolist.android.custom.VkMusicProvider
 import com.metrolist.android.custom.WaveHomeScreen
@@ -226,7 +224,6 @@ import com.metrolist.android.ui.screens.settings.ListenTogetherServerScreen
 import com.metrolist.android.ui.screens.settings.ListenTogetherSettingsScreen
 import com.metrolist.android.ui.screens.settings.PlaybackBenchmarkSettingsScreen
 import com.metrolist.android.ui.screens.settings.PlaylistImportScreen
-import com.metrolist.android.ui.screens.settings.ReleaseNotesSheet
 import com.metrolist.android.ui.screens.settings.StatsDetailScreen
 import com.metrolist.android.ui.screens.settings.StatsScreen
 import com.metrolist.android.ui.screens.settings.StorageSettingsScreen
@@ -235,9 +232,6 @@ import com.metrolist.android.ui.screens.settings.UpdatesScreen
 import com.metrolist.android.ui.theme.MetrolistTheme
 import com.metrolist.android.ui.utils.appBarScrollBehavior
 import com.metrolist.android.ui.utils.resetHeightOffset
-import com.metrolist.android.update.AppUpdateManager
-import com.metrolist.android.update.AppUpdateState
-import com.metrolist.android.update.GitHubRelease
 import com.metrolist.android.utils.isAndroidAutomotive
 import com.metrolist.android.utils.isAndroidTv
 import com.metrolist.android.utils.startActivitySafely
@@ -253,6 +247,7 @@ import com.metrolist.shared.constants.WideNavigationRailCollapsedWidth
 import com.metrolist.shared.constants.modernMiniPlayerHeight
 import com.metrolist.shared.db.MusicDatabase
 import com.metrolist.shared.db.entities.KIND_DOWNLOAD
+import com.metrolist.shared.db.entities.toSongItem
 import com.metrolist.shared.db.isHistoryPlaylistId
 import com.metrolist.shared.deviceconnect.DeviceConnectPairingHost
 import com.metrolist.shared.generated.resources.Res
@@ -268,7 +263,6 @@ import com.metrolist.shared.generated.resources.filter_library
 import com.metrolist.shared.generated.resources.home
 import com.metrolist.shared.generated.resources.lastfm_session_expired_description
 import com.metrolist.shared.generated.resources.lastfm_session_expired_title
-import com.metrolist.shared.generated.resources.listen_together
 import com.metrolist.shared.generated.resources.listen_together_guest_choice_message
 import com.metrolist.shared.generated.resources.listen_together_guest_choice_title
 import com.metrolist.shared.generated.resources.listen_together_guest_queue
@@ -279,12 +273,6 @@ import com.metrolist.shared.generated.resources.offline_mode
 import com.metrolist.shared.generated.resources.play
 import com.metrolist.shared.generated.resources.profile
 import com.metrolist.shared.generated.resources.search
-import com.metrolist.shared.generated.resources.update_pending
-import com.metrolist.shared.generated.resources.updates_action
-import com.metrolist.shared.generated.resources.updates_available_message
-import com.metrolist.shared.generated.resources.updates_available_title
-import com.metrolist.shared.generated.resources.updates_changelog_preview
-import com.metrolist.shared.generated.resources.updates_pending_parenthetical
 import com.metrolist.shared.generated.resources.youtube_music
 import com.metrolist.shared.generated.resources.youtube_session_expired_message
 import com.metrolist.shared.generated.resources.youtube_session_expired_title
@@ -296,6 +284,7 @@ import com.metrolist.shared.playback.LocalPlayerSession
 import com.metrolist.shared.playlistimport.PlaylistImportProgressCard
 import com.metrolist.shared.playlistimport.PlaylistImportStatusManager
 import com.metrolist.shared.scrobble.ScrobbleSessions
+import com.metrolist.shared.settings.BlockedContent
 import com.metrolist.shared.settings.MiniPlayerType
 import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.settings.defaultOpenTabRoot
@@ -359,6 +348,7 @@ import com.metrolist.shared.ui.player.CustomQueueBridge
 import com.metrolist.shared.ui.player.LocalPlayerPlatform
 import com.metrolist.shared.ui.player.PlayerScreen
 import com.metrolist.shared.ui.player.shouldShowMusicVideoSurface
+import com.metrolist.shared.ui.screens.CustomLibraryPreviewBridge
 import com.metrolist.shared.ui.screens.SupportPrompt
 import com.metrolist.shared.ui.screens.pageKey
 import com.metrolist.shared.ui.screens.toHomeSection
@@ -380,7 +370,9 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -388,7 +380,6 @@ import org.jetbrains.compose.resources.getPluralString
 import org.jetbrains.compose.resources.stringResource
 import org.koin.compose.koinInject
 import org.koin.compose.viewmodel.koinViewModel
-import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
 import coil3.compose.AsyncImage as CoilAsyncImage
 import com.metrolist.android.ui.screens.settings.IntegrationsScreen as SettingsIntegrationsScreen
@@ -597,106 +588,7 @@ fun MetrolistApp(
         var continuePlaybackPromptHandled by rememberSaveable { mutableStateOf(false) }
         var showContinuePlaybackPrompt by rememberSaveable { mutableStateOf(false) }
 
-        var updatePrompt by remember { mutableStateOf<GitHubRelease?>(null) }
-        var installedReleaseNotes by remember { mutableStateOf<GitHubRelease?>(null) }
-        val updateScope = rememberCoroutineScope()
-        val appUpdateState by AppUpdateManager.state.collectAsState()
-        val hasPendingUpdate =
-            when (val state = appUpdateState) {
-                is AppUpdateState.Available,
-                is AppUpdateState.Downloading,
-                is AppUpdateState.Downloaded,
-                -> true
-
-                is AppUpdateState.Error -> state.release != null
-
-                else -> false
-            }
-
-        LaunchedEffect(Unit) {
-            if (!App.claimStartupUpdateCheck()) return@LaunchedEffect
-            val previousVersion = Settings.shared.lastRunAppVersion
-            val wasUpdated = previousVersion.isNotBlank() && previousVersion != BuildConfig.VERSION_NAME
-            val available =
-                AppUpdateManager.checkAtStartup(
-                    context = context,
-                    networkEnabled = Settings.shared.checkForUpdates,
-                )
-            if (available == null) {
-                Settings.shared.updatePromptVersion = ""
-                Settings.shared.launchesSinceUpdatePrompt = 0
-            } else if (Settings.shared.updatePromptVersion != available.updateKey) {
-                Settings.shared.updatePromptVersion = available.updateKey
-                Settings.shared.launchesSinceUpdatePrompt = 0
-                updatePrompt = available
-            } else {
-                val launches = Settings.shared.launchesSinceUpdatePrompt + 1
-                if (launches >= 2) {
-                    updatePrompt = available
-                    Settings.shared.launchesSinceUpdatePrompt = 0
-                } else {
-                    Settings.shared.launchesSinceUpdatePrompt = launches
-                }
-            }
-            if (wasUpdated) {
-                installedReleaseNotes =
-                    AppUpdateManager.pendingReleaseForInstalledVersion()
-                        ?: AppUpdateManager.releaseForInstalledVersion()
-            }
-            if (!BuildConfig.UPDATER_ENABLED || !wasUpdated || installedReleaseNotes != null ||
-                AppUpdateManager.releases.value.isNotEmpty()
-            ) {
-                Settings.shared.lastRunAppVersion = BuildConfig.VERSION_NAME
-            }
-        }
-
-        LaunchedEffect(Unit) {
-            while (true) {
-                delay(1.hours)
-                if (Settings.shared.checkForUpdates) AppUpdateManager.checkAtStartup(context, networkEnabled = true)
-            }
-        }
-
         SupportPrompt()
-
-        PopupContent(updatePrompt) { release ->
-            AlertDialog(
-                onDismissRequest = { updatePrompt = null },
-                title = { Text(stringResource(Res.string.updates_available_title, release.version)) },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text(stringResource(Res.string.updates_available_message))
-                        Text(
-                            text = stringResource(Res.string.updates_changelog_preview),
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        Text(
-                            text = release.changelogSnippet(),
-                            style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 7,
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            updatePrompt = null
-                            navigator.navigate(Screen.UpdateDetails)
-                            updateScope.launch { AppUpdateManager.download(context, release) }
-                        },
-                        shapes = ButtonDefaults.shapes(),
-                    ) {
-                        Text(stringResource(Res.string.updates_action))
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { updatePrompt = null }, shapes = ButtonDefaults.shapes()) {
-                        Text(stringResource(Res.string.action_not_now))
-                    }
-                },
-            )
-        }
 
         val playerConnection = playbackViewModel.playerConnection
         val playbackController = remember(playerConnection) { AndroidPlaybackController(playerConnection, coroutineScope) }
@@ -724,6 +616,33 @@ fun MetrolistApp(
         val playerViewModel: PlayerViewModel = koinInject()
         val downloadManager: SongDownloadManager = koinInject()
         val database: MusicDatabase = koinInject()
+
+        // Живые предпросмотры треков для карточек Библиотеки («Мой топ» и «Кэшированные»)
+        LaunchedEffect(database) {
+            database.dao().mostPlayedSongs(0L, limit = 30).collectLatest { entities ->
+                val played = BlockedContent.filterSongs(entities.map { it.toSongItem() })
+                val resolved =
+                    played.ifEmpty {
+                        val recent =
+                            database
+                                .dao()
+                                .events()
+                                .first()
+                                .distinctBy { it.song.id }
+                                .take(30)
+                                .map { it.song.toSongItem() }
+                        BlockedContent.filterSongs(recent)
+                    }
+                CustomLibraryPreviewBridge.topSongs = resolved
+            }
+        }
+        LaunchedEffect(Unit) {
+            CustomMediaCacheManager.stats.collect {
+                CustomLibraryPreviewBridge.cachedSongs =
+                    BlockedContent.filterSongs(CustomMediaCacheManager.getOfflineCachedSongs(limit = 30))
+            }
+        }
+
         val downloadedSongIds by
             remember(database) {
                 database.dao().cachedAudioIdsByKind(KIND_DOWNLOAD).distinctUntilChanged().map { ids ->
@@ -979,28 +898,21 @@ fun MetrolistApp(
                 val accountName = authManager.accountName
                 val accountThumbnail = authManager.accountThumbnail
                 var showAccountMenu by remember { mutableStateOf(false) }
-                val updatePending = stringResource(Res.string.update_pending)
                 Box {
                     IconButton(
                         onClick = { showAccountMenu = true },
                         modifier =
-                            (
-                                if (hasPendingUpdate) {
-                                    buttonModifier.semantics { stateDescription = updatePending }
-                                } else {
-                                    buttonModifier
-                                }
-                            ).tvFocusHighlight(
-                                CircleShape,
-                                scale = 1.08f,
-                                bringIntoView = false,
-                            ).navigationPopupSource(),
+                            buttonModifier
+                                .tvFocusHighlight(
+                                    CircleShape,
+                                    scale = 1.08f,
+                                    bringIntoView = false,
+                                ).navigationPopupSource(),
                         shapes = IconButtonDefaults.shapes(),
                     ) {
                         TopBarProfileAvatar(
                             accountName = accountName,
                             accountThumbnail = accountThumbnail,
-                            hasPendingUpdate = hasPendingUpdate,
                         )
                     }
                     if (showAccountMenu) {
@@ -1011,15 +923,11 @@ fun MetrolistApp(
                             onNavigateToSwitchChannel = {
                                 navigator.navigate(Screen.SwitchChannel)
                             },
-                            onNavigateToHistory =
-                                if (navigationState.topLevelRoute == Screen.Library) {
-                                    { navigator.navigate(Screen.History) }
-                                } else {
-                                    null
-                                },
+                            onNavigateToHistory = { navigator.navigate(Screen.History) },
                             onNavigateToStatistics = { navigator.navigate(Screen.Statistics) },
                             onNavigateToIntegrations = { navigator.navigate(Screen.Integrations) },
                             onNavigateToSettings = { navigator.navigate(Screen.Settings) },
+                            onNavigateToLastFm = { navigator.navigate(Screen.LastFm) },
                             onLogout = {
                                 coroutineScope.launch {
                                     authManager.clearAllCredentials()
@@ -1496,14 +1404,14 @@ fun MetrolistApp(
                                         topBar = {
                                             if (shouldShowTopBar) {
                                                 val topBarTitle: @Composable () -> Unit = {
-                                                    AppTitleWithUpdateWarning(
-                                                        title =
+                                                    Text(
+                                                        text =
                                                             when (navigationState.topLevelRoute) {
                                                                 Screen.Home -> stringResource(Res.string.home)
                                                                 Screen.Library -> stringResource(Res.string.filter_library)
                                                                 else -> ""
                                                             },
-                                                        showWarning = hasPendingUpdate && navigationState.topLevelRoute == Screen.Home,
+                                                        style = MaterialTheme.typography.titleLargeEmphasized,
                                                     )
                                                 }
                                                 val topBarSubtitle: @Composable () -> Unit = {
@@ -1565,24 +1473,6 @@ fun MetrolistApp(
                                                             Icon(
                                                                 MetrolistIcons.Outlined.Settings,
                                                                 contentDescription = stringResource(Res.string.devtools_title),
-                                                                modifier = Modifier.size(24.dp),
-                                                            )
-                                                        }
-                                                    }
-                                                    if (Settings.shared.listenTogetherEnabled && Screen.ListenTogether !in railScreens) {
-                                                        TopBarIconButton(
-                                                            floating = useFloatingTopBar,
-                                                            onClick = { navigator.navigate(Screen.ListenTogether) },
-                                                            modifier =
-                                                                Modifier.tvFocusHighlight(
-                                                                    CircleShape,
-                                                                    scale = 1.08f,
-                                                                    bringIntoView = false,
-                                                                ),
-                                                        ) {
-                                                            Icon(
-                                                                MetrolistIcons.Outlined.Group,
-                                                                contentDescription = stringResource(Res.string.listen_together),
                                                                 modifier = Modifier.size(24.dp),
                                                             )
                                                         }
@@ -1804,16 +1694,6 @@ fun MetrolistApp(
                                                             )
                                                         }
                                                     }
-                                                }
-
-                                                installedReleaseNotes?.let { release ->
-                                                    ReleaseNotesSheet(
-                                                        release = release,
-                                                        onDismiss = {
-                                                            installedReleaseNotes = null
-                                                            AppUpdateManager.clearPendingRelease()
-                                                        },
-                                                    )
                                                 }
                                             }
                                         }
@@ -2126,8 +2006,8 @@ private fun ListenTogetherPlaybackRequestHandler(playerConnection: PlayerConnect
 private fun TopBarProfileAvatar(
     accountName: String,
     accountThumbnail: String,
-    hasPendingUpdate: Boolean,
 ) {
+    val startupPresentation = LocalStartupPresentation.current
     Box(modifier = Modifier.size(30.dp)) {
         Box(
             modifier =
@@ -2140,7 +2020,6 @@ private fun TopBarProfileAvatar(
         ) {
             if (accountName.isNotEmpty() && accountThumbnail.isNotEmpty()) {
                 val context = LocalContext.current
-                val startupPresentation = LocalStartupPresentation.current
                 var avatarReady by remember(accountThumbnail) { mutableStateOf(false) }
                 var avatarLoaded by remember(accountThumbnail) { mutableStateOf(false) }
                 SideEffect { startupPresentation?.avatarReady = avatarReady }
@@ -2170,82 +2049,16 @@ private fun TopBarProfileAvatar(
                     modifier = Modifier.fillMaxSize().clip(CircleShape),
                 )
             } else {
+                SideEffect { startupPresentation?.avatarReady = true }
                 Icon(
                     MetrolistIcons.Outlined.AccountCircle,
-                    contentDescription = null,
+                    contentDescription = stringResource(Res.string.profile),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(24.dp),
                 )
             }
         }
-        if (hasPendingUpdate) {
-            Box(
-                modifier =
-                    Modifier
-                        .size(14.dp)
-                        .align(Alignment.TopEnd)
-                        .background(MaterialTheme.colorScheme.error, CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "!",
-                    color = MaterialTheme.colorScheme.onError,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
-        }
     }
-}
-
-@Composable
-private fun AppTitleWithUpdateWarning(
-    title: String,
-    showWarning: Boolean,
-) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleLargeEmphasized,
-        )
-        if (showWarning) {
-            Text(
-                text = stringResource(Res.string.updates_pending_parenthetical),
-                modifier = Modifier.padding(start = 8.dp),
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.Bold,
-            )
-        }
-    }
-}
-
-private fun GitHubRelease.changelogSnippet(): String {
-    val lines =
-        body
-            .orEmpty()
-            .lineSequence()
-            .map(String::trim)
-            .filter(String::isNotEmpty)
-            .toList()
-    val versionHeading =
-        lines.indexOfFirst { line ->
-            line.trimStart('#', ' ').startsWith("Version $version", ignoreCase = true)
-        }
-    val firstChangesHeading =
-        lines.indexOfFirst { line ->
-            line.startsWith('#') && !line.contains("maintenance mode", ignoreCase = true)
-        }
-    val startIndex =
-        when {
-            versionHeading >= 0 -> versionHeading + 1
-            firstChangesHeading >= 0 -> firstChangesHeading
-            else -> 0
-        }
-    return lines
-        .subList(startIndex, lines.size)
-        .take(15)
-        .joinToString("\n")
 }
 
 val navTabMetadata: Map<String, Any> = mapOf("nav_tab" to true)
