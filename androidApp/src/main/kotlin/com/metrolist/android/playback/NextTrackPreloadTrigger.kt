@@ -1,9 +1,12 @@
 package com.metrolist.android.playback
 
+import androidx.media3.common.Player
 import com.metrolist.shared.model.SongItem
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+
+private const val EARLY_PRELOAD_POSITION_MS = 3_000L
 
 internal data class NextTrackPreloadTrigger(
     val currentPlaybackInstanceId: Long,
@@ -33,10 +36,15 @@ internal fun nextTrackPreloadTriggers(
     ) { position, currentIndex, songs, mode, generation ->
         val instanceId = currentPlaybackInstanceId()
         val nextVideoId = nextQueuedIndex(songs.size, currentIndex, mode, hasMore())?.let { songs[it].id }
+        val earlyReady =
+            nextVideoId != null &&
+                mode != Player.REPEAT_MODE_ONE &&
+                !stopAfterCurrentSong() &&
+                position >= EARLY_PRELOAD_POSITION_MS
         NextTrackPreloadTrigger(
             currentPlaybackInstanceId = instanceId,
             nextVideoId = nextVideoId,
-            shouldPreload = shouldPreloadNextTrack(position, nextVideoId, mode, stopAfterCurrentSong()),
+            shouldPreload = earlyReady || shouldPreloadNextTrack(position, nextVideoId, mode, stopAfterCurrentSong()),
             hasValidPreload = isPreloadedTargetActive(instanceId, nextVideoId),
             invalidationGeneration = generation,
         )
