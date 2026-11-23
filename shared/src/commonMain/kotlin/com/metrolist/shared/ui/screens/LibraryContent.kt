@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -166,6 +165,11 @@ import sh.calvin.reorderable.DragGestureDetector
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.ScrollMoveMode
 import sh.calvin.reorderable.rememberReorderableLazyGridState
+
+object CustomLibraryPreviewBridge {
+    var topSongs by mutableStateOf<List<SongItem>>(emptyList())
+    var cachedSongs by mutableStateOf<List<SongItem>>(emptyList())
+}
 
 enum class LibraryFilter {
     TRACKS,
@@ -373,16 +377,6 @@ fun LibraryContent(
             }
         }
 
-    val likedHeroPlaylist =
-        remember(searchedAutoPlaylists, effectiveFilter, searchQuery) {
-            if (effectiveFilter == null && searchQuery.isBlank()) {
-                searchedAutoPlaylists.firstOrNull {
-                    it.type.equals("liked", ignoreCase = true) || it.type == "LM"
-                }
-            } else {
-                null
-            }
-        }
     val likedHeroSongs =
         remember(rawLikedSongs, contentFilterVersion) {
             BlockedContent
@@ -391,12 +385,30 @@ fun LibraryContent(
                 .distinctBy { it.id }
                 .sortedByDescending { it.libraryAddedAt ?: 0L }
         }
-    val secondaryAutoPlaylists =
-        remember(searchedAutoPlaylists, likedHeroPlaylist) {
-            if (likedHeroPlaylist != null) {
-                searchedAutoPlaylists.filterNot { it.type == likedHeroPlaylist.type }
-            } else {
-                searchedAutoPlaylists
+    val topPreviewSongs =
+        remember(CustomLibraryPreviewBridge.topSongs, contentFilterVersion) {
+            BlockedContent
+                .filterSongs(CustomLibraryPreviewBridge.topSongs)
+                .filterNot { it.isPodcast || it.isUnavailable }
+                .distinctBy { it.id }
+        }
+    val cachedPreviewSongs =
+        remember(CustomLibraryPreviewBridge.cachedSongs, contentFilterVersion) {
+            BlockedContent
+                .filterSongs(CustomLibraryPreviewBridge.cachedSongs)
+                .filterNot { it.isPodcast || it.isUnavailable }
+                .distinctBy { it.id }
+        }
+
+    val orderedAutoPlaylists =
+        remember(searchedAutoPlaylists) {
+            searchedAutoPlaylists.sortedBy { pl ->
+                when (pl.type.lowercase()) {
+                    "liked", "lm" -> 0
+                    "top100" -> 1
+                    "cached" -> 2
+                    else -> 3
+                }
             }
         }
 
@@ -519,19 +531,6 @@ fun LibraryContent(
                             )
                         }
                     }
-                    if (likedHeroPlaylist != null) {
-                        item(key = "library_liked_hero", contentType = "liked_hero", span = { GridItemSpan(maxLineSpan) }) {
-                            LikedHeroSection(
-                                playlist = likedHeroPlaylist,
-                                songs = likedHeroSongs,
-                                downloadedSongIds = downloadedSongIds,
-                                currentSongIdState = currentSongIdState,
-                                isPlayingState = isPlayingState,
-                                onOpenAll = { onAutoPlaylistClick(likedHeroPlaylist.type) },
-                                onPlaySongAt = { index -> onPlaySongs(likedHeroSongs, index) },
-                            )
-                        }
-                    }
                     if (!isLoading && error) {
                         item(key = "library_error", contentType = "status", span = { GridItemSpan(maxLineSpan) }) {
                             Column(Modifier.fillMaxWidth().padding(24.dp)) {
@@ -544,34 +543,45 @@ fun LibraryContent(
                             }
                         }
                     }
-                    // Все автоплейлисты (Мой топ, Кэшированные и др.) в едином стиле полноширинных карточек
+                    // Все разделы автоплейлистов (Мне нравится, Мой топ, Кэшированные) в одном стиле с предпросмотром треков
                     items(
-                        count = secondaryAutoPlaylists.size,
-                        key = { "auto_${secondaryAutoPlaylists[it].type}" },
-                        contentType = { "auto_playlist_wide" },
+                        count = orderedAutoPlaylists.size,
+                        key = { "auto_${orderedAutoPlaylists[it].type}" },
+                        contentType = { "auto_playlist_hero" },
                         span = { GridItemSpan(maxLineSpan) },
                     ) { index ->
-                        val playlist = secondaryAutoPlaylists[index]
-                        Box(Modifier.animateItem()) {
-                            itemContainer(
-                                HiddenLibraryItem(
-                                    HiddenLibraryItemType.AUTO,
-                                    playlist.type,
-                                    playlist.title,
-                                    subtitle = playlist.subtitle,
-                                ),
-                                null,
-                                false,
-                                { onAutoPlaylistClick(playlist.type) },
-                            ) {
-                                UnifiedAutoPlaylistCard(
-                                    playlist = playlist,
-                                    onClick = { onAutoPlaylistClick(playlist.type) },
-                                )
+                        val playlist = orderedAutoPlaylists[index]
+                        val showPreview = searchQuery.isBlank()
+                        val previewSongs =
+                            if (!showPreview) {
+                                emptyList()
+                            } else {
+                                when (playlist.type.lowercase()) {
+                                    "liked", "lm" -> likedHeroSongs
+                                    "top100" -> topPreviewSongs
+                                    "cached" -> cachedPreviewSongs
+                                    else -> emptyList()
+                                }
                             }
+                        Box(Modifier.animateItem()) {
+                            AutoPlaylistHeroCard(
+                                playlist = playlist,
+                                songs = previewSongs,
+                                downloadedSongIds = downloadedSongIds,
+                                currentSongIdState = currentSongIdState,
+                                isPlayingState = isPlayingState,
+                                onOpenAll = { onAutoPlaylistClick(playlist.type) },
+                                onPlaySongAt = { songIndex ->
+                                    if (previewSongs.isNotEmpty()) {
+                                        onPlaySongs(previewSongs, songIndex)
+                                    } else {
+                                        onAutoPlaylistClick(playlist.type)
+                                    }
+                                },
+                            )
                         }
                     }
-                    if (searchedItems.isEmpty() && searchedAutoPlaylists.isEmpty() && !error) {
+                    if (searchedItems.isEmpty() && orderedAutoPlaylists.isEmpty() && !error) {
                         item(key = "library_empty", contentType = "status", span = { GridItemSpan(maxLineSpan) }) {
                             Box(Modifier.fillMaxWidth().padding(48.dp), contentAlignment = Alignment.Center) {
                                 if (isLoading) {
@@ -659,81 +669,7 @@ fun LibraryContent(
 }
 
 @Composable
-private fun UnifiedAutoPlaylistCard(
-    playlist: LibraryAutoPlaylist,
-    onClick: () -> Unit,
-) {
-    val gradientColors =
-        when (playlist.type.lowercase()) {
-            "top100" -> listOf(Color(0xFF4ADE80), Color(0xFF16A34A))
-            "cached" -> listOf(Color(0xFF60A5FA), Color(0xFF4F46E5))
-            "podcasts", "se" -> listOf(Color(0xFFC084FC), Color(0xFF7E22CE))
-            else -> listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.tertiary)
-        }
-
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(22.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Box(
-                modifier =
-                    Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Brush.linearGradient(colors = gradientColors)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = playlist.icon,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(26.dp),
-                )
-            }
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = playlist.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (playlist.subtitle.isNotBlank()) {
-                    Text(
-                        text = playlist.subtitle,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-
-            playlist.badge?.let { badge ->
-                AutoPlaylistBadge(badge, Modifier)
-            }
-
-            Icon(
-                imageVector = MetrolistIcons.Outlined.KeyboardArrowDown,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(20.dp).rotate(-90f),
-            )
-        }
-    }
-}
-
-@Composable
-private fun LikedHeroSection(
+private fun AutoPlaylistHeroCard(
     playlist: LibraryAutoPlaylist,
     songs: List<SongItem>,
     downloadedSongIds: Set<String>,
@@ -742,6 +678,18 @@ private fun LikedHeroSection(
     onOpenAll: () -> Unit,
     onPlaySongAt: (Int) -> Unit,
 ) {
+    val typeKey = playlist.type.lowercase()
+    val isLiked = typeKey == "liked" || typeKey == "lm"
+    val gradientColors =
+        when (typeKey) {
+            "liked", "lm" -> listOf(Color(0xFFFF4D6D), Color(0xFFC9184A))
+            "top100" -> listOf(Color(0xFF4ADE80), Color(0xFF16A34A))
+            "cached" -> listOf(Color(0xFF60A5FA), Color(0xFF4F46E5))
+            "podcasts", "se" -> listOf(Color(0xFFC084FC), Color(0xFF7E22CE))
+            else -> listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.tertiary)
+        }
+    val displayTitle = if (isLiked) "Мне нравится" else playlist.title
+    val displayIcon = if (isLiked) MetrolistIcons.Filled.Favorite else playlist.icon
     val countSubtitle =
         if (songs.isNotEmpty()) {
             pluralStringResource(Res.plurals.song_count, songs.size, songs.size)
@@ -752,7 +700,7 @@ private fun LikedHeroSection(
     Surface(
         shape = RoundedCornerShape(24.dp),
         color = MaterialTheme.colorScheme.surfaceContainerLow,
-        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 2.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
     ) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
@@ -774,19 +722,11 @@ private fun LikedHeroSection(
                         Modifier
                             .size(52.dp)
                             .clip(RoundedCornerShape(16.dp))
-                            .background(
-                                Brush.linearGradient(
-                                    colors =
-                                        listOf(
-                                            Color(0xFFFF4D6D),
-                                            Color(0xFFC9184A),
-                                        ),
-                                ),
-                            ),
+                            .background(Brush.linearGradient(colors = gradientColors)),
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        imageVector = MetrolistIcons.Filled.Favorite,
+                        imageVector = displayIcon,
                         contentDescription = null,
                         tint = Color.White,
                         modifier = Modifier.size(28.dp),
@@ -799,7 +739,7 @@ private fun LikedHeroSection(
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
                         Text(
-                            text = "Мне нравится",
+                            text = displayTitle,
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface,
@@ -1220,28 +1160,6 @@ private fun LibrarySortType.isAvailableFor(filter: LibraryFilter?): Boolean =
             true
         }
     }
-
-@Composable
-private fun AutoPlaylistBadge(
-    label: String,
-    modifier: Modifier,
-) {
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(50),
-        color = MaterialTheme.colorScheme.primaryContainer,
-        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-    ) {
-        Text(
-            label,
-            style = MaterialTheme.typography.labelSmall,
-            maxLines = 1,
-            softWrap = false,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-        )
-    }
-}
 
 @Composable
 private fun LibraryItem(
