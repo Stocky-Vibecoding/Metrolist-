@@ -49,6 +49,7 @@ import kotlin.math.tanh
 private const val MUSIC_MINIMUM_SILENCE_DURATION_US = 500_000L
 private const val MUSIC_SILENCE_THRESHOLD_DB = -55.0
 private const val EDGE_LEADING_WINDOW_MS = 10_000L
+private const val EDGE_MAX_LEADING_TRIM_MS = 5_000L
 private const val EDGE_TRAILING_WINDOW_MS = 12_000L
 private const val EDGE_MIN_TRACK_DURATION_MS = 25_000L
 private const val EDGE_TRAILING_CONFIRM_MS = 600L
@@ -293,20 +294,26 @@ internal fun musicAudioProcessorChain(vararg processors: AudioProcessor): Defaul
     )
 
 /**
- * Умная PCM-нормализация громкости в реальном времени (Boost-Only AGC + Soft-Knee Limiter):
- * - Громкие треки (VK / Я.Музыка / современный мастеринг) НЕ приглушаются (коэффициент >= 1.0f).
+ * Умная PCM-нормализация громкости в реальном времени (Boost-Only AGC + Peak-Safe Soft-Knee Limiter):
+ * - Громкие треки (VK / Я.Музыка / современный мастеринг) идут 100% bit-exact pass-through (gain = 1.0x, без сжатия пиков).
  * - Тихие треки плавно подтягиваются вверх (до +9 дБ) к полке -10 dBFS RMS.
+ * - Пик-лимитер мгновенно прибирает гейн при резком дропе после тихого интро, исключая перегруз.
  * - Тишина и фоновый шум ниже -42 dBFS игнорируются (шум в паузах не усиливается).
- * - Мягкий антиклип-лимитер на -0.3 dBFS исключает квадратный клип на усилителях и динамиках.
  */
 internal class SmartLoudnessAudioProcessor : BaseAudioProcessor() {
-    @Volatile
     private var rmsEnvelope: Float = TARGET_RMS
-
-    @Volatile
     private var currentGain: Float = 1.0f
 
+    @Volatile
+    private var pendingReset: Boolean = false
+
     fun resetForNewTrack() {
+        pendingReset = true
+    }
+
+    private fun applyResetIfNeeded() {
+        if (!pendingReset) return
+        pendingReset = false
         rmsEnvelope = TARGET_RMS
         currentGain = 1.0f
     }
@@ -317,6 +324,7 @@ internal class SmartLoudnessAudioProcessor : BaseAudioProcessor() {
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
+        applyResetIfNeeded()
         val remaining = inputBuffer.remaining()
         if (remaining <= 0) return
 
@@ -329,7 +337,7 @@ internal class SmartLoudnessAudioProcessor : BaseAudioProcessor() {
         }
 
         val enabled = SmartLoudnessController.isEnabled
-        if (!enabled && currentGain <= 1.001f) {
+        if (!enabled && currentGain <= UNITY_BYPASS_THRESHOLD) {
             currentGain = 1.0f
             passThrough(inputBuffer)
             return
@@ -346,11 +354,14 @@ internal class SmartLoudnessAudioProcessor : BaseAudioProcessor() {
         val totalSamples = frameCount * channels
 
         var sumSquares = 0.0
+        var blockPeak = 0f
         var idx = startPos
         val endPos = startPos + usableBytes
         while (idx < endPos) {
-            val normalized = inputBuffer.getShort(idx) / 32768.0
-            sumSquares += normalized * normalized
+            val normalized = inputBuffer.getShort(idx) / 32768f
+            val absSample = abs(normalized)
+            if (absSample > blockPeak) blockPeak = absSample
+            sumSquares += (normalized * normalized).toDouble()
             idx += 2
         }
         val blockRms = sqrt(sumSquares / totalSamples.coerceAtLeast(1)).toFloat()
@@ -360,25 +371,41 @@ internal class SmartLoudnessAudioProcessor : BaseAudioProcessor() {
             if (!enabled) {
                 1.0f
             } else if (blockRms < NOISE_GATE_RMS) {
-                // В тишине/паузе держим текущий коэффициент, чтобы не задирать фоновый шум
+                // В тишине/паузе держим текущий коэффициент, чтобы не вытягивать фоновый шум
                 currentGain
             } else {
                 val envTauSec = if (blockRms > rmsEnvelope) ENVELOPE_ATTACK_SEC else ENVELOPE_RELEASE_SEC
                 val envAlpha = (1.0 - exp((-blockDurationSec / envTauSec).toDouble())).toFloat().coerceIn(0f, 1f)
                 rmsEnvelope += (blockRms - rmsEnvelope) * envAlpha
-                (TARGET_RMS / rmsEnvelope.coerceAtLeast(NOISE_GATE_RMS)).coerceIn(1.0f, MAX_BOOST_GAIN)
+                val rmsTarget = (TARGET_RMS / rmsEnvelope.coerceAtLeast(NOISE_GATE_RMS)).coerceIn(1.0f, MAX_BOOST_GAIN)
+                val peakSafe =
+                    if (blockPeak > 0.02f) {
+                        (LIMITER_CEILING / blockPeak).coerceIn(1.0f, MAX_BOOST_GAIN)
+                    } else {
+                        MAX_BOOST_GAIN
+                    }
+                minOf(rmsTarget, peakSafe)
             }
 
         val startGain = currentGain
+        val wouldClipAtStart = blockPeak * startGain > LIMITER_CEILING
         val gainTauSec =
             when {
                 !enabled -> DISABLE_RAMP_SEC
+                wouldClipAtStart -> GAIN_PEAK_DUCK_SEC
                 targetGain < startGain -> GAIN_FAST_DOWN_SEC
                 else -> GAIN_SLOW_UP_SEC
             }
         val gainAlpha = (1.0 - exp((-blockDurationSec / gainTauSec).toDouble())).toFloat().coerceIn(0f, 1f)
         val endGain = (startGain + (targetGain - startGain) * gainAlpha).coerceIn(1.0f, MAX_BOOST_GAIN)
         currentGain = endGain
+
+        // Для уже громких треков (gain ≈ 1.0x) отдаём 100% чистый нетронутый PCM без лимитера
+        if (startGain <= UNITY_BYPASS_THRESHOLD && endGain <= UNITY_BYPASS_THRESHOLD) {
+            currentGain = 1.0f
+            passThrough(inputBuffer)
+            return
+        }
 
         val out = replaceOutputBuffer(usableBytes)
         out.order(ByteOrder.LITTLE_ENDIAN)
@@ -419,11 +446,15 @@ internal class SmartLoudnessAudioProcessor : BaseAudioProcessor() {
     }
 
     override fun onFlush(streamMetadata: AudioProcessor.StreamMetadata) {
-        resetForNewTrack()
+        pendingReset = false
+        rmsEnvelope = TARGET_RMS
+        currentGain = 1.0f
     }
 
     override fun onReset() {
-        resetForNewTrack()
+        pendingReset = false
+        rmsEnvelope = TARGET_RMS
+        currentGain = 1.0f
     }
 
     companion object {
@@ -436,20 +467,23 @@ internal class SmartLoudnessAudioProcessor : BaseAudioProcessor() {
         // Максимум +9 дБ подтяжки вверх для тихих треков
         private const val MAX_BOOST_GAIN = 2.82f
 
-        // Мягкое колено лимитера с -1.7 dBFS, потолок -0.3 dBFS (0% цифрового клипа)
-        private const val KNEE_START = 0.82f
-        private const val LIMITER_CEILING = 0.966f
+        private const val UNITY_BYPASS_THRESHOLD = 1.005f
 
-        private const val ENVELOPE_ATTACK_SEC = 0.20f
+        // Мягкое колено с -1.1 dBFS, потолок -0.13 dBFS — работает только при активном бусте
+        private const val KNEE_START = 0.88f
+        private const val LIMITER_CEILING = 0.985f
+
+        private const val ENVELOPE_ATTACK_SEC = 0.18f
         private const val ENVELOPE_RELEASE_SEC = 2.60f
-        private const val GAIN_FAST_DOWN_SEC = 0.14f
+        private const val GAIN_PEAK_DUCK_SEC = 0.015f
+        private const val GAIN_FAST_DOWN_SEC = 0.12f
         private const val GAIN_SLOW_UP_SEC = 1.80f
         private const val DISABLE_RAMP_SEC = 0.04f
     }
 }
 
 /**
- * Обрезка мёртвой тишины (< −55 дБ) СТРОГО в начале и самом конце трека.
+ * Обрезка мёртвой тишины (< −55 дБ) СТРОГО в начале (до 5 сек) и самом конце трека.
  * Вся середина песни проходит 100% без изменений (pass-through).
  */
 internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
@@ -468,6 +502,7 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
     @Volatile
     private var pendingTrackStart: Boolean = true
 
+    private var leadingTrimmedFrames: Long = 0L
     private var trailingSilentFrames: Long = 0L
 
     fun updateTimeline(
@@ -483,6 +518,7 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
         durationMs = C.TIME_UNSET
         pendingTrackStart = positionMs <= 1_500L
         heardAudioInTrack = !pendingTrackStart
+        leadingTrimmedFrames = 0L
         trailingSilentFrames = 0L
     }
 
@@ -490,6 +526,7 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
         positionMs = newPosMs.coerceAtLeast(0L)
         pendingTrackStart = positionMs <= 1_500L
         heardAudioInTrack = !pendingTrackStart
+        leadingTrimmedFrames = 0L
         trailingSilentFrames = 0L
     }
 
@@ -515,10 +552,12 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
         val pos = positionMs
         val dur = durationMs
 
-        // 1. НАЧАЛО ТРЕКА: режем мёртвую тишину строго до первого звука (в пределах первых 10 сек)
+        // 1. НАЧАЛО ТРЕКА: режем мёртвую тишину до первого звука (не более EDGE_MAX_LEADING_TRIM_MS)
         if (!heardAudioInTrack) {
-            if (!pendingTrackStart && pos > EDGE_LEADING_WINDOW_MS) {
+            val maxLeadingFrames = (sampleRate.toLong() * EDGE_MAX_LEADING_TRIM_MS) / 1_000L
+            if (leadingTrimmedFrames >= maxLeadingFrames || (!pendingTrackStart && pos > EDGE_LEADING_WINDOW_MS)) {
                 heardAudioInTrack = true
+                pendingTrackStart = false
                 passThrough(inputBuffer)
                 return
             }
@@ -542,7 +581,14 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
             }
 
             if (firstAudibleFrame < 0) {
-                inputBuffer.position(limit)
+                leadingTrimmedFrames += frameCount.toLong()
+                if (leadingTrimmedFrames >= maxLeadingFrames) {
+                    heardAudioInTrack = true
+                    pendingTrackStart = false
+                    passThrough(inputBuffer)
+                } else {
+                    inputBuffer.position(limit)
+                }
                 return
             }
 
@@ -605,12 +651,14 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
 
     override fun onFlush(streamMetadata: AudioProcessor.StreamMetadata) {
         heardAudioInTrack = !pendingTrackStart && positionMs > 1_500L
+        leadingTrimmedFrames = 0L
         trailingSilentFrames = 0L
     }
 
     override fun onReset() {
         heardAudioInTrack = false
         pendingTrackStart = true
+        leadingTrimmedFrames = 0L
         trailingSilentFrames = 0L
         positionMs = 0L
         durationMs = C.TIME_UNSET
@@ -648,8 +696,8 @@ internal class SilenceDetectorAudioProcessor : BaseAudioProcessor() {
         if (!inputBuffer.hasRemaining()) return
         if (enabled) {
             synchronized(this) {
-                if (enabled) {
-                    val detector = checkNotNull(detector)
+                val activeDetector = detector
+                if (enabled && activeDetector != null) {
                     inputBuffer.order(ByteOrder.LITTLE_ENDIAN)
                     var offset = inputBuffer.position()
                     while (offset + inputAudioFormat.bytesPerFrame <= inputBuffer.limit()) {
@@ -657,11 +705,11 @@ internal class SilenceDetectorAudioProcessor : BaseAudioProcessor() {
                         repeat(inputAudioFormat.channelCount) {
                             peak = maxOf(peak, abs(inputBuffer.getShort(offset + it * 2).toInt()))
                         }
-                        val wasSilent = detector.isSilent
-                        detector.frame(peak)
-                        if (wasSilent != detector.isSilent) {
+                        val wasSilent = activeDetector.isSilent
+                        activeDetector.frame(peak)
+                        if (wasSilent != activeDetector.isSilent) {
                             generation++
-                            if (detector.isSilent) thresholds.trySend(generation)
+                            if (activeDetector.isSilent) thresholds.trySend(generation)
                         }
                         offset += inputAudioFormat.bytesPerFrame
                     }
