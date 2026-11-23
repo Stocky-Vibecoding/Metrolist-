@@ -31,6 +31,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
@@ -38,7 +40,11 @@ import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+import kotlin.math.tanh
 
 private const val MUSIC_MINIMUM_SILENCE_DURATION_US = 500_000L
 private const val MUSIC_SILENCE_THRESHOLD_DB = -55.0
@@ -47,14 +53,58 @@ private const val EDGE_TRAILING_WINDOW_MS = 12_000L
 private const val EDGE_MIN_TRACK_DURATION_MS = 25_000L
 private const val EDGE_TRAILING_CONFIRM_MS = 600L
 
+/**
+ * Контроллер умной PCM-нормализации (подтяжка тихих треков + мягкий антиклип-лимитер).
+ * В отличие от штатной нормализации, никогда не глушит громкие треки ниже 1.0x —
+ * важно для вывода максимального чистого сигнала на внешние усилители.
+ */
+object SmartLoudnessController {
+    private const val PREFS_NAME = "metrolist_custom_audio_prefs"
+    private const val KEY_ENABLED = "smart_loudness_boost_enabled"
+
+    private val _enabled = MutableStateFlow(true)
+    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+
+    val isEnabled: Boolean
+        get() = _enabled.value
+
+    @Volatile
+    private var initialized = false
+
+    fun init(context: Context) {
+        if (initialized) return
+        initialized = true
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        _enabled.value = prefs.getBoolean(KEY_ENABLED, true)
+    }
+
+    fun setEnabled(
+        context: Context,
+        value: Boolean,
+    ) {
+        initialized = true
+        _enabled.value = value
+        context.applicationContext
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_ENABLED, value)
+            .apply()
+    }
+}
+
 internal class SilenceSkippingSupport(
     context: Context,
     vararg extraProcessors: AudioProcessor,
     onAudioOutputEvent: ((String, Map<String, String>) -> Unit)? = null,
     onOutputSignal: (AudioOutputSignal) -> Unit = {},
 ) {
+    init {
+        SmartLoudnessController.init(context)
+    }
+
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
     private val edgeTrimmer = EdgeSilenceTrimAudioProcessor()
+    private val smartLoudness = SmartLoudnessAudioProcessor()
     private val detector = SilenceDetectorAudioProcessor()
     private val audioPositionDiagnostics = AudioPositionDiagnostics()
     val playoutTracker = AudioPlayoutTracker()
@@ -80,7 +130,7 @@ internal class SilenceSkippingSupport(
                 return pitchSafeAudioSink(
                     context,
                     enableAudioOutputPlaybackParams,
-                    playoutTracker.wrap(musicAudioProcessorChain(equalizer, *extraProcessors, edgeTrimmer, detector)),
+                    playoutTracker.wrap(musicAudioProcessorChain(equalizer, *extraProcessors, edgeTrimmer, smartLoudness, detector)),
                     outputProvider = {
                         playoutTracker.wrap(
                             audioPositionDiagnostics.wrap(
@@ -119,6 +169,7 @@ internal class SilenceSkippingSupport(
                 ) {
                     detector.resetTracking()
                     edgeTrimmer.onTrackChanged(player.currentPosition)
+                    smartLoudness.resetForNewTrack()
                 }
 
                 override fun onPositionDiscontinuity(
@@ -129,8 +180,10 @@ internal class SilenceSkippingSupport(
                     detector.resetTracking()
                     if (reason == Player.DISCONTINUITY_REASON_AUTO_TRANSITION) {
                         edgeTrimmer.onTrackChanged(newPosition.positionMs)
+                        smartLoudness.resetForNewTrack()
                     } else if (reason == Player.DISCONTINUITY_REASON_SEEK || reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT) {
                         edgeTrimmer.resetForSeek(newPosition.positionMs)
+                        smartLoudness.resetForNewTrack()
                     }
                 }
 
@@ -240,6 +293,162 @@ internal fun musicAudioProcessorChain(vararg processors: AudioProcessor): Defaul
     )
 
 /**
+ * Умная PCM-нормализация громкости в реальном времени (Boost-Only AGC + Soft-Knee Limiter):
+ * - Громкие треки (VK / Я.Музыка / современный мастеринг) НЕ приглушаются (коэффициент >= 1.0f).
+ * - Тихие треки плавно подтягиваются вверх (до +9 дБ) к полке -10 dBFS RMS.
+ * - Тишина и фоновый шум ниже -42 dBFS игнорируются (шум в паузах не усиливается).
+ * - Мягкий антиклип-лимитер на -0.3 dBFS исключает квадратный клип на усилителях и динамиках.
+ */
+internal class SmartLoudnessAudioProcessor : BaseAudioProcessor() {
+    @Volatile
+    private var rmsEnvelope: Float = TARGET_RMS
+
+    @Volatile
+    private var currentGain: Float = 1.0f
+
+    fun resetForNewTrack() {
+        rmsEnvelope = TARGET_RMS
+        currentGain = 1.0f
+    }
+
+    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) return AudioProcessor.AudioFormat.NOT_SET
+        return inputAudioFormat
+    }
+
+    override fun queueInput(inputBuffer: ByteBuffer) {
+        val remaining = inputBuffer.remaining()
+        if (remaining <= 0) return
+
+        val bytesPerFrame = inputAudioFormat.bytesPerFrame
+        val channels = inputAudioFormat.channelCount
+        val sampleRate = inputAudioFormat.sampleRate
+        if (bytesPerFrame <= 0 || channels <= 0 || sampleRate <= 0) {
+            passThrough(inputBuffer)
+            return
+        }
+
+        val enabled = SmartLoudnessController.isEnabled
+        if (!enabled && currentGain <= 1.001f) {
+            currentGain = 1.0f
+            passThrough(inputBuffer)
+            return
+        }
+
+        inputBuffer.order(ByteOrder.LITTLE_ENDIAN)
+        val startPos = inputBuffer.position()
+        val frameCount = remaining / bytesPerFrame
+        if (frameCount <= 0) {
+            passThrough(inputBuffer)
+            return
+        }
+        val usableBytes = frameCount * bytesPerFrame
+        val totalSamples = frameCount * channels
+
+        var sumSquares = 0.0
+        var idx = startPos
+        val endPos = startPos + usableBytes
+        while (idx < endPos) {
+            val normalized = inputBuffer.getShort(idx) / 32768.0
+            sumSquares += normalized * normalized
+            idx += 2
+        }
+        val blockRms = sqrt(sumSquares / totalSamples.coerceAtLeast(1)).toFloat()
+        val blockDurationSec = frameCount.toFloat() / sampleRate.toFloat()
+
+        val targetGain: Float =
+            if (!enabled) {
+                1.0f
+            } else if (blockRms < NOISE_GATE_RMS) {
+                // В тишине/паузе держим текущий коэффициент, чтобы не задирать фоновый шум
+                currentGain
+            } else {
+                val envTauSec = if (blockRms > rmsEnvelope) ENVELOPE_ATTACK_SEC else ENVELOPE_RELEASE_SEC
+                val envAlpha = (1.0 - exp((-blockDurationSec / envTauSec).toDouble())).toFloat().coerceIn(0f, 1f)
+                rmsEnvelope += (blockRms - rmsEnvelope) * envAlpha
+                (TARGET_RMS / rmsEnvelope.coerceAtLeast(NOISE_GATE_RMS)).coerceIn(1.0f, MAX_BOOST_GAIN)
+            }
+
+        val startGain = currentGain
+        val gainTauSec =
+            when {
+                !enabled -> DISABLE_RAMP_SEC
+                targetGain < startGain -> GAIN_FAST_DOWN_SEC
+                else -> GAIN_SLOW_UP_SEC
+            }
+        val gainAlpha = (1.0 - exp((-blockDurationSec / gainTauSec).toDouble())).toFloat().coerceIn(0f, 1f)
+        val endGain = (startGain + (targetGain - startGain) * gainAlpha).coerceIn(1.0f, MAX_BOOST_GAIN)
+        currentGain = endGain
+
+        val out = replaceOutputBuffer(usableBytes)
+        out.order(ByteOrder.LITTLE_ENDIAN)
+
+        val invFrameCount = 1f / frameCount.toFloat()
+        val gainDelta = endGain - startGain
+        var offset = startPos
+        for (frame in 0 until frameCount) {
+            val frameGain = startGain + gainDelta * (frame * invFrameCount)
+            for (ch in 0 until channels) {
+                val sample = inputBuffer.getShort(offset) / 32768f
+                val boosted = sample * frameGain
+                val limited = softLimit(boosted)
+                val pcmOut = (limited * 32767f).roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                out.putShort(pcmOut)
+                offset += 2
+            }
+        }
+
+        inputBuffer.position(endPos)
+        out.flip()
+    }
+
+    private fun softLimit(x: Float): Float {
+        val absX = abs(x)
+        if (absX <= KNEE_START) return x
+        val headroom = LIMITER_CEILING - KNEE_START
+        val shaped = KNEE_START + headroom * tanh(((absX - KNEE_START) / headroom).toDouble()).toFloat()
+        return if (x >= 0f) shaped else -shaped
+    }
+
+    private fun passThrough(inputBuffer: ByteBuffer) {
+        val remaining = inputBuffer.remaining()
+        if (remaining <= 0) return
+        val out = replaceOutputBuffer(remaining)
+        out.put(inputBuffer)
+        out.flip()
+    }
+
+    override fun onFlush(streamMetadata: AudioProcessor.StreamMetadata) {
+        resetForNewTrack()
+    }
+
+    override fun onReset() {
+        resetForNewTrack()
+    }
+
+    companion object {
+        // Полка громкости -10 dBFS RMS (уровень современных громких релизов без глушения)
+        private const val TARGET_RMS = 0.316f
+
+        // Игнорируем сигнал тише -42 dBFS, чтобы не вытягивать фоновый шум
+        private const val NOISE_GATE_RMS = 0.008f
+
+        // Максимум +9 дБ подтяжки вверх для тихих треков
+        private const val MAX_BOOST_GAIN = 2.82f
+
+        // Мягкое колено лимитера с -1.7 dBFS, потолок -0.3 dBFS (0% цифрового клипа)
+        private const val KNEE_START = 0.82f
+        private const val LIMITER_CEILING = 0.966f
+
+        private const val ENVELOPE_ATTACK_SEC = 0.20f
+        private const val ENVELOPE_RELEASE_SEC = 2.60f
+        private const val GAIN_FAST_DOWN_SEC = 0.14f
+        private const val GAIN_SLOW_UP_SEC = 1.80f
+        private const val DISABLE_RAMP_SEC = 0.04f
+    }
+}
+
+/**
  * Обрезка мёртвой тишины (< −55 дБ) СТРОГО в начале и самом конце трека.
  * Вся середина песни проходит 100% без изменений (pass-through).
  */
@@ -301,7 +510,6 @@ internal class EdgeSilenceTrimAudioProcessor : BaseAudioProcessor() {
             return
         }
 
-        // Media3 отдаёт 16-bit PCM в little-endian — выставляем порядок байтов явно
         inputBuffer.order(ByteOrder.LITTLE_ENDIAN)
 
         val pos = positionMs
