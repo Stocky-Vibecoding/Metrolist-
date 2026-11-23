@@ -20,6 +20,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -28,6 +30,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -949,7 +952,6 @@ object CustomMediaCacheManager {
                     Triple(file, safe, effectiveTime)
                 }.sortedBy { it.third }
 
-        // Первый проход: удаляем только незащищённые старые файлы
         for ((file, safe, _) in sortedOldestFirst) {
             if (total <= maxBytes) break
             if (safe in protectedSafeKeys || safe == activePlayingSafeKey) continue
@@ -959,7 +961,6 @@ object CustomMediaCacheManager {
             total -= size
         }
 
-        // Страховочный проход: если всё равно выше лимита — чистим старые, кроме текущего играющего
         if (total > maxBytes) {
             for ((file, safe, _) in sortedOldestFirst) {
                 if (total <= maxBytes) break
@@ -1090,8 +1091,6 @@ object LocalCensorshipAdvisor {
             val norm = TrackMatcher.normalize(part)
             if (norm.isBlank()) continue
             if (norm in set) return true
-            // Подстроку проверяем только для длинных имён (>= 6 символов) по границе слова,
-            // чтобы "atl" не матчил The Beatles, а "face" — Babyface/Scarface
             if (norm.length >= 6) {
                 for (known in set) {
                     if (known.length >= 6 && (norm == known || norm.startsWith("$known ") || norm.endsWith(" $known"))) {
@@ -1167,6 +1166,16 @@ object ResolverDiagnostics {
         _revision.value += 1
     }
 
+    fun updateCover(
+        videoId: String,
+        hdCoverUrl: String,
+    ) {
+        if (videoId.isBlank() || hdCoverUrl.isBlank()) return
+        if (coverByVideo[videoId] == hdCoverUrl) return
+        coverByVideo[videoId] = hdCoverUrl
+        _revision.value += 1
+    }
+
     fun hdCoverFor(videoId: String?): String? {
         if (videoId.isNullOrBlank()) return null
         return coverByVideo[videoId] ?: TrackBindingCache.getCoverByVideoId(videoId)
@@ -1229,6 +1238,8 @@ class HybridStreamResolver(
     private val yandexProvider: YandexMusicProvider,
     private val vkProvider: VkMusicProvider,
 ) : StreamResolver {
+    private val resolverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     /** `videoId -> (provider -> failedAtMs)` с автоматическим истечением через 5 минут. */
     private val failedProvidersByVideo = ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>()
     private val preResolvedCache = ConcurrentHashMap<String, PreResolvedEntry>()
@@ -1336,7 +1347,7 @@ class HybridStreamResolver(
 
     /**
      * Главный маршрутизатор каскадов:
-     * - Зарубежные: Deezer (мета/обложка) → YTM → VK → Яндекс
+     * - Зарубежные: YTM сразу (Deezer параллельно для HD-обложки, без блокировки старта) → VK → Яндекс
      * - Русские без цензуры: Яндекс → VK → YTM
      * - Русские Explicit / цензура: VK → Яндекс → YTM
      */
@@ -1391,42 +1402,61 @@ class HybridStreamResolver(
                 !LocalCensorshipAdvisor.isRussianTrack(artist, title) &&
                 !configStore.isArtistLearnedCensored(artist)
 
-        // Зарубежный каскад: Deezer (обложка/эталон) → YTM → VK → Яндекс
+        // Зарубежный каскад: YTM сразу, Deezer параллельно в фоне (не тормозит старт звука)
         if (isForeignAuto && song != null && !song.isLocal && !song.isUploaded && !song.isPodcast && !song.isLive) {
-            val deezerRef =
-                try {
-                    deezerClient.lookup(
-                        artist = artist,
-                        title = title,
-                        fallbackDurationSec = song.duration,
-                        fallbackExplicit = song.isExplicit || song.explicitness == true,
-                    )
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    null
-                }
+            val diskBinding = TrackBindingCache.get(videoId, artist, title)
+            val cachedCover = diskBinding?.hdCoverUrl
 
-            if (deezerRef != null && (!deezerRef.coverXlUrl.isNullOrBlank() || !deezerRef.deezerId.isNullOrBlank())) {
-                TrackBindingCache.put(videoId, artist, title) { prev ->
-                    prev.copy(
-                        deezerId = deezerRef.deezerId ?: prev.deezerId,
-                        hdCoverUrl = deezerRef.coverXlUrl ?: prev.hdCoverUrl,
-                        durationSec = deezerRef.durationSec ?: prev.durationSec,
-                        isExplicit = deezerRef.isExplicit || prev.isExplicit,
-                    )
+            val deezerDeferred =
+                if (!cachedCover.isNullOrBlank() && diskBinding?.durationSec != null) {
+                    null
+                } else {
+                    resolverScope.async {
+                        try {
+                            withTimeoutOrNull(DEEZER_LOOKUP_TIMEOUT_MS) {
+                                deezerClient.lookup(
+                                    artist = artist,
+                                    title = title,
+                                    fallbackDurationSec = song.duration ?: diskBinding?.durationSec,
+                                    fallbackExplicit = song.isExplicit || song.explicitness == true || diskBinding?.isExplicit == true,
+                                )
+                            }?.also { ref ->
+                                if (!ref.coverXlUrl.isNullOrBlank() || !ref.deezerId.isNullOrBlank()) {
+                                    TrackBindingCache.put(videoId, artist, title) { prev ->
+                                        prev.copy(
+                                            deezerId = ref.deezerId ?: prev.deezerId,
+                                            hdCoverUrl = ref.coverXlUrl ?: prev.hdCoverUrl,
+                                            durationSec = ref.durationSec ?: prev.durationSec,
+                                            isExplicit = ref.isExplicit || prev.isExplicit,
+                                        )
+                                    }
+                                    ref.coverXlUrl?.let { ResolverDiagnostics.updateCover(videoId, it) }
+                                }
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
                 }
-            }
 
             val ytmFailed = "ytm" in activeFailedProviders(videoId)
             var ytmError: Throwable? = null
             if (!ytmFailed) {
                 try {
+                    val coverNow =
+                        cachedCover
+                            ?: if (deezerDeferred?.isCompleted == true) {
+                                runCatching { deezerDeferred.getCompleted()?.coverXlUrl }.getOrNull()
+                            } else {
+                                null
+                            }
                     val ytmRes =
                         resolveViaDelegate(
                             videoId = videoId,
                             sourceSong = song,
-                            hdCoverOverride = deezerRef?.coverXlUrl,
+                            hdCoverOverride = coverNow,
                             reasonOverride = "зарубежный • YTM",
                             call = delegateCall,
                         )
@@ -1440,6 +1470,17 @@ class HybridStreamResolver(
                     CustomMediaCacheManager.recordNetworkFailure()
                 }
             }
+
+            val deezerRef =
+                deezerDeferred?.let {
+                    try {
+                        withTimeoutOrNull(1_800L) { it.await() }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
 
             // Фолбэк для зарубежного трека: VK → Яндекс
             tryResolveCustom(
@@ -1610,12 +1651,25 @@ class HybridStreamResolver(
                     !configStore.isArtistLearnedCensored(artist)
             if (isForeignAuto) {
                 try {
-                    deezerClient.lookup(
-                        artist = artist,
-                        title = title,
-                        fallbackDurationSec = song.duration,
-                        fallbackExplicit = song.isExplicit || song.explicitness == true,
-                    )
+                    withTimeoutOrNull(DEEZER_LOOKUP_TIMEOUT_MS) {
+                        deezerClient.lookup(
+                            artist = artist,
+                            title = title,
+                            fallbackDurationSec = song.duration,
+                            fallbackExplicit = song.isExplicit || song.explicitness == true,
+                        )
+                    }?.let { ref ->
+                        if (!ref.coverXlUrl.isNullOrBlank() || !ref.deezerId.isNullOrBlank()) {
+                            TrackBindingCache.put(videoId, artist, title) { prev ->
+                                prev.copy(
+                                    deezerId = ref.deezerId ?: prev.deezerId,
+                                    hdCoverUrl = ref.coverXlUrl ?: prev.hdCoverUrl,
+                                    durationSec = ref.durationSec ?: prev.durationSec,
+                                    isExplicit = ref.isExplicit || prev.isExplicit,
+                                )
+                            }
+                        }
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -1716,7 +1770,8 @@ class HybridStreamResolver(
             return null
         }
 
-        if (allowPreResolvedCache && failed.isEmpty() && excludedProfiles.isEmpty() && manualPref == TrackSourcePreference.AUTO && forcedOrder == null) {
+        // Мгновенное попадание в пре-резолв (работает и для AUTO, и для ручных YANDEX/VK)
+        if (allowPreResolvedCache && failed.isEmpty() && excludedProfiles.isEmpty() && forcedOrder == null) {
             val cached = preResolvedCache.remove(videoId)
             if (cached != null &&
                 cached.expiresAtMs > System.currentTimeMillis() &&
@@ -1728,29 +1783,105 @@ class HybridStreamResolver(
         }
 
         val diskBinding = TrackBindingCache.get(videoId, artist, title)
-        val reference =
-            prefetchedReference
-                ?: deezerClient.lookup(
-                    artist = artist,
-                    title = title,
-                    fallbackDurationSec = song.duration ?: diskBinding?.durationSec,
-                    fallbackExplicit = song.isExplicit || song.explicitness == true || diskBinding?.isExplicit == true,
-                )
-
+        val isManualCustom = manualPref == TrackSourcePreference.YANDEX || manualPref == TrackSourcePreference.VK
         val isRuTrack = LocalCensorshipAdvisor.isRussianTrack(artist, title)
         val cachedCensored = configStore.getCachedCensorship(artist, title) == true
-        val localCensored =
+        val alreadyKnownCensored =
             manualPref == TrackSourcePreference.AUTO &&
                 cfg.preferVkForExplicit &&
                 cfg.vkToken.isNotBlank() &&
                 (
                     cachedCensored ||
                         configStore.isArtistLearnedCensored(artist) ||
-                        LocalCensorshipAdvisor.isLikelyCensoredOnYandex(artist, title) ||
-                        (reference.isExplicit && isRuTrack)
+                        LocalCensorshipAdvisor.isLikelyCensoredOnYandex(artist, title)
                 )
 
-        val isManualCustom = manualPref == TrackSourcePreference.YANDEX || manualPref == TrackSourcePreference.VK
+        // Используем дисковую привязку или неблокирующий фолбэк, чтобы Deezer не тормозил старт трека
+        val hasWarmBinding =
+            diskBinding != null &&
+                diskBinding.durationSec != null &&
+                (!diskBinding.deezerId.isNullOrBlank() || !diskBinding.hdCoverUrl.isNullOrBlank())
+
+        val fallbackRef =
+            TrackReference(
+                title = TrackMatcher.cleanSearchTerm(title),
+                artist = TrackMatcher.cleanSearchTerm(artist),
+                durationSec = song.duration ?: diskBinding?.durationSec,
+                isExplicit = song.isExplicit || song.explicitness == true || diskBinding?.isExplicit == true,
+                fromDeezer = !diskBinding?.deezerId.isNullOrBlank(),
+                coverXlUrl = diskBinding?.hdCoverUrl,
+                deezerId = diskBinding?.deezerId,
+            )
+
+        val skipBlockingDeezer =
+            prefetchedReference != null ||
+                hasWarmBinding ||
+                isManualCustom ||
+                (alreadyKnownCensored && (videoId.startsWith("vk_") || !diskBinding?.vkAudioKey.isNullOrBlank()))
+
+        val reference: TrackReference =
+            when {
+                prefetchedReference != null -> prefetchedReference
+                skipBlockingDeezer -> {
+                    if (diskBinding?.hdCoverUrl.isNullOrBlank() && !isPreResolve) {
+                        resolverScope.launch {
+                            try {
+                                withTimeoutOrNull(DEEZER_LOOKUP_TIMEOUT_MS) {
+                                    deezerClient.lookup(
+                                        artist = artist,
+                                        title = title,
+                                        fallbackDurationSec = song.duration ?: diskBinding?.durationSec,
+                                        fallbackExplicit = fallbackRef.isExplicit,
+                                    )
+                                }?.let { ref ->
+                                    if (!ref.coverXlUrl.isNullOrBlank() || !ref.deezerId.isNullOrBlank()) {
+                                        TrackBindingCache.put(videoId, artist, title) { prev ->
+                                            prev.copy(
+                                                deezerId = ref.deezerId ?: prev.deezerId,
+                                                hdCoverUrl = ref.coverXlUrl ?: prev.hdCoverUrl,
+                                                durationSec = ref.durationSec ?: prev.durationSec,
+                                                isExplicit = ref.isExplicit || prev.isExplicit,
+                                            )
+                                        }
+                                        ref.coverXlUrl?.let { ResolverDiagnostics.updateCover(videoId, it) }
+                                    }
+                                }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                    fallbackRef
+                }
+                else -> {
+                    try {
+                        withTimeoutOrNull(DEEZER_LOOKUP_TIMEOUT_MS) {
+                            deezerClient.lookup(
+                                artist = artist,
+                                title = title,
+                                fallbackDurationSec = song.duration ?: diskBinding?.durationSec,
+                                fallbackExplicit = fallbackRef.isExplicit,
+                            )
+                        } ?: fallbackRef
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        fallbackRef
+                    }
+                }
+            }
+
+        val localCensored =
+            alreadyKnownCensored ||
+                (
+                    manualPref == TrackSourcePreference.AUTO &&
+                        cfg.preferVkForExplicit &&
+                        cfg.vkToken.isNotBlank() &&
+                        reference.isExplicit &&
+                        isRuTrack
+                )
+
         val (baseOrder, baseReason) =
             when {
                 forcedOrder != null -> forcedOrder to (forcedReason ?: "каскад")
@@ -2056,6 +2187,7 @@ class HybridStreamResolver(
         delegate.refreshPlayerConfigAfterStreamRejection()
 
     override suspend fun close() {
+        resolverScope.coroutineContext.cancelChildren()
         preResolvedCache.clear()
         delegate.close()
     }
@@ -2102,6 +2234,7 @@ class HybridStreamResolver(
         private const val TAG = "HybridResolver"
         private const val PRE_RESOLVE_TTL_MS = 12 * 60 * 1_000L
         private const val FAILED_PROVIDER_TTL_MS = 5 * 60 * 1_000L
+        private const val DEEZER_LOOKUP_TIMEOUT_MS = 2_200L
 
         @Volatile
         private var activeInstance: HybridStreamResolver? = null
