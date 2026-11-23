@@ -735,46 +735,69 @@ fun WaveHomeScreen(
         }
     }
 
-    fun launchFreshWave(useInstantStarter: Boolean) {
+    // Полная пересборка волны (по кнопке «Применить» или «Обновить волну»)
+    fun regenerateWave() {
         val conn = playerConnection ?: return
         val excludeCurrent = setOfNotNull(currentSong?.id)
-        val startedInstant =
-            if (useInstantStarter) {
-                val starter = aiWaveEngine.buildInstantStarterSongs(excludeIds = excludeCurrent)
-                if (starter.isNotEmpty()) {
+        scope.launch {
+            aiWaveEngine
+                .generateWaveSongs(
+                    backgroundLabel = false,
+                    excludeIds = excludeCurrent,
+                ).onSuccess { fresh ->
                     conn.playQueue(
-                        songs = starter,
+                        songs = fresh,
                         queueTitle = "Моя волна",
                         finite = false,
                         forceStartPlaying = true,
                     )
-                    true
-                } else {
-                    false
+                }.onFailure { err ->
+                    Toast.makeText(context, err.message ?: "Не удалось обновить волну", Toast.LENGTH_SHORT).show()
                 }
-            } else {
-                false
+        }
+    }
+
+    // Мгновенное продолжение сохранённой волны (при возврате к волне / крестике / запуске с пустого плеера)
+    fun resumeOrStartWave() {
+        val conn = playerConnection ?: return
+        val excludeCurrent = setOfNotNull(currentSong?.id)
+        val savedStarter = aiWaveEngine.buildInstantStarterSongs(excludeIds = excludeCurrent, limit = 40)
+        if (savedStarter.isEmpty()) {
+            regenerateWave()
+            return
+        }
+
+        val unplayed =
+            savedStarter.filterNot { song ->
+                val artist = song.artists.joinToString(", ") { it.name }.trim()
+                configStore.isTrackInRecentCooldown(artist, song.title)
             }
 
+        if (unplayed.isNotEmpty()) {
+            // Продолжаем с недослушанных треков волны без лишнего запроса в Gemini —
+            // когда останется <= 3 треков, AndroidQueueCoordinator сам тихо догрузит следующую пачку
+            conn.playQueue(
+                songs = unplayed,
+                queueTitle = "Моя волна",
+                finite = false,
+                forceStartPlaying = true,
+            )
+            return
+        }
+
+        // Все сохранённые треки уже недавно отыграли — мгновенно включаем и тихо обновляем хвост
+        conn.playQueue(
+            songs = savedStarter,
+            queueTitle = "Моя волна",
+            finite = false,
+            forceStartPlaying = true,
+        )
         scope.launch {
             aiWaveEngine
-                .generateWaveSongs(
-                    backgroundLabel = startedInstant,
-                    excludeIds = if (startedInstant) emptySet() else excludeCurrent,
-                ).onSuccess { fresh ->
-                    if (startedInstant && conn.queueTitle.value?.startsWith("Моя волна") == true) {
+                .generateWaveSongs(backgroundLabel = true)
+                .onSuccess { fresh ->
+                    if (conn.queueTitle.value?.startsWith("Моя волна") == true) {
                         conn.replaceUpcomingWaveQueue(fresh)
-                    } else {
-                        conn.playQueue(
-                            songs = fresh,
-                            queueTitle = "Моя волна",
-                            finite = false,
-                            forceStartPlaying = true,
-                        )
-                    }
-                }.onFailure { err ->
-                    if (!startedInstant) {
-                        Toast.makeText(context, err.message ?: "Не удалось запустить волну", Toast.LENGTH_SHORT).show()
                     }
                 }
         }
@@ -785,7 +808,7 @@ fun WaveHomeScreen(
             playerConnection.togglePlayPause()
             return
         }
-        launchFreshWave(useInstantStarter = true)
+        resumeOrStartWave()
     }
 
     val activeBubbleText =
@@ -851,7 +874,7 @@ fun WaveHomeScreen(
                     ActiveExternalContextPill(
                         label = activeContextLabel,
                         onOpenContext = onExpandPlayer,
-                        onResetToWave = { launchFreshWave(useInstantStarter = false) },
+                        onResetToWave = ::resumeOrStartWave,
                     )
                 }
             }
@@ -866,8 +889,8 @@ fun WaveHomeScreen(
                 ) {
                     if (isOutsideWave) {
                         ReturnToWavePillButton(
-                            enabled = !isGenerating,
-                            onClick = { launchFreshWave(useInstantStarter = false) },
+                            enabled = true,
+                            onClick = ::resumeOrStartWave,
                         )
                     }
                     WaveFilterPillButton(
@@ -994,7 +1017,7 @@ fun WaveHomeScreen(
                 onUpdate = { transform -> configStore.update(transform) },
                 onApplyOrRefresh = {
                     showWaveSettingsSheet = false
-                    launchFreshWave(useInstantStarter = false)
+                    regenerateWave()
                 },
             )
         }
