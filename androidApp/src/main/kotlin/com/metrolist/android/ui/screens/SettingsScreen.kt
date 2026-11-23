@@ -1,10 +1,6 @@
 package com.metrolist.android.ui.screens
 
-import android.content.ActivityNotFoundException
-import android.content.Intent
-import android.net.Uri
 import android.os.Build
-import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -29,7 +25,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -39,30 +34,27 @@ import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.rememberViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.rememberViewModelStoreProvider
 import coil3.imageLoader
-import com.metrolist.android.BuildConfig
 import com.metrolist.android.LocalMiniPlayerBottomInset
 import com.metrolist.android.R
+import com.metrolist.android.custom.CustomConfigStore
+import com.metrolist.android.custom.CustomEngineSettingsContent
+import com.metrolist.android.custom.CustomMediaCacheManager
+import com.metrolist.android.custom.GeminiClient
+import com.metrolist.android.custom.VkMusicProvider
+import com.metrolist.android.custom.YandexMusicProvider
 import com.metrolist.android.extensions.findActivity
 import com.metrolist.android.locale.AppLocale
 import com.metrolist.android.locale.rememberAppLanguageChoices
 import com.metrolist.android.playback.AudioCacheManager
 import com.metrolist.android.playback.LocalPlayerConnection
 import com.metrolist.android.playback.PlayerConnection
-import com.metrolist.android.spotifyimport.SpotifyLoginScreen
-import com.metrolist.android.spotifyimport.androidSpotifyImportManager
 import com.metrolist.android.ui.component.rememberMetroEqProfilePicker
 import com.metrolist.android.ui.download.rememberDownloadPermissionGate
 import com.metrolist.android.ui.player.CanvasCache
-import com.metrolist.android.ui.screens.settings.AndroidAboutScreen
 import com.metrolist.android.ui.screens.settings.AndroidAutoScreen
-import com.metrolist.android.ui.screens.settings.BackupRestoreScreen
 import com.metrolist.android.ui.screens.settings.DevtoolsSettingsScreen
 import com.metrolist.android.ui.screens.settings.PlaybackBenchmarkSettingsScreen
 import com.metrolist.android.ui.screens.settings.StorageSettingsScreen
-import com.metrolist.android.ui.screens.settings.UpdateDetailsScreen
-import com.metrolist.android.ui.screens.settings.UpdatesScreen
-import com.metrolist.android.update.AppUpdateManager
-import com.metrolist.android.update.AppUpdateState
 import com.metrolist.android.utils.AppFontManager
 import com.metrolist.android.utils.AppIcon
 import com.metrolist.android.utils.IconUtils
@@ -70,6 +62,7 @@ import com.metrolist.android.utils.QuickFontManager
 import com.metrolist.android.utils.SentryManager
 import com.metrolist.android.viewmodels.HomeViewModel
 import com.metrolist.android.viewmodels.SearchViewModel
+import com.metrolist.shared.auth.AuthManager
 import com.metrolist.shared.generated.resources.Res
 import com.metrolist.shared.generated.resources.app_font_active
 import com.metrolist.shared.generated.resources.app_font_applied
@@ -89,13 +82,12 @@ import com.metrolist.shared.generated.resources.calculating
 import com.metrolist.shared.generated.resources.device_language
 import com.metrolist.shared.generated.resources.search_history_removal_failed
 import com.metrolist.shared.generated.resources.settings_storage_summary
-import com.metrolist.shared.generated.resources.settings_updates_available_description
-import com.metrolist.shared.generated.resources.spotify_import_error_sign_in_failed
-import com.metrolist.shared.generated.resources.updates_no_updates
 import com.metrolist.shared.settings.FontOption
 import com.metrolist.shared.state.GlobalYouTube
 import com.metrolist.shared.state.applyContentRegion
 import com.metrolist.shared.state.contentCountryCodes
+import com.metrolist.shared.ui.navigation.LocalNavigator
+import com.metrolist.shared.ui.navigation.Screen
 import com.metrolist.shared.ui.settings.PlayerLyricsSettingsPreview
 import com.metrolist.shared.ui.settings.SettingsChangeEffect
 import com.metrolist.shared.ui.settings.SettingsChoice
@@ -108,7 +100,6 @@ import com.metrolist.shared.ui.settings.SharedSettingsScreen
 import com.metrolist.shared.ui.settings.settingsHomeSections
 import com.metrolist.shared.ui.utils.rememberFileSizeFormatter
 import com.metrolist.shared.viewmodels.PlayerViewModel
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -131,9 +122,14 @@ fun SettingsScreen(
     var currentPage by remember { mutableStateOf<SettingsPageId?>(null) }
     val formatFileSize = rememberFileSizeFormatter()
     val context = LocalContext.current
-    val uriHandler = LocalUriHandler.current
+    val navigator = LocalNavigator.current
+    val authManager = remember { AuthManager() }
     val playerConnection = LocalPlayerConnection.current
     val audioCacheManager: AudioCacheManager = koinInject()
+    val customConfigStore: CustomConfigStore = koinInject()
+    val yandexProvider: YandexMusicProvider = koinInject()
+    val vkProvider: VkMusicProvider = koinInject()
+    val geminiClient: GeminiClient = koinInject()
     val homeViewModel: HomeViewModel = koinViewModel()
     val homeState by homeViewModel.shared.uiState.collectAsState()
     val searchViewModel: SearchViewModel = koinViewModel()
@@ -146,7 +142,6 @@ fun SettingsScreen(
     val requireDownloadNotifications = rememberDownloadPermissionGate()
 
     val miniPlayerInset = LocalMiniPlayerBottomInset.current
-    val appUpdateState by AppUpdateManager.state.collectAsState()
     val configuration = LocalConfiguration.current
     val systemLocale = remember(configuration) { AppLocale.systemLocale(context) }
     val systemDefaultLabel = stringResource(Res.string.app_language_system)
@@ -301,7 +296,10 @@ fun SettingsScreen(
                         context.imageLoader.diskCache?.size ?: coilDir.calculateDirectorySize()
                     }
                 val animatedCoverCacheSize = withContext(Dispatchers.IO) { CanvasCache.get(context).sizeBytes() }
-                totalCacheSize = songCacheSize + imageCacheSize + downloadSize + animatedCoverCacheSize
+                val customCache = CustomMediaCacheManager.stats.value
+                totalCacheSize =
+                    songCacheSize + imageCacheSize + downloadSize + animatedCoverCacheSize +
+                        customCache.waveCacheBytes + customCache.likedDownloadsBytes
                 freeStorageSize = withContext(Dispatchers.IO) { context.filesDir.usableSpace }
             } finally {
                 isCalculatingCacheSize = false
@@ -319,27 +317,34 @@ fun SettingsScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // Убираем лишние и неактуальные для форка разделы из стоковых настроек
+    val hiddenPages =
+        remember {
+            setOf(
+                SettingsPageId.LYRICS,
+                SettingsPageId.LYRICS_SOURCES,
+                SettingsPageId.LYRICS_AI_TRANSLATION,
+                SettingsPageId.LYRICS_ROMANIZATION,
+                SettingsPageId.LYRICS_AI_SETUP,
+                SettingsPageId.BACKUP_RESTORE,
+                SettingsPageId.UPDATES,
+                SettingsPageId.UPDATE_DETAILS,
+                SettingsPageId.SUPPORTED_LINKS,
+                SettingsPageId.ABOUT,
+            )
+        }
+
     val availablePages =
         buildSet {
             add(SettingsPageId.FONTS)
             add(SettingsPageId.PLAYER_STYLE)
             add(SettingsPageId.PLAYER_ARTWORK)
             add(SettingsPageId.MINI_PLAYER_STYLE)
-            add(SettingsPageId.LYRICS_SOURCES)
-            add(SettingsPageId.LYRICS_AI_TRANSLATION)
-            add(SettingsPageId.LYRICS_ROMANIZATION)
             add(SettingsPageId.HIDDEN_HOME_ITEMS)
             add(SettingsPageId.HIDDEN_LIBRARY_ITEMS)
             add(SettingsPageId.BLOCKED_ARTISTS)
             add(SettingsPageId.BLOCKED_SONGS)
             add(SettingsPageId.STORAGE)
-            add(SettingsPageId.BACKUP_RESTORE)
-            if (BuildConfig.UPDATER_ENABLED) {
-                add(SettingsPageId.UPDATES)
-                add(SettingsPageId.UPDATE_DETAILS)
-            }
-            add(SettingsPageId.ABOUT)
-            add(SettingsPageId.SUPPORTED_LINKS)
             if (SharedPreferences.shared.devtoolsUnlocked) {
                 add(SettingsPageId.DEVTOOLS)
                 add(SettingsPageId.PLAYBACK_BENCHMARK)
@@ -347,26 +352,23 @@ fun SettingsScreen(
             add(SettingsPageId.ANDROID_AUTO)
         }
 
-    fun openSupportedLinks() {
-        val packageUri = Uri.fromParts("package", context.packageName, null)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val intent = Intent(Settings.ACTION_APP_OPEN_BY_DEFAULT_SETTINGS, packageUri)
-            if (intent.resolveActivity(context.packageManager) != null) {
-                try {
-                    context.startActivity(intent)
-                    return
-                } catch (_: ActivityNotFoundException) {
-                } catch (_: SecurityException) {
-                    // Some vendor settings apps do not export this screen.
-                }
-            }
-        }
-        val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri)
-        if (fallback.resolveActivity(context.packageManager) != null) context.startActivity(fallback)
-    }
-
     Box(Modifier.fillMaxSize()) {
         SharedSettingsScreen(
+            hiddenPages = hiddenPages,
+            customSectionGroupTitle = "ИИ и источники",
+            customEngineTitle = "Источники и ИИ-движок",
+            customEngineSubtitle = "Вход (VK, Яндекс, YouTube, Last.fm), Gemini, кэш 4 ГБ, бэкап",
+            customEngineContent = {
+                CustomEngineSettingsContent(
+                    configStore = customConfigStore,
+                    yandexProvider = yandexProvider,
+                    vkProvider = vkProvider,
+                    geminiClient = geminiClient,
+                    isYouTubeLoggedIn = authManager.isLoggedIn,
+                    onOpenYouTubeLogin = { navigator?.navigate(Screen.Login) },
+                    onOpenLastFmLogin = { navigator?.navigate(Screen.LastFm) },
+                )
+            },
             host =
                 SharedSettingsHost(
                     platform = SettingsPlatform.ANDROID,
@@ -396,20 +398,10 @@ fun SettingsScreen(
                                 formatFileSize(freeStorageSize),
                             )
                         },
-                    updateSummary =
-                        if (
-                            appUpdateState is AppUpdateState.Available ||
-                            appUpdateState is AppUpdateState.Downloading ||
-                            appUpdateState is AppUpdateState.Downloaded ||
-                            (appUpdateState as? AppUpdateState.Error)?.release != null
-                        ) {
-                            stringResource(Res.string.settings_updates_available_description)
-                        } else {
-                            stringResource(Res.string.updates_no_updates)
-                        },
+                    updateSummary = "",
                     availablePages = availablePages,
-                    initialPage = initialPage,
-                    externalPages = setOf(SettingsPageId.SUPPORTED_LINKS),
+                    initialPage = initialPage?.takeUnless { it in hiddenPages },
+                    externalPages = emptySet(),
                     onPageChanged = { page ->
                         if (page != currentPage) {
                             currentPage?.let(pageViewModels::clearKey)
@@ -480,9 +472,7 @@ fun SettingsScreen(
                     fontPrimaryActions = fontPrimaryActions,
                     fontDownloadActions = fontDownloadActions,
                     onClearSearchHistory = searchViewModel.shared::clearSearchHistory,
-                    onOpenPage = { page ->
-                        if (page == SettingsPageId.SUPPORTED_LINKS) openSupportedLinks()
-                    },
+                    onOpenPage = {},
                     pageContent = { page, onBack, onNavigate ->
                         CompositionLocalProvider(
                             LocalViewModelStoreOwner provides rememberViewModelStoreOwner(page, pageViewModels),
@@ -494,29 +484,6 @@ fun SettingsScreen(
 
                                 SettingsPageId.STORAGE -> {
                                     StorageSettingsScreen(onBack, onNavigateToDownloads)
-                                }
-
-                                SettingsPageId.BACKUP_RESTORE -> {
-                                    BackupRestoreScreen(onNavigateBack = onBack)
-                                }
-
-                                SettingsPageId.UPDATES -> {
-                                    UpdatesScreen(onBack) { onNavigate(SettingsPageId.UPDATE_DETAILS) }
-                                }
-
-                                SettingsPageId.UPDATE_DETAILS -> {
-                                    UpdateDetailsScreen(onNavigateBack = onBack)
-                                }
-
-                                SettingsPageId.ABOUT -> {
-                                    var openDevtools by remember { mutableStateOf(false) }
-                                    LaunchedEffect(openDevtools) {
-                                        if (openDevtools) {
-                                            onNavigate(SettingsPageId.DEVTOOLS)
-                                            openDevtools = false
-                                        }
-                                    }
-                                    AndroidAboutScreen(onBack, onDevtoolsUnlocked = { openDevtools = true })
                                 }
 
                                 SettingsPageId.DEVTOOLS -> {
