@@ -16,7 +16,6 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.vector.ImageVector
 import com.metrolist.shared.generated.resources.*
-import com.metrolist.shared.settings.Settings
 import com.metrolist.shared.ui.icons.MetrolistIcons
 import org.jetbrains.compose.resources.stringResource
 
@@ -29,8 +28,37 @@ fun rememberMetrolistSettingsRegistry(
     builder.registerAppearanceSettings(host)
     builder.registerPlaybackSettings(host)
     builder.registerContentSettings(host)
-    builder.registerLyricsSettings(host)
+    if (host.platform != SettingsPlatform.ANDROID) {
+        builder.registerLyricsSettings(host)
+    }
     builder.registerPrivacySettings(host)
+
+    if (SettingsPageId.CUSTOM_ENGINE in host.availablePages) {
+        builder.customPage(
+            id = SettingsPageId.CUSTOM_ENGINE,
+            title = "Источники и ИИ-движок",
+            subtitle = "Яндекс, VK, YouTube, Last.fm, Gemini, кэш 4 ГБ и бэкап",
+            icon = MetrolistIcons.Outlined.AutoAwesome,
+            tone = SettingsTone.PURPLE,
+            searchTerms =
+                listOf(
+                    "Яндекс",
+                    "VK",
+                    "ВК",
+                    "YouTube",
+                    "Deezer",
+                    "Last.fm",
+                    "Gemini",
+                    "Волна",
+                    "Кэш",
+                    "Бэкап",
+                    "Импорт",
+                    "Нормализация",
+                    "Антицензура",
+                    "Маскот",
+                ),
+        )
+    }
 
     @Composable
     fun customPage(
@@ -78,12 +106,6 @@ fun rememberMetrolistSettingsRegistry(
                             Res.string.action_backup,
                             Res.string.action_restore,
                             Res.string.playlist_imports_title,
-                            Res.string.import_provider_spotify,
-                            Res.string.import_provider_apple_music,
-                            Res.string.import_provider_deezer,
-                            Res.string.import_provider_tidal,
-                            Res.string.import_provider_amazon,
-                            Res.string.import_provider_youtube,
                         )
                     }
 
@@ -142,12 +164,7 @@ fun rememberMetrolistSettingsRegistry(
                         listOf(
                             Res.string.credits_creator_section,
                             Res.string.credits_collaborators_section,
-                            Res.string.brand_github,
-                            Res.string.brand_discord,
-                            Res.string.brand_telegram,
                             Res.string.credits_license_name,
-                            Res.string.sponsor_developer,
-                            Res.string.open_website,
                         )
                     }
 
@@ -230,6 +247,12 @@ fun rememberMetrolistSettingsRegistry(
         SettingsTone.BLUE,
     )
 
+    if (SettingsPageId.CUSTOM_ENGINE in host.availablePages) {
+        builder.rootGroup(
+            "Волна и сервисы",
+            SettingsPageId.CUSTOM_ENGINE,
+        )
+    }
     builder.rootGroup(
         stringResource(Res.string.settings_interface),
         SettingsPageId.APPEARANCE,
@@ -237,22 +260,23 @@ fun rememberMetrolistSettingsRegistry(
     )
     builder.rootGroup(
         stringResource(Res.string.settings_playback),
-        SettingsPageId.PLAYER,
-        SettingsPageId.LYRICS,
+        *buildList {
+            add(SettingsPageId.PLAYER)
+            if (host.platform != SettingsPlatform.ANDROID) add(SettingsPageId.LYRICS)
+        }.toTypedArray(),
     )
     builder.rootGroup(stringResource(Res.string.settings_privacy_security), SettingsPageId.PRIVACY)
     builder.rootGroup(
         stringResource(Res.string.settings_storage_data),
         *listOf(SettingsPageId.STORAGE, SettingsPageId.BACKUP_RESTORE)
-            .filter {
-                it in host.availablePages
-            }.toTypedArray(),
+            .filter { it in host.availablePages }
+            .toTypedArray(),
     )
     builder.rootGroup(
         stringResource(Res.string.settings_application_about),
         *listOf(
-            SettingsPageId.UPDATES,
             SettingsPageId.ANDROID_AUTO,
+            SettingsPageId.UPDATES,
             SettingsPageId.SUPPORTED_LINKS,
             SettingsPageId.ABOUT,
             SettingsPageId.DEVTOOLS,
